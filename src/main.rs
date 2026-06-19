@@ -12,6 +12,7 @@ mod config;
 mod gridr;
 mod workspace;
 
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use config::Config;
 use notify::Watcher;
+use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -449,6 +451,9 @@ struct App {
     selecting: bool,
     last_click: Option<(Instant, Point)>,
     click_count: u8,
+
+    /// Wayland clipboard (clipboard + primary selection) via the app's own seat.
+    clipboard: Option<smithay_clipboard::Clipboard>,
 }
 
 impl App {
@@ -477,6 +482,7 @@ impl App {
             selecting: false,
             last_click: None,
             click_count: 0,
+            clipboard: None,
         }
     }
 
@@ -647,13 +653,22 @@ impl App {
         self.request_redraw();
     }
 
-    /// Finish selecting; a plain click (empty selection) clears any highlight.
+    /// Finish selecting; a plain click (empty selection) clears any highlight, otherwise the
+    /// selection is published to the primary selection (middle-click paste source on Linux).
     fn end_selection(&mut self) {
         self.selecting = false;
+        let mut selected = None;
         if let Some(term) = &self.term {
             let mut t = term.lock().unwrap();
             if t.selection.as_ref().is_some_and(|s| s.is_empty()) {
                 t.selection = None;
+            } else {
+                selected = t.selection_to_string();
+            }
+        }
+        if let (Some(cb), Some(s)) = (&self.clipboard, selected) {
+            if !s.is_empty() {
+                cb.store_primary(s);
             }
         }
         self.request_redraw();
@@ -662,6 +677,52 @@ impl App {
     fn clear_selection(&mut self) {
         if let Some(term) = &self.term {
             term.lock().unwrap().selection = None;
+        }
+    }
+
+    /// Copy the active selection to the clipboard and clear it. Returns whether anything was copied.
+    fn copy(&mut self) -> bool {
+        let text = self
+            .term
+            .as_ref()
+            .and_then(|t| t.lock().unwrap().selection_to_string());
+        match text {
+            Some(s) if !s.is_empty() => {
+                if let Some(cb) = &self.clipboard {
+                    cb.store(s);
+                }
+                self.clear_selection();
+                self.request_redraw();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Write text to the PTY, wrapped in bracketed-paste markers when the app enabled them.
+    fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self
+            .term
+            .as_ref()
+            .is_some_and(|t| t.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE));
+        let mut out = Vec::new();
+        if bracketed {
+            out.extend_from_slice(b"\x1b[200~");
+        }
+        out.extend_from_slice(text.as_bytes());
+        if bracketed {
+            out.extend_from_slice(b"\x1b[201~");
+        }
+        self.to_pty(&out);
+    }
+
+    fn paste(&mut self) {
+        let text = self.clipboard.as_ref().and_then(|cb| cb.load().ok());
+        if let Some(t) = text {
+            self.paste_text(&t);
         }
     }
 
@@ -681,6 +742,31 @@ impl App {
                 Key::Named(NamedKey::End) => return self.scroll(Scroll::Bottom),
                 _ => {}
             }
+        }
+
+        // Clipboard shortcuts. Ctrl-C copies only when a selection exists (else it falls
+        // through to ^C / SIGINT); Ctrl-Shift-C always copies; Ctrl-V / Ctrl-Shift-V paste;
+        // Ctrl-Insert copies, Shift-Insert pastes.
+        match &ev.logical_key {
+            Key::Character(s) if ctrl => match s.to_lowercase().as_str() {
+                "c" => {
+                    if shift {
+                        self.copy();
+                        return;
+                    }
+                    if self.copy() {
+                        return; // had a selection → copied; otherwise fall through to ^C
+                    }
+                }
+                "v" => return self.paste(),
+                _ => {}
+            },
+            Key::Named(NamedKey::Insert) if ctrl => {
+                self.copy();
+                return;
+            }
+            Key::Named(NamedKey::Insert) if shift => return self.paste(),
+            _ => {}
         }
         // Cursor keys: `ESC O x` in application mode, else `ESC [ x`. mc (ncurses) relies on
         // this; vim is lenient and accepts CSI either way — which is why it "worked".
@@ -935,6 +1021,15 @@ impl ApplicationHandler<UserEvent> for App {
         );
         // Accept IME commits so an active ibus/fcitx can't swallow input (layout-agnostic safety net).
         window.set_ime_allowed(true);
+
+        // Clipboard via our own wl_display — uses the app's seat, so it works on KWin and any
+        // Wayland compositor without XWayland or data-control protocols. None on non-Wayland.
+        self.clipboard = match window.display_handle().map(|h| h.as_raw()) {
+            Ok(RawDisplayHandle::Wayland(h)) => {
+                Some(unsafe { smithay_clipboard::Clipboard::new(h.display.as_ptr() as *mut c_void) })
+            }
+            _ => None,
+        };
         let egui_renderer = egui_wgpu::Renderer::new(
             &state.device,
             state.surface_config.format,
@@ -994,6 +1089,17 @@ impl ApplicationHandler<UserEvent> for App {
                 ElementState::Released if self.selecting => self.end_selection(),
                 _ => {}
             },
+            // Middle-click pastes the primary selection (Linux convention).
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } if self.in_term(self.mouse_px.0, self.mouse_px.1) => {
+                let text = self.clipboard.as_ref().and_then(|cb| cb.load_primary().ok());
+                if let Some(t) = text {
+                    self.paste_text(&t);
+                }
+            }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
             // IME commit (composed text, or text from an active input-method framework).
