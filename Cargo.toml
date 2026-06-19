@@ -1,0 +1,19 @@
+[package]
+name = "potty"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+cosmic-text = "0.18"
+egui = "0.34.3"
+egui-wgpu = "0.34.3"
+egui-winit = "0.34.3"
+notify = "8.2.0"
+pollster = "0.4.0"
+portable-pty = "0.9.0"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+wgpu = "29"
+winit = "0.30"
