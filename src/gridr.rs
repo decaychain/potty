@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::EventListener;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
@@ -467,11 +467,11 @@ impl GridRenderer {
     }
 
     /// Build instance data for the visible grid, positioned within the pane at `origin` (px).
-    pub fn prepare(
+    pub fn prepare<L: EventListener>(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        term: &Term<VoidListener>,
+        term: &Term<L>,
         origin: (f32, f32),
         screen: (f32, f32),
     ) {

@@ -23,11 +23,11 @@ use config::Config;
 use notify::Watcher;
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::term::{Config as TermConfig, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
 use wgpu::{
@@ -53,12 +53,51 @@ const LINE_PX: f32 = 18.0;
 /// Top-bar height reserve (logical px) for the initial PTY sizing.
 const TOPBAR: f32 = 34.0;
 
-type SharedTerm = Arc<Mutex<Term<VoidListener>>>;
+type SharedTerm = Arc<Mutex<Term<EventProxy>>>;
 
-#[derive(Debug, Clone, Copy)]
+/// Events the terminal raises (from the PTY reader thread) that the main loop must service.
 enum UserEvent {
     Wake,
     ReloadConfig,
+    /// OSC 52 store (app writes the system clipboard). Targets the clipboard selection.
+    ClipboardStore(String),
+    /// OSC 52 load: read the clipboard, run the formatter, write the result back to the PTY.
+    ClipboardLoad(std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>),
+    /// Terminal query response (cursor position, device attributes, …) bound for the PTY.
+    PtyWrite(String),
+}
+
+/// Terminal event listener: forwards the events we care about to the main loop via the proxy.
+/// (PTY reader thread → here → `user_event`.) Replaces VoidListener, which dropped everything —
+/// notably OSC 52 clipboard writes and terminal query responses.
+#[derive(Clone)]
+struct EventProxy(EventLoopProxy<UserEvent>);
+
+impl EventListener for EventProxy {
+    fn send_event(&self, event: Event) {
+        // `ty` (clipboard vs primary) is ignored — OSC 52 in practice targets the clipboard.
+        let forward = match event {
+            Event::ClipboardStore(_ty, text) => Some(UserEvent::ClipboardStore(text)),
+            Event::ClipboardLoad(_ty, fmt) => Some(UserEvent::ClipboardLoad(fmt)),
+            Event::PtyWrite(text) => Some(UserEvent::PtyWrite(text)),
+            _ => None,
+        };
+        if let Some(ev) = forward {
+            let _ = self.0.send_event(ev);
+        }
+    }
+}
+
+/// Build alacritty's terminal Config from ours (currently just the OSC 52 policy).
+fn term_config(cfg: &Config) -> TermConfig {
+    let mut tc = TermConfig::default();
+    tc.osc52 = match cfg.osc52.as_str() {
+        "disabled" => Osc52::Disabled,
+        "paste" => Osc52::OnlyPaste,
+        "copy-paste" => Osc52::CopyPaste,
+        _ => Osc52::OnlyCopy,
+    };
+    tc
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -313,7 +352,7 @@ impl WindowState {
         prims: &[egui::ClippedPrimitive],
         ppp: f32,
         term_rect: Option<egui::Rect>,
-        term: Option<&Term<VoidListener>>,
+        term: Option<&Term<EventProxy>>,
     ) {
         let (sw, sh) = (self.surface_config.width, self.surface_config.height);
 
@@ -497,6 +536,10 @@ impl App {
         let font_changed =
             new.font_family != self.config.font_family || new.font_size != self.config.font_size;
         self.config = new;
+        // Hot-reload the OSC 52 clipboard policy.
+        if let Some(term) = &self.term {
+            term.lock().unwrap().set_options(term_config(&self.config));
+        }
         let (family, size, scale) = (self.config.font_family.clone(), self.config.font_size, self.scale);
         let palette = self.config.palette();
         let line = self.line_px(size);
@@ -970,8 +1013,11 @@ impl ApplicationHandler<UserEvent> for App {
         );
         self.cur_dims = dims;
 
-        let term: SharedTerm =
-            Arc::new(Mutex::new(Term::new(TermConfig::default(), &dims, VoidListener)));
+        let term: SharedTerm = Arc::new(Mutex::new(Term::new(
+            term_config(&self.config),
+            &dims,
+            EventProxy(self.proxy.clone()),
+        )));
 
         let pty = portable_pty::native_pty_system();
         let pair = pty
@@ -1044,17 +1090,35 @@ impl ApplicationHandler<UserEvent> for App {
         self.egui_renderer = Some(egui_renderer);
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Drop the clipboard before the Wayland connection is torn down — its worker thread
+        // holds the wl_display, and using it after teardown segfaults.
+        self.clipboard = None;
+    }
+
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Wake => {
-                if let Some(state) = &self.state {
-                    state.window.request_redraw();
-                }
-            }
+            UserEvent::Wake => self.request_redraw(),
             UserEvent::ReloadConfig => {
                 let cfg = Config::load(&self.config_path);
                 self.apply_config(cfg);
             }
+            // OSC 52: app wrote the system clipboard.
+            UserEvent::ClipboardStore(text) => {
+                if let Some(cb) = &self.clipboard {
+                    cb.store(text);
+                }
+            }
+            // OSC 52: app reads the clipboard; format the response and send it to the PTY.
+            UserEvent::ClipboardLoad(fmt) => {
+                let text = self.clipboard.as_ref().and_then(|cb| cb.load().ok());
+                if let Some(t) = text {
+                    let response = fmt(&t);
+                    self.to_pty(response.as_bytes());
+                }
+            }
+            // Terminal query response (DSR, DA, cursor position, …).
+            UserEvent::PtyWrite(text) => self.to_pty(text.as_bytes()),
         }
     }
 
