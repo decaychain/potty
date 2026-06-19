@@ -18,6 +18,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
     pub font_size: f32,
+    /// Point size for the chrome (tab bar + menus). The terminal grid uses `font_size`.
+    pub ui_font_size: f32,
     /// OSC 52 clipboard policy: "copy" (default, safe), "copy-paste", "paste", or "disabled".
     /// "paste"/"copy-paste" let programs READ your clipboard via escape sequence — including
     /// remote hosts over SSH. Enable read deliberately.
@@ -40,6 +42,7 @@ impl Default for Config {
         Self {
             font_family: None,
             font_size: 15.0,
+            ui_font_size: 13.0,
             osc52: "copy".into(),
             colors: Colors::default(),
         }

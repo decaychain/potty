@@ -14,7 +14,7 @@ mod config;
 mod gridr;
 mod workspace;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -70,6 +70,10 @@ enum UserEvent {
     ClipboardLoad(PaneId, std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>),
     /// Terminal query response (cursor position, device attributes, …) bound for the pane.
     PtyWrite(PaneId, String),
+    /// The pane's program set its window title (OSC 0/2).
+    Title(PaneId, String),
+    /// The pane's program reset its title to the default.
+    ResetTitle(PaneId),
     /// A pane's shell exited (reader hit EOF) — close the pane.
     PaneExited(PaneId),
 }
@@ -90,6 +94,8 @@ impl EventListener for EventProxy {
             Event::ClipboardStore(_ty, text) => Some(UserEvent::ClipboardStore(text)),
             Event::ClipboardLoad(_ty, fmt) => Some(UserEvent::ClipboardLoad(self.pane, fmt)),
             Event::PtyWrite(text) => Some(UserEvent::PtyWrite(self.pane, text)),
+            Event::Title(title) => Some(UserEvent::Title(self.pane, title)),
+            Event::ResetTitle => Some(UserEvent::ResetTitle(self.pane)),
             _ => None,
         };
         if let Some(ev) = forward {
@@ -142,6 +148,10 @@ struct Terminal {
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     dims: Dims,
+    /// Current title (OSC 0/2), shown in the tab label and (when focused) the window title.
+    title: String,
+    /// What `title` resets to (the shell's basename) on OSC ResetTitle.
+    default_title: String,
 }
 
 enum Action {
@@ -153,6 +163,7 @@ enum Action {
     Focus(PaneId),
     SetFontFamily(Option<String>),
     SetFontSize(f32),
+    ShowFontSettings,
 }
 
 /// Apply a workspace (tab/pane) action. Font actions are routed separately (they touch App).
@@ -164,7 +175,7 @@ fn apply(ws: &mut Workspace, action: Action) {
         Action::ClosePane => ws.close_focused(),
         Action::CloseTab(i) => ws.close_tab(i),
         Action::Focus(id) => ws.focus(id),
-        Action::SetFontFamily(_) | Action::SetFontSize(_) => {}
+        Action::SetFontFamily(_) | Action::SetFontSize(_) | Action::ShowFontSettings => {}
     }
 }
 
@@ -172,8 +183,24 @@ fn apply(ws: &mut Workspace, action: Action) {
 // egui chrome
 // ---------------------------------------------------------------------------
 
-#[allow(deprecated)] // ui.close_menu → ui.close migration, see build_ui note
-fn pane_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<PaneId>) {
+/// Shorten a title for a tab label, with an ellipsis when it overflows.
+fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// The one pane/tab menu, used by both the ☰ button (`for_pane` = None → acts on the focused
+/// pane) and a pane's right-click context menu (`for_pane` = that pane). Being the single menu
+/// means hiding the tab bar still gives full access via right-click. Font controls live in a
+/// separate window (opened from here) rather than cluttering the menu.
+///
+/// NOTE: egui 0.34 is mid-migration to `ui.close`; `ui.close_menu` is deprecated-but-working.
+#[allow(deprecated)]
+fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<PaneId>) {
     let focus = |actions: &mut Vec<Action>| {
         if let Some(id) = for_pane {
             actions.push(Action::Focus(id));
@@ -199,40 +226,51 @@ fn pane_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<Pane
         actions.push(Action::NewTab);
         ui.close_menu();
     }
+    ui.separator();
+    if ui.button("Font settings…").clicked() {
+        actions.push(Action::ShowFontSettings);
+        ui.close_menu();
+    }
 }
 
-/// NOTE: egui 0.34 is mid-migration to `run_ui`/`show_inside`/`ui.close`; the panel
-/// helpers used here are deprecated-but-working. Migrate when the new Panel API settles.
-/// Font family/size picker. Family list comes from the renderer's monospace faces.
-fn appearance_menu(
-    ui: &mut egui::Ui,
-    actions: &mut Vec<Action>,
+/// The floating Font settings window: terminal font size + family picker. Visibility is tied to
+/// `open` (its close button flips it off).
+fn font_settings_window(
+    ctx: &egui::Context,
+    open: &mut bool,
     families: &[String],
     cur_family: Option<&str>,
     cur_size: f32,
+    actions: &mut Vec<Action>,
 ) {
-    ui.horizontal(|ui| {
-        ui.label("Size");
-        if ui.button("−").clicked() {
-            actions.push(Action::SetFontSize(cur_size - 1.0));
-        }
-        ui.label(format!("{cur_size:.0} px"));
-        if ui.button("+").clicked() {
-            actions.push(Action::SetFontSize(cur_size + 1.0));
-        }
-    });
-    ui.separator();
-    ui.label("Font family");
-    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-        if ui.selectable_label(cur_family.is_none(), "(default monospace)").clicked() {
-            actions.push(Action::SetFontFamily(None));
-        }
-        for fam in families {
-            if ui.selectable_label(cur_family == Some(fam.as_str()), fam).clicked() {
-                actions.push(Action::SetFontFamily(Some(fam.clone())));
-            }
-        }
-    });
+    egui::Window::new("Font settings")
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                if ui.button("−").clicked() {
+                    actions.push(Action::SetFontSize(cur_size - 1.0));
+                }
+                ui.label(format!("{cur_size:.0} px"));
+                if ui.button("+").clicked() {
+                    actions.push(Action::SetFontSize(cur_size + 1.0));
+                }
+            });
+            ui.separator();
+            ui.label("Font family");
+            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                if ui.selectable_label(cur_family.is_none(), "(default monospace)").clicked() {
+                    actions.push(Action::SetFontFamily(None));
+                }
+                for fam in families {
+                    if ui.selectable_label(cur_family == Some(fam.as_str()), fam).clicked() {
+                        actions.push(Action::SetFontFamily(Some(fam.clone())));
+                    }
+                }
+            });
+        });
 }
 
 #[allow(deprecated)]
@@ -242,33 +280,43 @@ fn build_ui(
     families: &[String],
     cur_family: Option<&str>,
     cur_size: f32,
-    report_panes: &HashSet<PaneId>,
+    tab_titles: &[String],
+    show_font_settings: &mut bool,
     actions: &mut Vec<Action>,
     leaves: &mut Vec<(PaneId, egui::Rect)>,
 ) {
-    egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            for (i, tab) in ws.tabs.iter().enumerate() {
-                if ui.selectable_label(i == ws.active, &tab.title).clicked() {
-                    actions.push(Action::SelectTab(i));
+    // The tab bar only earns its space with more than one tab; otherwise the menu lives on the
+    // pane's right-click (shift-right-click when an app has grabbed the mouse).
+    if ws.tabs.len() > 1 {
+        egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (i, _tab) in ws.tabs.iter().enumerate() {
+                    // Label + close grouped tightly so they read as one tab.
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let title = elide(&tab_titles[i], 24);
+                        if ui.selectable_label(i == ws.active, title).clicked() {
+                            actions.push(Action::SelectTab(i));
+                        }
+                        let close = egui::Button::new(egui::RichText::new("×").weak()).frame(false);
+                        if ui.add(close).on_hover_text("Close tab").clicked() {
+                            actions.push(Action::CloseTab(i));
+                        }
+                    });
                 }
-                if ws.tabs.len() > 1 && ui.small_button("✕").on_hover_text("Close tab").clicked() {
-                    actions.push(Action::CloseTab(i));
+                if ui.button("+").on_hover_text("New tab").clicked() {
+                    actions.push(Action::NewTab);
                 }
-            }
-            if ui.button("+").on_hover_text("New tab").clicked() {
-                actions.push(Action::NewTab);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("☰", |ui| pane_menu(ui, actions, None));
-                ui.menu_button("Aa", |ui| {
-                    appearance_menu(ui, actions, families, cur_family, cur_size)
-                })
-                .response
-                .on_hover_text("Font & size");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("☰", |ui| full_menu(ui, actions, None));
+                });
             });
         });
-    });
+    }
+
+    if *show_font_settings {
+        font_settings_window(ctx, show_font_settings, families, cur_family, cur_size, actions);
+    }
 
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
@@ -276,15 +324,13 @@ fn build_ui(
             let area = ui.max_rect();
             let focus = ws.active_tab().focus;
             // Each leaf is a live terminal drawn underneath (pass 1) — keep the fill
-            // transparent. We DO claim the rect for a right-click context menu, but only
-            // when the pane isn't in mouse-reporting mode (so apps like Zellij/vim still get
-            // right-click). Left-clicks fall through to our own handler regardless (it gates
-            // geometrically, not on egui consumption), so text selection/focus still work.
+            // transparent. We claim the rect so right-click opens the context menu; left-clicks
+            // fall through to our own handler (which gates geometrically, not on egui
+            // consumption), so selection/focus still work. Plain right-click in a mouse-mode
+            // app is withheld from egui upstream so it reaches the app instead.
             for (id, rect) in ws.leaf_rects(area) {
-                if !report_panes.contains(&id) {
-                    ui.interact(rect, egui::Id::new(("pane", ws.active, id)), egui::Sense::click())
-                        .context_menu(|ui| pane_menu(ui, actions, Some(id)));
-                }
+                ui.interact(rect, egui::Id::new(("pane", ws.active, id)), egui::Sense::click())
+                    .context_menu(|ui| full_menu(ui, actions, Some(id)));
                 let stroke = if id == focus {
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 160, 255))
                 } else {
@@ -526,6 +572,14 @@ struct App {
 
     /// Wayland clipboard (clipboard + primary selection) via the app's own seat.
     clipboard: Option<smithay_clipboard::Clipboard>,
+
+    /// Last title pushed to the OS window (so we only call set_title on change).
+    window_title: String,
+    /// Whether an egui popup/menu was open as of the last frame — suppresses our own mouse
+    /// handling so clicking a menu item doesn't also hit the terminal underneath.
+    menu_open: bool,
+    /// Whether the floating Font settings window is shown.
+    show_font_settings: bool,
 }
 
 impl App {
@@ -556,6 +610,9 @@ impl App {
             mouse_held: None,
             last_report_cell: None,
             clipboard: None,
+            window_title: String::new(),
+            menu_open: false,
+            show_font_settings: false,
         }
     }
 
@@ -596,6 +653,12 @@ impl App {
             })
             .unwrap();
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        // Default title until the program sets one: the shell's basename (e.g. "zsh").
+        let default_title = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("shell")
+            .to_string();
         let mut cmd = portable_pty::CommandBuilder::new(shell);
         // Declare what we actually emulate so terminfo-driven apps (mc, ncurses) agree with
         // the escape sequences we send (e.g. application cursor keys).
@@ -624,7 +687,17 @@ impl App {
             let _ = proxy.send_event(UserEvent::PaneExited(id));
         });
 
-        self.terms.insert(id, Terminal { term, writer, master: pair.master, dims });
+        self.terms.insert(
+            id,
+            Terminal {
+                term,
+                writer,
+                master: pair.master,
+                dims,
+                title: default_title.clone(),
+                default_title,
+            },
+        );
     }
 
     /// Keep the live terminals in lock-step with the pane tree: spawn one for every leaf that
@@ -1060,17 +1133,50 @@ impl App {
         }
         let window = self.state.as_ref().unwrap().window.clone();
 
-        // Panes in mouse-reporting mode keep right-click for the app; others get our menu.
-        let report_panes: HashSet<PaneId> = self
+        // Window title follows the active (focused) pane's title.
+        let active_title = self
             .terms
-            .keys()
-            .copied()
-            .filter(|id| self.mouse_modes(*id).0)
+            .get(&self.focus())
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        let desired = if active_title.is_empty() {
+            "potty".to_string()
+        } else {
+            format!("{active_title} — potty")
+        };
+        if self.window_title != desired {
+            self.window_title = desired.clone();
+            window.set_title(&desired);
+        }
+
+        // Each tab's label is its focused pane's title (falling back to the tab number).
+        let tab_titles: Vec<String> = self
+            .workspace
+            .tabs
+            .iter()
+            .map(|t| {
+                self.terms
+                    .get(&t.focus)
+                    .map(|x| x.title.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| t.title.clone())
+            })
             .collect();
+
+        // Apply the configurable chrome font size to egui's text styles.
+        let ui_size = self.config.ui_font_size;
+        self.egui_ctx.style_mut(|style| {
+            for st in [egui::TextStyle::Body, egui::TextStyle::Button] {
+                if let Some(f) = style.text_styles.get_mut(&st) {
+                    f.size = ui_size;
+                }
+            }
+        });
 
         let raw = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let mut actions = Vec::new();
         let mut leaves: Vec<(PaneId, egui::Rect)> = Vec::new();
+        let mut show_font = self.show_font_settings;
         let full = {
             let ws = &self.workspace;
             let families = &self.font_families;
@@ -1078,15 +1184,20 @@ impl App {
             let cur_size = self.config.font_size;
             self.egui_ctx.run(raw, |ctx| {
                 build_ui(
-                    ctx, ws, families, cur_family, cur_size, &report_panes, &mut actions,
-                    &mut leaves,
+                    ctx, ws, families, cur_family, cur_size, &tab_titles, &mut show_font,
+                    &mut actions, &mut leaves,
                 )
             })
         };
+        self.show_font_settings = show_font;
+        // Remember whether a popup/menu is open so the next frame's clicks don't leak through
+        // the menu into the terminal underneath.
+        self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open());
         for a in actions {
             match a {
                 Action::SetFontFamily(f) => self.set_font_family(f),
                 Action::SetFontSize(s) => self.set_font_size(s),
+                Action::ShowFontSettings => self.show_font_settings = true,
                 a => apply(&mut self.workspace, a),
             }
         }
@@ -1263,6 +1374,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // Terminal query response (DSR, DA, cursor position, …).
             UserEvent::PtyWrite(pane, text) => self.to_pty(pane, text.as_bytes()),
+            // The pane's program set / reset its title — redraw to refresh tab + window title.
+            UserEvent::Title(pane, title) => {
+                if let Some(t) = self.terms.get_mut(&pane) {
+                    t.title = title;
+                }
+                self.request_redraw();
+            }
+            UserEvent::ResetTitle(pane) => {
+                if let Some(t) = self.terms.get_mut(&pane) {
+                    t.title = t.default_title.clone();
+                }
+                self.request_redraw();
+            }
             // A shell exited — close its pane. Exit the app once no terminals remain.
             UserEvent::PaneExited(id) => {
                 self.terms.remove(&id);
@@ -1282,11 +1406,33 @@ impl ApplicationHandler<UserEvent> for App {
         _id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        // Decide what NOT to hand egui:
+        //  - All keyboard input: the chrome is mouse-only by design, so egui must not steal keys
+        //    (Tab navigating widgets, Space/Enter activating a focused tab) from the terminal.
+        //  - A plain right-click over a mouse-reporting pane: it belongs to the app, not our
+        //    context menu (shift, or a non-reporting pane, lets egui open the menu as usual).
+        let withhold_from_egui = match &event {
+            WindowEvent::KeyboardInput { .. } => true,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                !self.mods.state().shift_key()
+                    && self
+                        .pane_at(self.mouse_px.0, self.mouse_px.1)
+                        .is_some_and(|id| self.mouse_modes(id).0)
+            }
+            _ => false,
+        };
+
         if let Some(window) = self.state.as_ref().map(|s| s.window.clone()) {
             if let Some(es) = self.egui_state.as_mut() {
-                let resp = es.on_window_event(&window, &event);
-                if resp.repaint {
-                    window.request_redraw();
+                if !withhold_from_egui {
+                    let resp = es.on_window_event(&window, &event);
+                    if resp.repaint {
+                        window.request_redraw();
+                    }
                 }
             }
         }
@@ -1316,6 +1462,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // A menu/popup or the font window is open — let egui own this click.
+                if self.menu_open || self.show_font_settings {
+                    return;
+                }
                 let shift = self.mods.state().shift_key();
                 let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else { return };
                 let (report, sgr, ..) = self.mouse_modes(id);
@@ -1368,7 +1518,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let focus = self.focus();
                 self.to_pty(focus, text.as_bytes());
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !self.menu_open && !self.show_font_settings => {
                 // Positive = up / into history. 3 lines per wheel notch; touchpad by pixels.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
