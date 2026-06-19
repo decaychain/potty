@@ -1,9 +1,9 @@
 //! Tabs and the pane (panel) tree — the model the visual menu manipulates.
 //!
-//! This is structure only. There is exactly ONE live terminal for now; it lives in
-//! `home_pane` (pane 0 of tab 0). The menu can create tabs and split panes freely,
-//! and the terminal renders wherever its home pane currently sits. Every other pane
-//! is an honest empty placeholder until each pane gets its own PTY — the next milestone.
+//! This is structure only: every leaf is a pane id, and the app owns one live terminal
+//! per leaf (see `App::reconcile_terms`). The model never spawns or drops terminals
+//! itself — it just mutates the tree, and the app diffs `all_leaves()` against its live
+//! terminals to keep them in sync.
 
 use egui::{pos2, vec2, Rect};
 
@@ -113,6 +113,23 @@ impl Node {
             Node::Branch { a, .. } => a.first_leaf(),
         }
     }
+
+    fn contains(&self, id: PaneId) -> bool {
+        match self {
+            Node::Leaf(i) => *i == id,
+            Node::Branch { a, b, .. } => a.contains(id) || b.contains(id),
+        }
+    }
+
+    fn collect_leaves(&self, out: &mut Vec<PaneId>) {
+        match self {
+            Node::Leaf(id) => out.push(*id),
+            Node::Branch { a, b, .. } => {
+                a.collect_leaves(out);
+                b.collect_leaves(out);
+            }
+        }
+    }
 }
 
 pub struct Tab {
@@ -124,8 +141,6 @@ pub struct Tab {
 pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub active: usize,
-    /// The single pane that currently owns the live terminal.
-    pub home_pane: PaneId,
     next_id: PaneId,
 }
 
@@ -139,7 +154,6 @@ impl Workspace {
                 focus: home,
             }],
             active: 0,
-            home_pane: home,
             next_id: 1,
         }
     }
@@ -160,6 +174,41 @@ impl Workspace {
         out
     }
 
+    /// Every pane id across all tabs — the set the app keeps a live terminal for.
+    pub fn all_leaves(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            tab.layout.collect_leaves(&mut out);
+        }
+        out
+    }
+
+    /// Forcibly drop a pane wherever it lives (its terminal's shell exited), collapsing its
+    /// parent into the sibling and removing the tab if it was the last pane. Unlike
+    /// `close_focused`, this keeps no minimum — emptying the workspace is allowed (the app
+    /// then exits). No-op if the id is unknown (already gone).
+    pub fn remove_pane(&mut self, id: PaneId) {
+        let Some(ti) = self.tabs.iter().position(|t| t.layout.contains(id)) else {
+            return;
+        };
+        let taken = std::mem::replace(&mut self.tabs[ti].layout, Node::Leaf(id));
+        match taken.without(id) {
+            Some(remaining) => {
+                let tab = &mut self.tabs[ti];
+                if tab.focus == id {
+                    tab.focus = remaining.first_leaf();
+                }
+                tab.layout = remaining;
+            }
+            None => {
+                self.tabs.remove(ti);
+                if self.active >= self.tabs.len() {
+                    self.active = self.tabs.len().saturating_sub(1);
+                }
+            }
+        }
+    }
+
     pub fn split(&mut self, split: Split) {
         let id = self.alloc();
         let focus = self.tabs[self.active].focus;
@@ -176,10 +225,6 @@ impl Workspace {
     pub fn close_focused(&mut self) {
         let tab = &mut self.tabs[self.active];
         let focus = tab.focus;
-        // Refuse to close the live terminal's pane until panes own their own PTY.
-        if focus == self.home_pane && self.active == 0 {
-            return;
-        }
         let taken = std::mem::replace(&mut tab.layout, Node::Leaf(focus));
         match taken.without(focus) {
             Some(remaining) => {

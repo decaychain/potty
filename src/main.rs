@@ -5,13 +5,16 @@
 //!     └─ egui  : tab bar + pane menu                                          [pass 2]
 //!   portable-pty → vte parser → alacritty_terminal grid
 //!
-//! One live terminal still (home_pane in tab 0); it renders into its pane's rect, the
-//! others are placeholders. Next: a PTY+Term per pane.
+//! Real multiplexing: every leaf pane owns its own PTY + Term (App::terms, keyed by
+//! PaneId). The active tab's panes each render into their rect (one render submit per
+//! pane, scissored); background tabs keep running. Keyboard goes to the focused pane;
+//! the mouse acts on the pane under the cursor.
 
 mod config;
 mod gridr;
 mod workspace;
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -55,35 +58,42 @@ const TOPBAR: f32 = 34.0;
 
 type SharedTerm = Arc<Mutex<Term<EventProxy>>>;
 
-/// Events the terminal raises (from the PTY reader thread) that the main loop must service.
+/// Events the terminal raises (from a PTY reader thread) that the main loop must service.
+/// Variants that write back to a PTY carry the originating `PaneId`, since there is now a
+/// terminal per pane.
 enum UserEvent {
     Wake,
     ReloadConfig,
     /// OSC 52 store (app writes the system clipboard). Targets the clipboard selection.
     ClipboardStore(String),
-    /// OSC 52 load: read the clipboard, run the formatter, write the result back to the PTY.
-    ClipboardLoad(std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>),
-    /// Terminal query response (cursor position, device attributes, …) bound for the PTY.
-    PtyWrite(String),
+    /// OSC 52 load: read the clipboard, run the formatter, write the result back to the pane.
+    ClipboardLoad(PaneId, std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>),
+    /// Terminal query response (cursor position, device attributes, …) bound for the pane.
+    PtyWrite(PaneId, String),
+    /// A pane's shell exited (reader hit EOF) — close the pane.
+    PaneExited(PaneId),
 }
 
-/// Terminal event listener: forwards the events we care about to the main loop via the proxy.
-/// (PTY reader thread → here → `user_event`.) Replaces VoidListener, which dropped everything —
-/// notably OSC 52 clipboard writes and terminal query responses.
+/// Terminal event listener for one pane: forwards the events we care about to the main loop,
+/// tagging the writes with the pane id so they reach the right PTY. (PTY reader thread → here
+/// → `user_event`.) Replaces VoidListener, which dropped everything.
 #[derive(Clone)]
-struct EventProxy(EventLoopProxy<UserEvent>);
+struct EventProxy {
+    proxy: EventLoopProxy<UserEvent>,
+    pane: PaneId,
+}
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         // `ty` (clipboard vs primary) is ignored — OSC 52 in practice targets the clipboard.
         let forward = match event {
             Event::ClipboardStore(_ty, text) => Some(UserEvent::ClipboardStore(text)),
-            Event::ClipboardLoad(_ty, fmt) => Some(UserEvent::ClipboardLoad(fmt)),
-            Event::PtyWrite(text) => Some(UserEvent::PtyWrite(text)),
+            Event::ClipboardLoad(_ty, fmt) => Some(UserEvent::ClipboardLoad(self.pane, fmt)),
+            Event::PtyWrite(text) => Some(UserEvent::PtyWrite(self.pane, text)),
             _ => None,
         };
         if let Some(ev) = forward {
-            let _ = self.0.send_event(ev);
+            let _ = self.proxy.send_event(ev);
         }
     }
 }
@@ -123,6 +133,15 @@ fn dims_for(width_px: f32, height_px: f32, cell_w: f32, cell_h: f32) -> Dims {
         cols: ((width_px / cell_w).floor() as usize).max(1),
         rows: ((height_px / cell_h).floor() as usize).max(1),
     }
+}
+
+/// One live terminal: its grid model + the PTY master (for writes and resize) and current size.
+/// The reader thread that feeds the grid is detached; it ends when the PTY closes.
+struct Terminal {
+    term: SharedTerm,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    dims: Dims,
 }
 
 enum Action {
@@ -223,8 +242,9 @@ fn build_ui(
     families: &[String],
     cur_family: Option<&str>,
     cur_size: f32,
+    report_panes: &HashSet<PaneId>,
     actions: &mut Vec<Action>,
-    home_pts: &mut Option<egui::Rect>,
+    leaves: &mut Vec<(PaneId, egui::Rect)>,
 ) {
     egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -255,42 +275,28 @@ fn build_ui(
         .show(ctx, |ui| {
             let area = ui.max_rect();
             let focus = ws.active_tab().focus;
+            // Each leaf is a live terminal drawn underneath (pass 1) — keep the fill
+            // transparent. We DO claim the rect for a right-click context menu, but only
+            // when the pane isn't in mouse-reporting mode (so apps like Zellij/vim still get
+            // right-click). Left-clicks fall through to our own handler regardless (it gates
+            // geometrically, not on egui consumption), so text selection/focus still work.
             for (id, rect) in ws.leaf_rects(area) {
-                let is_home = id == ws.home_pane && ws.active == 0;
-
-                // The live pane must NOT capture clicks — they belong to text selection.
-                // Placeholder panes stay clickable (focus) and right-clickable (pane menu).
-                if !is_home {
-                    let resp = ui.interact(
-                        rect,
-                        egui::Id::new(("pane", ws.active, id)),
-                        egui::Sense::click(),
-                    );
-                    if resp.clicked() {
-                        actions.push(Action::Focus(id));
-                    }
-                    resp.context_menu(|ui| pane_menu(ui, actions, Some(id)));
-                }
-
-                let painter = ui.painter();
-                if is_home {
-                    *home_pts = Some(rect); // transparent — terminal drawn here in pass 1
-                } else {
-                    painter.rect_filled(rect, egui::CornerRadius::same(4), egui::Color32::from_gray(18));
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "empty pane",
-                        egui::FontId::proportional(13.0),
-                        egui::Color32::from_gray(110),
-                    );
+                if !report_panes.contains(&id) {
+                    ui.interact(rect, egui::Id::new(("pane", ws.active, id)), egui::Sense::click())
+                        .context_menu(|ui| pane_menu(ui, actions, Some(id)));
                 }
                 let stroke = if id == focus {
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 160, 255))
                 } else {
                     egui::Stroke::new(1.0, egui::Color32::from_gray(60))
                 };
-                painter.rect_stroke(rect, egui::CornerRadius::same(4), stroke, egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(4),
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+                leaves.push((id, rect));
             }
         });
 }
@@ -308,6 +314,8 @@ struct WindowState {
     grid: GridRenderer,
     window: Arc<Window>,
 }
+
+const BG_CLEAR: wgpu::Color = wgpu::Color { r: 0.02, g: 0.02, b: 0.025, a: 1.0 };
 
 impl WindowState {
     async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Self {
@@ -345,50 +353,103 @@ impl WindowState {
         Self { device, queue, surface, surface_config, instance, grid, window }
     }
 
+    /// Acquire the surface texture, mapping the recoverable error cases to a redraw request.
+    fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
+        match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) => Some(f),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                self.window.request_redraw();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                self.window.request_redraw();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface = self.instance.create_surface(self.window.clone()).unwrap();
+                self.surface.configure(&self.device, &self.surface_config);
+                self.window.request_redraw();
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Validation => panic!("surface validation error"),
+        }
+    }
+
     fn render(
         &mut self,
         egui_renderer: &mut egui_wgpu::Renderer,
         textures_delta: &egui::TexturesDelta,
         prims: &[egui::ClippedPrimitive],
         ppp: f32,
-        term_rect: Option<egui::Rect>,
-        term: Option<&Term<EventProxy>>,
+        panes: &[(egui::Rect, &Term<EventProxy>)],
     ) {
         let (sw, sh) = (self.surface_config.width, self.surface_config.height);
-
-        let draw_term = match (term_rect, term) {
-            (Some(rect), Some(term)) => {
-                let origin = (rect.min.x * ppp, rect.min.y * ppp);
-                self.grid.prepare(&self.device, &self.queue, term, origin, (sw as f32, sh as f32));
-                Some(rect)
-            }
-            _ => None,
-        };
-
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.window.request_redraw();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                self.window.request_redraw();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface = self.instance.create_surface(self.window.clone()).unwrap();
-                self.surface.configure(&self.device, &self.surface_config);
-                self.window.request_redraw();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => panic!("surface validation error"),
-        };
+        let Some(frame) = self.acquire() else { return };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
+
+        // Pass 1: one submit per pane (the renderer reuses a single instance buffer, so each
+        // pane must prepare→render→submit before the next overwrites it). The first clears the
+        // whole surface — including inter-pane gaps — then each draw is scissored to its rect.
+        let mut first = true;
+        for (rect, term) in panes {
+            let origin = (rect.min.x * ppp, rect.min.y * ppp);
+            self.grid.prepare(&self.device, &self.queue, *term, origin, (sw as f32, sh as f32));
+            let mut encoder = self
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor { label: Some("terminal") });
+            {
+                let load = if first { LoadOp::Clear(BG_CLEAR) } else { LoadOp::Load };
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("terminal"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations { load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                let x = (rect.min.x * ppp).max(0.0) as u32;
+                let y = (rect.min.y * ppp).max(0.0) as u32;
+                let w = ((rect.width() * ppp) as u32).min(sw.saturating_sub(x));
+                let h = ((rect.height() * ppp) as u32).min(sh.saturating_sub(y));
+                if w > 0 && h > 0 {
+                    pass.set_scissor_rect(x, y, w, h);
+                    self.grid.render(&mut pass);
+                }
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+            first = false;
+        }
+        if first {
+            // No panes (shouldn't happen) — still clear the surface so egui has a backdrop.
+            let mut encoder = self
+                .device
+                .create_command_encoder(&CommandEncoderDescriptor { label: Some("clear") });
+            encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("clear"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations { load: LoadOp::Clear(BG_CLEAR), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Pass 2: egui chrome on top.
         let mut encoder = self
             .device
-            .create_command_encoder(&CommandEncoderDescriptor { label: None });
-
+            .create_command_encoder(&CommandEncoderDescriptor { label: Some("egui") });
         for (id, delta) in &textures_delta.set {
             egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
         }
@@ -396,41 +457,8 @@ impl WindowState {
             size_in_pixels: [sw, sh],
             pixels_per_point: ppp,
         };
-        let egui_cmds = egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, prims, &screen);
-
-        // Pass 1: clear + terminal cells (scissored to the pane).
-        {
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("terminal"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.025, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Some(rect) = draw_term {
-                let x = (rect.min.x * ppp).max(0.0) as u32;
-                let y = (rect.min.y * ppp).max(0.0) as u32;
-                let w = (rect.width() * ppp) as u32;
-                let h = (rect.height() * ppp) as u32;
-                let w = w.min(sw.saturating_sub(x));
-                let h = h.min(sh.saturating_sub(y));
-                if w > 0 && h > 0 {
-                    pass.set_scissor_rect(x, y, w, h);
-                    self.grid.render(&mut pass);
-                }
-            }
-        }
-
-        // Pass 2: egui chrome on top.
+        let egui_cmds =
+            egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, prims, &screen);
         {
             let pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("egui"),
@@ -448,7 +476,6 @@ impl WindowState {
             let mut pass = pass.forget_lifetime();
             egui_renderer.render(&mut pass, prims, &screen);
         }
-
         for id in &textures_delta.free {
             egui_renderer.free_texture(id);
         }
@@ -465,16 +492,16 @@ impl WindowState {
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     state: Option<WindowState>,
-    term: Option<SharedTerm>,
-    writer: Option<Box<dyn Write + Send>>,
-    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    /// One live terminal per leaf pane, keyed by PaneId (across all tabs).
+    terms: HashMap<PaneId, Terminal>,
     mods: Modifiers,
 
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
     workspace: Workspace,
-    cur_dims: Dims,
+    /// Size newly spawned panes start at (the most recent fit); they're refitted next redraw.
+    last_dims: Dims,
     cell_w: f32,
     cell_h: f32,
 
@@ -484,13 +511,15 @@ struct App {
     scale: f32,
     _watcher: Option<notify::RecommendedWatcher>,
 
-    /// Live terminal pane rect in physical px (origin x, y, width, height) — for hit-testing.
-    term_px: Option<(f32, f32, f32, f32)>,
+    /// Active-tab pane rects in physical px: (id, origin x, origin y, width, height).
+    pane_px: Vec<(PaneId, f32, f32, f32, f32)>,
     mouse_px: (f64, f64),
+    /// The pane the in-progress press/drag (selection or mouse-report) belongs to.
+    mouse_pane: Option<PaneId>,
     selecting: bool,
     last_click: Option<(Instant, Point)>,
     click_count: u8,
-    /// When forwarding mouse events to the app: which button is held, and the last cell
+    /// While forwarding to a mouse-reporting app: which button is held, and the last cell
     /// reported (to suppress duplicate motion reports).
     mouse_held: Option<u8>,
     last_report_cell: Option<(i64, i64)>,
@@ -504,15 +533,13 @@ impl App {
         Self {
             proxy,
             state: None,
-            term: None,
-            writer: None,
-            master: None,
+            terms: HashMap::new(),
             mods: Modifiers::default(),
             egui_ctx: egui::Context::default(),
             egui_state: None,
             egui_renderer: None,
             workspace: Workspace::new(),
-            cur_dims: Dims { cols: 80, rows: 24 },
+            last_dims: Dims { cols: 80, rows: 24 },
             cell_w: 9.0,
             cell_h: 18.0,
             config: Config::default(),
@@ -520,8 +547,9 @@ impl App {
             font_families: Vec::new(),
             scale: 1.0,
             _watcher: None,
-            term_px: None,
+            pane_px: Vec::new(),
             mouse_px: (0.0, 0.0),
+            mouse_pane: None,
             selecting: false,
             last_click: None,
             click_count: 0,
@@ -536,15 +564,91 @@ impl App {
         size * 1.2 * self.scale
     }
 
+    /// The focused pane id (the keyboard target).
+    fn focus(&self) -> PaneId {
+        self.workspace.active_tab().focus
+    }
+
+    /// A cloned handle to a pane's grid (cloning the Arc, so callers don't borrow `self.terms`).
+    fn arc(&self, id: PaneId) -> Option<SharedTerm> {
+        self.terms.get(&id).map(|t| t.term.clone())
+    }
+
+    fn focused_arc(&self) -> Option<SharedTerm> {
+        self.arc(self.focus())
+    }
+
+    /// Spawn a PTY + Term + reader thread for a pane, sized at `dims`.
+    fn spawn_terminal(&mut self, id: PaneId, dims: Dims) {
+        let term: SharedTerm = Arc::new(Mutex::new(Term::new(
+            term_config(&self.config),
+            &dims,
+            EventProxy { proxy: self.proxy.clone(), pane: id },
+        )));
+
+        let pty = portable_pty::native_pty_system();
+        let pair = pty
+            .openpty(portable_pty::PtySize {
+                rows: dims.rows as u16,
+                cols: dims.cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let mut cmd = portable_pty::CommandBuilder::new(shell);
+        // Declare what we actually emulate so terminfo-driven apps (mc, ncurses) agree with
+        // the escape sequences we send (e.g. application cursor keys).
+        cmd.env("TERM", "xterm-256color");
+        let _child = pair.slave.spawn_command(cmd).unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+
+        let reader_term = term.clone();
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let mut parser = Processor::<StdSyncHandler>::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        {
+                            let mut t = reader_term.lock().unwrap();
+                            parser.advance(&mut *t, &buf[..n]);
+                        }
+                        let _ = proxy.send_event(UserEvent::Wake);
+                    }
+                }
+            }
+            let _ = proxy.send_event(UserEvent::PaneExited(id));
+        });
+
+        self.terms.insert(id, Terminal { term, writer, master: pair.master, dims });
+    }
+
+    /// Keep the live terminals in lock-step with the pane tree: spawn one for every leaf that
+    /// lacks a terminal, and drop terminals for panes that no longer exist (closing their PTY,
+    /// which ends the reader thread). Called after any action that mutates the tree.
+    fn reconcile_terms(&mut self) {
+        let live = self.workspace.all_leaves();
+        for id in &live {
+            if !self.terms.contains_key(id) {
+                self.spawn_terminal(*id, self.last_dims);
+            }
+        }
+        self.terms.retain(|id, _| live.contains(id));
+    }
+
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
-    /// family/size changed (and then force a terminal refit, since the cell box moved).
+    /// family/size changed (and then force a refit of every terminal, since the cell box moved).
     fn apply_config(&mut self, new: Config) {
         let font_changed =
             new.font_family != self.config.font_family || new.font_size != self.config.font_size;
         self.config = new;
-        // Hot-reload the OSC 52 clipboard policy.
-        if let Some(term) = &self.term {
-            term.lock().unwrap().set_options(term_config(&self.config));
+        // Hot-reload the OSC 52 clipboard policy on every live terminal.
+        for t in self.terms.values() {
+            t.term.lock().unwrap().set_options(term_config(&self.config));
         }
         let (family, size, scale) = (self.config.font_family.clone(), self.config.font_size, self.scale);
         let palette = self.config.palette();
@@ -556,7 +660,10 @@ impl App {
                 let m = state.grid.metrics();
                 self.cell_w = m.w;
                 self.cell_h = m.h;
-                self.cur_dims = Dims { cols: 0, rows: 0 }; // force refit next redraw
+                // Invalidate every terminal's size so the next redraw refits it.
+                for t in self.terms.values_mut() {
+                    t.dims = Dims { cols: 0, rows: 0 };
+                }
             }
             state.window.request_redraw();
         }
@@ -576,59 +683,55 @@ impl App {
         self.apply_config(c);
     }
 
-    /// Write raw bytes to the PTY.
-    fn to_pty(&mut self, bytes: &[u8]) {
-        if let Some(w) = self.writer.as_mut() {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
+    /// Write raw bytes to a pane's PTY.
+    fn to_pty(&mut self, id: PaneId, bytes: &[u8]) {
+        if let Some(t) = self.terms.get_mut(&id) {
+            let _ = t.writer.write_all(bytes);
+            let _ = t.writer.flush();
         }
     }
 
-    /// DECCKM (application cursor keys) state — decides SS3 vs CSI for cursor/Home/End.
-    fn app_cursor(&self) -> bool {
-        self.term
-            .as_ref()
+    /// DECCKM (application cursor keys) state of a pane — decides SS3 vs CSI.
+    fn app_cursor(&self, id: PaneId) -> bool {
+        self.arc(id)
             .is_some_and(|t| t.lock().unwrap().mode().contains(TermMode::APP_CURSOR))
     }
 
-    /// (alternate screen, alternate-scroll requested) — wheel behaves differently in each.
-    fn alt_modes(&self) -> (bool, bool) {
-        self.term.as_ref().map_or((false, false), |t| {
+    /// (alternate screen, alternate-scroll requested) for a pane — wheel behaves differently.
+    fn alt_modes(&self, id: PaneId) -> (bool, bool) {
+        self.arc(id).map_or((false, false), |t| {
             let guard = t.lock().unwrap();
             let m = guard.mode();
             (m.contains(TermMode::ALT_SCREEN), m.contains(TermMode::ALTERNATE_SCROLL))
         })
     }
 
-    /// Scroll the history viewport. No-op on the alternate screen (it has no scrollback).
-    fn scroll(&mut self, s: Scroll) {
-        if let Some(term) = &self.term {
+    /// Scroll a pane's history viewport. No-op on the alternate screen (it has no scrollback).
+    fn scroll(&mut self, id: PaneId, s: Scroll) {
+        if let Some(term) = self.arc(id) {
             let mut t = term.lock().unwrap();
             if t.mode().contains(TermMode::ALT_SCREEN) {
                 return;
             }
             t.scroll_display(s);
         }
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
-        }
+        self.request_redraw();
     }
 
-    /// Mouse wheel (lines > 0 = up/into history). Primary screen scrolls scrollback; the
-    /// alternate screen emits arrow keys when the app asked for alternate-scroll (less/vim).
-    /// Forwarding to mouse-reporting apps comes with the selection work.
-    fn on_wheel(&mut self, lines: i32) {
-        let (alt, alt_scroll) = self.alt_modes();
+    /// Mouse wheel over a pane (lines > 0 = up/into history). The primary screen scrolls
+    /// scrollback; the alternate screen emits arrow keys when the app asked for alternate-scroll.
+    fn on_wheel(&mut self, id: PaneId, lines: i32) {
+        let (alt, alt_scroll) = self.alt_modes(id);
         if alt {
             if alt_scroll {
                 let final_byte = if lines > 0 { b'A' } else { b'B' };
-                let seq = [0x1b, if self.app_cursor() { b'O' } else { b'[' }, final_byte];
+                let seq = [0x1b, if self.app_cursor(id) { b'O' } else { b'[' }, final_byte];
                 for _ in 0..lines.unsigned_abs() {
-                    self.to_pty(&seq);
+                    self.to_pty(id, &seq);
                 }
             }
         } else {
-            self.scroll(Scroll::Delta(lines));
+            self.scroll(id, Scroll::Delta(lines));
         }
     }
 
@@ -638,37 +741,46 @@ impl App {
         }
     }
 
-    fn display_offset(&self) -> i32 {
-        self.term
-            .as_ref()
+    fn display_offset(&self, id: PaneId) -> i32 {
+        self.arc(id)
             .map_or(0, |t| t.lock().unwrap().grid().display_offset() as i32)
     }
 
-    /// Is a physical-pixel position inside the live terminal pane? (Press gate — egui's
-    /// `wants_pointer_input` is over-eager over the whole window, so we test geometry.)
-    fn in_term(&self, px: f64, py: f64) -> bool {
-        self.term_px.is_some_and(|(ox, oy, w, h)| {
-            let (px, py) = (px as f32, py as f32);
-            px >= ox && px < ox + w && py >= oy && py < oy + h
-        })
+    /// The pane under a physical-pixel position (active tab only), if any.
+    fn pane_at(&self, px: f64, py: f64) -> Option<PaneId> {
+        let (px, py) = (px as f32, py as f32);
+        self.pane_px
+            .iter()
+            .find(|(_, ox, oy, w, h)| px >= *ox && px < ox + w && py >= *oy && py < oy + h)
+            .map(|(id, ..)| *id)
     }
 
-    /// Map a physical-pixel position to a grid point (absolute line, incl. scrollback) and
-    /// which half of the cell it falls on. None when outside the live terminal pane.
-    fn point_at(&self, px: f64, py: f64) -> Option<(Point, Side)> {
-        let (ox, oy, w, h) = self.term_px?;
+    /// A pane's pixel rect (origin x, y, width, height).
+    fn rect_of(&self, id: PaneId) -> Option<(f32, f32, f32, f32)> {
+        self.pane_px
+            .iter()
+            .find(|(p, ..)| *p == id)
+            .map(|(_, ox, oy, w, h)| (*ox, *oy, *w, *h))
+    }
+
+    /// Map a physical-pixel position to a grid point in pane `id` (absolute line, incl.
+    /// scrollback) and which half of the cell it falls on.
+    fn point_at(&self, id: PaneId, px: f64, py: f64) -> Option<(Point, Side)> {
+        let (ox, oy, w, h) = self.rect_of(id)?;
+        let dims = self.terms.get(&id)?.dims;
         let relx = (px as f32 - ox).clamp(0.0, (w - 1.0).max(0.0));
         let rely = (py as f32 - oy).clamp(0.0, (h - 1.0).max(0.0));
-        let col = ((relx / self.cell_w) as usize).min(self.cur_dims.cols.saturating_sub(1));
-        let vis_row = ((rely / self.cell_h) as i32).min(self.cur_dims.rows as i32 - 1).max(0);
-        let line = vis_row - self.display_offset();
+        let col = ((relx / self.cell_w) as usize).min(dims.cols.saturating_sub(1));
+        let vis_row = ((rely / self.cell_h) as i32).min(dims.rows as i32 - 1).max(0);
+        let line = vis_row - self.display_offset(id);
         let side = if (relx / self.cell_w).fract() > 0.5 { Side::Right } else { Side::Left };
         Some((Point::new(Line(line), Column(col)), side))
     }
 
-    /// Mouse-reporting flags: (any reporting on, SGR encoding, any-motion 1003, button-drag 1002).
-    fn mouse_modes(&self) -> (bool, bool, bool, bool) {
-        self.term.as_ref().map_or((false, false, false, false), |t| {
+    /// Mouse-reporting flags of a pane: (any reporting on, SGR encoding, any-motion 1003,
+    /// button-drag 1002).
+    fn mouse_modes(&self, id: PaneId) -> (bool, bool, bool, bool) {
+        self.arc(id).map_or((false, false, false, false), |t| {
             let guard = t.lock().unwrap();
             let m = guard.mode();
             (
@@ -680,16 +792,16 @@ impl App {
         })
     }
 
-    /// 1-based viewport cell (column, row) under a physical-pixel position, for mouse reports.
-    fn cell_vp(&self, px: f64, py: f64) -> Option<(i64, i64)> {
-        let (ox, oy, w, h) = self.term_px?;
+    /// 1-based viewport cell (column, row) under a position within pane `id`, for mouse reports.
+    fn cell_vp(&self, id: PaneId, px: f64, py: f64) -> Option<(i64, i64)> {
+        let (ox, oy, w, h) = self.rect_of(id)?;
         let relx = (px as f32 - ox).clamp(0.0, (w - 1.0).max(0.0));
         let rely = (py as f32 - oy).clamp(0.0, (h - 1.0).max(0.0));
         Some(((relx / self.cell_w) as i64 + 1, (rely / self.cell_h) as i64 + 1))
     }
 
-    /// Encode a mouse event and write it to the PTY (SGR-1006 when negotiated, else X10).
-    fn report_mouse(&mut self, cb: u8, pressed: bool, col: i64, row: i64, sgr: bool) {
+    /// Encode a mouse event and write it to a pane's PTY (SGR-1006 when negotiated, else X10).
+    fn report_mouse(&mut self, id: PaneId, cb: u8, pressed: bool, col: i64, row: i64, sgr: bool) {
         let bytes = if sgr {
             format!("\x1b[<{};{};{}{}", cb, col, row, if pressed { 'M' } else { 'm' }).into_bytes()
         } else {
@@ -697,23 +809,24 @@ impl App {
             let b = if pressed { cb } else { 3 };
             vec![0x1b, b'[', b'M', 32 + b, (col.min(223) + 32) as u8, (row.min(223) + 32) as u8]
         };
-        self.to_pty(&bytes);
+        self.to_pty(id, &bytes);
     }
 
-    /// Report motion for the held button (or 3 = no button), deduped to cell changes.
-    fn report_motion(&mut self, cb: u8, sgr: bool) {
-        let Some((col, row)) = self.cell_vp(self.mouse_px.0, self.mouse_px.1) else { return };
+    /// Report motion for the held button (or 3 = no button) in pane `id`, deduped to cell changes.
+    fn report_motion(&mut self, id: PaneId, cb: u8, sgr: bool) {
+        let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1) else { return };
         if self.last_report_cell == Some((col, row)) {
             return;
         }
         self.last_report_cell = Some((col, row));
-        self.report_mouse(cb + 32, true, col, row, sgr);
+        self.report_mouse(id, cb + 32, true, col, row, sgr);
     }
 
-    /// Begin a selection at the mouse, choosing simple/word/line by click count.
+    /// Begin a selection in `self.mouse_pane`, choosing simple/word/line by click count.
     fn start_selection(&mut self) {
+        let Some(id) = self.mouse_pane else { return };
         let (px, py) = self.mouse_px;
-        let Some((point, side)) = self.point_at(px, py) else { return };
+        let Some((point, side)) = self.point_at(id, px, py) else { return };
 
         let now = Instant::now();
         let recent = self
@@ -727,7 +840,7 @@ impl App {
             3 => SelectionType::Lines,    // whole line
             _ => SelectionType::Simple,
         };
-        if let Some(term) = &self.term {
+        if let Some(term) = self.arc(id) {
             term.lock().unwrap().selection = Some(Selection::new(ty, point, side));
         }
         self.selecting = true;
@@ -736,9 +849,10 @@ impl App {
 
     /// Extend the in-progress selection to the mouse.
     fn update_selection(&mut self) {
+        let Some(id) = self.mouse_pane else { return };
         let (px, py) = self.mouse_px;
-        let Some((point, side)) = self.point_at(px, py) else { return };
-        if let Some(term) = &self.term {
+        let Some((point, side)) = self.point_at(id, px, py) else { return };
+        if let Some(term) = self.arc(id) {
             if let Some(sel) = term.lock().unwrap().selection.as_mut() {
                 sel.update(point, side);
             }
@@ -750,8 +864,9 @@ impl App {
     /// selection is published to the primary selection (middle-click paste source on Linux).
     fn end_selection(&mut self) {
         self.selecting = false;
+        let id = self.mouse_pane.take();
         let mut selected = None;
-        if let Some(term) = &self.term {
+        if let Some(term) = id.and_then(|id| self.arc(id)) {
             let mut t = term.lock().unwrap();
             if t.selection.as_ref().is_some_and(|s| s.is_empty()) {
                 t.selection = None;
@@ -767,17 +882,18 @@ impl App {
         self.request_redraw();
     }
 
+    /// Clear the focused pane's selection (used when typing into it).
     fn clear_selection(&mut self) {
-        if let Some(term) = &self.term {
+        if let Some(term) = self.focused_arc() {
             term.lock().unwrap().selection = None;
         }
     }
 
-    /// Copy the active selection to the clipboard and clear it. Returns whether anything was copied.
+    /// Copy the focused pane's selection to the clipboard and clear it. Returns whether anything
+    /// was copied.
     fn copy(&mut self) -> bool {
         let text = self
-            .term
-            .as_ref()
+            .focused_arc()
             .and_then(|t| t.lock().unwrap().selection_to_string());
         match text {
             Some(s) if !s.is_empty() => {
@@ -792,14 +908,13 @@ impl App {
         }
     }
 
-    /// Write text to the PTY, wrapped in bracketed-paste markers when the app enabled them.
-    fn paste_text(&mut self, text: &str) {
+    /// Write text to a pane's PTY, wrapped in bracketed-paste markers when the app enabled them.
+    fn paste_text(&mut self, id: PaneId, text: &str) {
         if text.is_empty() {
             return;
         }
         let bracketed = self
-            .term
-            .as_ref()
+            .arc(id)
             .is_some_and(|t| t.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE));
         let mut out = Vec::new();
         if bracketed {
@@ -809,30 +924,31 @@ impl App {
         if bracketed {
             out.extend_from_slice(b"\x1b[201~");
         }
-        self.to_pty(&out);
+        self.to_pty(id, &out);
     }
 
     fn paste(&mut self) {
         let text = self.clipboard.as_ref().and_then(|cb| cb.load().ok());
         if let Some(t) = text {
-            self.paste_text(&t);
+            self.paste_text(self.focus(), &t);
         }
     }
 
     fn on_key(&mut self, ev: &KeyEvent) {
-        if ev.state != ElementState::Pressed {
+        if ev.state != ElementState::Pressed || self.terms.is_empty() {
             return;
         }
+        let focus = self.focus();
         let ctrl = self.mods.state().control_key();
         let shift = self.mods.state().shift_key();
 
-        // Shift+nav scrolls the history viewport (and is not sent to the PTY).
+        // Shift+nav scrolls the focused pane's history viewport (and is not sent to the PTY).
         if shift {
             match &ev.logical_key {
-                Key::Named(NamedKey::PageUp) => return self.scroll(Scroll::PageUp),
-                Key::Named(NamedKey::PageDown) => return self.scroll(Scroll::PageDown),
-                Key::Named(NamedKey::Home) => return self.scroll(Scroll::Top),
-                Key::Named(NamedKey::End) => return self.scroll(Scroll::Bottom),
+                Key::Named(NamedKey::PageUp) => return self.scroll(focus, Scroll::PageUp),
+                Key::Named(NamedKey::PageDown) => return self.scroll(focus, Scroll::PageDown),
+                Key::Named(NamedKey::Home) => return self.scroll(focus, Scroll::Top),
+                Key::Named(NamedKey::End) => return self.scroll(focus, Scroll::Bottom),
                 _ => {}
             }
         }
@@ -863,7 +979,7 @@ impl App {
         }
         // Cursor keys: `ESC O x` in application mode, else `ESC [ x`. mc (ncurses) relies on
         // this; vim is lenient and accepts CSI either way — which is why it "worked".
-        let cur = |b: u8| -> Vec<u8> { vec![0x1b, if self.app_cursor() { b'O' } else { b'[' }, b] };
+        let cur = |b: u8| -> Vec<u8> { vec![0x1b, if self.app_cursor(focus) { b'O' } else { b'[' }, b] };
 
         let mut out: Vec<u8> = Vec::new();
         match &ev.logical_key {
@@ -911,23 +1027,23 @@ impl App {
             }
         }
         if !out.is_empty() {
-            // Typing clears any selection and returns the viewport to the prompt.
+            // Typing clears the focused selection and returns its viewport to the prompt.
             self.clear_selection();
-            self.scroll(Scroll::Bottom);
-            self.to_pty(&out);
+            self.scroll(focus, Scroll::Bottom);
+            self.to_pty(focus, &out);
         }
     }
 
-    fn fit_terminal(&mut self, dims: Dims) {
-        if dims == self.cur_dims {
-            return;
-        }
-        self.cur_dims = dims;
-        if let Some(term) = &self.term {
-            term.lock().unwrap().resize(dims);
-        }
-        if let Some(master) = &self.master {
-            let _ = master.resize(portable_pty::PtySize {
+    /// Resize a pane's terminal + PTY to `dims` (no-op if unchanged).
+    fn fit_terminal(&mut self, id: PaneId, dims: Dims) {
+        if let Some(t) = self.terms.get_mut(&id) {
+            if t.dims == dims {
+                return;
+            }
+            t.dims = dims;
+            self.last_dims = dims;
+            t.term.lock().unwrap().resize(dims);
+            let _ = t.master.resize(portable_pty::PtySize {
                 rows: dims.rows as u16,
                 cols: dims.cols as u16,
                 pixel_width: 0,
@@ -938,21 +1054,33 @@ impl App {
 
     #[allow(deprecated)] // egui_ctx.run → run_ui migration, see build_ui note
     fn redraw(&mut self) {
-        if self.state.is_none() {
+        // Nothing to draw once the last terminal is gone (we're exiting).
+        if self.state.is_none() || self.terms.is_empty() {
             return;
         }
         let window = self.state.as_ref().unwrap().window.clone();
 
+        // Panes in mouse-reporting mode keep right-click for the app; others get our menu.
+        let report_panes: HashSet<PaneId> = self
+            .terms
+            .keys()
+            .copied()
+            .filter(|id| self.mouse_modes(*id).0)
+            .collect();
+
         let raw = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let mut actions = Vec::new();
-        let mut home_pts = None;
+        let mut leaves: Vec<(PaneId, egui::Rect)> = Vec::new();
         let full = {
             let ws = &self.workspace;
             let families = &self.font_families;
             let cur_family = self.config.font_family.as_deref();
             let cur_size = self.config.font_size;
             self.egui_ctx.run(raw, |ctx| {
-                build_ui(ctx, ws, families, cur_family, cur_size, &mut actions, &mut home_pts)
+                build_ui(
+                    ctx, ws, families, cur_family, cur_size, &report_panes, &mut actions,
+                    &mut leaves,
+                )
             })
         };
         for a in actions {
@@ -962,6 +1090,10 @@ impl App {
                 a => apply(&mut self.workspace, a),
             }
         }
+        // Actions may have created/destroyed panes — keep a terminal per leaf. (The `leaves`
+        // rects reflect the pre-action layout for this frame; egui requests a repaint after the
+        // interaction, so the new layout lands next frame.)
+        self.reconcile_terms();
 
         let egui::FullOutput {
             platform_output,
@@ -975,28 +1107,33 @@ impl App {
             .unwrap()
             .handle_platform_output(&window, platform_output);
 
-        if let Some(r) = home_pts {
-            let dims = dims_for(r.width() * pixels_per_point, r.height() * pixels_per_point, self.cell_w, self.cell_h);
-            self.fit_terminal(dims);
+        let ppp = pixels_per_point;
+        // Fit each active-tab terminal to its pane, and remember pane rects for hit-testing.
+        for (id, r) in &leaves {
+            let dims = dims_for(r.width() * ppp, r.height() * ppp, self.cell_w, self.cell_h);
+            self.fit_terminal(*id, dims);
         }
-        // Remember the live pane's pixel rect for mouse hit-testing.
-        self.term_px = home_pts.map(|r| {
-            let p = pixels_per_point;
-            (r.min.x * p, r.min.y * p, r.width() * p, r.height() * p)
-        });
+        self.pane_px = leaves
+            .iter()
+            .map(|(id, r)| (*id, r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp))
+            .collect();
 
-        let prims = self.egui_ctx.tessellate(shapes, pixels_per_point);
-        let guard = self.term.as_ref().map(|t| t.lock().unwrap());
+        let prims = self.egui_ctx.tessellate(shapes, ppp);
+
+        // Lock every visible pane's grid (cloned Arcs, so `self` stays free) and hand the
+        // renderer a rect+grid for each.
+        let arcs: Vec<(egui::Rect, SharedTerm)> = leaves
+            .iter()
+            .filter_map(|(id, r)| self.terms.get(id).map(|t| (*r, t.term.clone())))
+            .collect();
+        let guards: Vec<(egui::Rect, std::sync::MutexGuard<Term<EventProxy>>)> =
+            arcs.iter().map(|(r, a)| (*r, a.lock().unwrap())).collect();
+        let refs: Vec<(egui::Rect, &Term<EventProxy>)> =
+            guards.iter().map(|(r, g)| (*r, &**g)).collect();
+
         let renderer = self.egui_renderer.as_mut().unwrap();
         if let Some(state) = self.state.as_mut() {
-            state.render(
-                renderer,
-                &textures_delta,
-                &prims,
-                pixels_per_point,
-                home_pts,
-                guard.as_deref(),
-            );
+            state.render(renderer, &textures_delta, &prims, ppp, &refs);
         }
     }
 }
@@ -1054,57 +1191,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
-        // Initial grid size from the content area (window minus the top bar).
-        let dims = dims_for(
+        // Initial grid size from the content area (window minus the top bar). New panes spawn
+        // at this size until the first redraw fits them to their actual rect.
+        self.last_dims = dims_for(
             size.width as f32,
             size.height as f32 - TOPBAR * scale,
             self.cell_w,
             self.cell_h,
         );
-        self.cur_dims = dims;
-
-        let term: SharedTerm = Arc::new(Mutex::new(Term::new(
-            term_config(&self.config),
-            &dims,
-            EventProxy(self.proxy.clone()),
-        )));
-
-        let pty = portable_pty::native_pty_system();
-        let pair = pty
-            .openpty(portable_pty::PtySize {
-                rows: dims.rows as u16,
-                cols: dims.cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let mut cmd = portable_pty::CommandBuilder::new(shell);
-        // Declare what we actually emulate so terminfo-driven apps (mc, ncurses) agree
-        // with the escape sequences we send (e.g. application cursor keys).
-        cmd.env("TERM", "xterm-256color");
-        let _child = pair.slave.spawn_command(cmd).unwrap();
-        let mut reader = pair.master.try_clone_reader().unwrap();
-        let writer = pair.master.take_writer().unwrap();
-
-        let reader_term = term.clone();
-        let proxy = self.proxy.clone();
-        thread::spawn(move || {
-            let mut parser = Processor::<StdSyncHandler>::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        {
-                            let mut t = reader_term.lock().unwrap();
-                            parser.advance(&mut *t, &buf[..n]);
-                        }
-                        let _ = proxy.send_event(UserEvent::Wake);
-                    }
-                }
-            }
-        });
 
         // egui plumbing.
         let egui_state = egui_winit::State::new(
@@ -1133,11 +1227,11 @@ impl ApplicationHandler<UserEvent> for App {
         );
 
         self.state = Some(state);
-        self.term = Some(term);
-        self.writer = Some(writer);
-        self.master = Some(pair.master);
         self.egui_state = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
+
+        // Spawn the home terminal (and any other leaves, though there's only one at startup).
+        self.reconcile_terms();
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1146,7 +1240,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.clipboard = None;
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Wake => self.request_redraw(),
             UserEvent::ReloadConfig => {
@@ -1159,16 +1253,26 @@ impl ApplicationHandler<UserEvent> for App {
                     cb.store(text);
                 }
             }
-            // OSC 52: app reads the clipboard; format the response and send it to the PTY.
-            UserEvent::ClipboardLoad(fmt) => {
+            // OSC 52: app reads the clipboard; format the response and send it to that pane.
+            UserEvent::ClipboardLoad(pane, fmt) => {
                 let text = self.clipboard.as_ref().and_then(|cb| cb.load().ok());
                 if let Some(t) = text {
                     let response = fmt(&t);
-                    self.to_pty(response.as_bytes());
+                    self.to_pty(pane, response.as_bytes());
                 }
             }
             // Terminal query response (DSR, DA, cursor position, …).
-            UserEvent::PtyWrite(text) => self.to_pty(text.as_bytes()),
+            UserEvent::PtyWrite(pane, text) => self.to_pty(pane, text.as_bytes()),
+            // A shell exited — close its pane. Exit the app once no terminals remain.
+            UserEvent::PaneExited(id) => {
+                self.terms.remove(&id);
+                self.workspace.remove_pane(id);
+                if self.terms.is_empty() {
+                    event_loop.exit();
+                } else {
+                    self.request_redraw();
+                }
+            }
         }
     }
 
@@ -1191,22 +1295,31 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_px = (position.x, position.y);
-                let (report, sgr, motion, drag) = self.mouse_modes();
-                if report && !self.mods.state().shift_key() {
-                    // Forward motion: held-button drag (1002) or any-motion tracking (1003).
-                    match self.mouse_held {
-                        Some(cb) if drag || motion => self.report_motion(cb, sgr),
-                        None if motion => self.report_motion(3, sgr), // 3 = no button
-                        _ => {}
+                let shift = self.mods.state().shift_key();
+                if let Some(id) = self.mouse_pane {
+                    // An interaction is in progress — it stays with its origin pane.
+                    let (report, sgr, motion, drag) = self.mouse_modes(id);
+                    if report && !shift {
+                        match self.mouse_held {
+                            Some(cb) if drag || motion => self.report_motion(id, cb, sgr),
+                            _ => {}
+                        }
+                    } else if self.selecting {
+                        self.update_selection();
                     }
-                } else if self.selecting {
-                    self.update_selection();
+                } else if let Some(id) = self.pane_at(position.x, position.y) {
+                    // Hover motion (no button): only meaningful for any-motion tracking (1003).
+                    let (report, sgr, motion, _) = self.mouse_modes(id);
+                    if report && !shift && motion {
+                        self.report_motion(id, 3, sgr); // 3 = no button
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let (report, sgr, ..) = self.mouse_modes();
                 let shift = self.mods.state().shift_key();
-                let in_term = self.in_term(self.mouse_px.0, self.mouse_px.1);
+                let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else { return };
+                let (report, sgr, ..) = self.mouse_modes(id);
+                let pressed = state == ElementState::Pressed;
                 let cb = match button {
                     MouseButton::Left => Some(0),
                     MouseButton::Middle => Some(1),
@@ -1215,27 +1328,33 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 // App mouse mode (and no Shift) → forward to the app (Zellij/vim/htop select).
                 // Shift bypasses reporting and forces our local selection — the standard override.
-                if report && !shift && in_term {
-                    if let (Some(cb), Some((col, row))) =
-                        (cb, self.cell_vp(self.mouse_px.0, self.mouse_px.1))
-                    {
-                        let pressed = state == ElementState::Pressed;
-                        self.mouse_held = if pressed { Some(cb) } else { None };
-                        self.last_report_cell = Some((col, row));
-                        self.report_mouse(cb, pressed, col, row, sgr);
+                if report && !shift {
+                    if pressed {
+                        self.workspace.focus(id);
                     }
+                    if let Some(cb) = cb {
+                        if let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1) {
+                            self.mouse_held = if pressed { Some(cb) } else { None };
+                            self.mouse_pane = if pressed { Some(id) } else { None };
+                            self.last_report_cell = Some((col, row));
+                            self.report_mouse(id, cb, pressed, col, row, sgr);
+                        }
+                    }
+                    self.request_redraw();
                 } else {
                     match (button, state) {
-                        (MouseButton::Left, ElementState::Pressed) if in_term => {
-                            self.start_selection()
+                        (MouseButton::Left, ElementState::Pressed) => {
+                            self.workspace.focus(id);
+                            self.mouse_pane = Some(id);
+                            self.start_selection();
                         }
                         (MouseButton::Left, ElementState::Released) if self.selecting => {
                             self.end_selection()
                         }
-                        (MouseButton::Middle, ElementState::Pressed) if in_term => {
+                        (MouseButton::Middle, ElementState::Pressed) => {
                             let text = self.clipboard.as_ref().and_then(|cb| cb.load_primary().ok());
                             if let Some(t) = text {
-                                self.paste_text(&t);
+                                self.paste_text(id, &t);
                             }
                         }
                         _ => {}
@@ -1245,7 +1364,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
             // IME commit (composed text, or text from an active input-method framework).
-            WindowEvent::Ime(Ime::Commit(text)) => self.to_pty(text.as_bytes()),
+            WindowEvent::Ime(Ime::Commit(text)) if !self.terms.is_empty() => {
+                let focus = self.focus();
+                self.to_pty(focus, text.as_bytes());
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Positive = up / into history. 3 lines per wheel notch; touchpad by pixels.
                 let lines = match delta {
@@ -1253,17 +1375,18 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h.max(1.0) as f64) as i32,
                 };
                 if lines != 0 {
-                    let (report, sgr, ..) = self.mouse_modes();
+                    let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else { return };
+                    let (report, sgr, ..) = self.mouse_modes(id);
                     if report && !self.mods.state().shift_key() {
                         // Forward as wheel buttons (64 = up, 65 = down) so the app scrolls.
                         let cb = if lines > 0 { 64 } else { 65 };
-                        if let Some((col, row)) = self.cell_vp(self.mouse_px.0, self.mouse_px.1) {
+                        if let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1) {
                             for _ in 0..lines.unsigned_abs() {
-                                self.report_mouse(cb, true, col, row, sgr);
+                                self.report_mouse(id, cb, true, col, row, sgr);
                             }
                         }
                     } else {
-                        self.on_wheel(lines);
+                        self.on_wheel(id, lines);
                     }
                 }
             }
