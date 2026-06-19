@@ -490,6 +490,10 @@ struct App {
     selecting: bool,
     last_click: Option<(Instant, Point)>,
     click_count: u8,
+    /// When forwarding mouse events to the app: which button is held, and the last cell
+    /// reported (to suppress duplicate motion reports).
+    mouse_held: Option<u8>,
+    last_report_cell: Option<(i64, i64)>,
 
     /// Wayland clipboard (clipboard + primary selection) via the app's own seat.
     clipboard: Option<smithay_clipboard::Clipboard>,
@@ -521,6 +525,8 @@ impl App {
             selecting: false,
             last_click: None,
             click_count: 0,
+            mouse_held: None,
+            last_report_cell: None,
             clipboard: None,
         }
     }
@@ -658,6 +664,50 @@ impl App {
         let line = vis_row - self.display_offset();
         let side = if (relx / self.cell_w).fract() > 0.5 { Side::Right } else { Side::Left };
         Some((Point::new(Line(line), Column(col)), side))
+    }
+
+    /// Mouse-reporting flags: (any reporting on, SGR encoding, any-motion 1003, button-drag 1002).
+    fn mouse_modes(&self) -> (bool, bool, bool, bool) {
+        self.term.as_ref().map_or((false, false, false, false), |t| {
+            let guard = t.lock().unwrap();
+            let m = guard.mode();
+            (
+                m.intersects(TermMode::MOUSE_MODE),
+                m.contains(TermMode::SGR_MOUSE),
+                m.contains(TermMode::MOUSE_MOTION),
+                m.contains(TermMode::MOUSE_DRAG),
+            )
+        })
+    }
+
+    /// 1-based viewport cell (column, row) under a physical-pixel position, for mouse reports.
+    fn cell_vp(&self, px: f64, py: f64) -> Option<(i64, i64)> {
+        let (ox, oy, w, h) = self.term_px?;
+        let relx = (px as f32 - ox).clamp(0.0, (w - 1.0).max(0.0));
+        let rely = (py as f32 - oy).clamp(0.0, (h - 1.0).max(0.0));
+        Some(((relx / self.cell_w) as i64 + 1, (rely / self.cell_h) as i64 + 1))
+    }
+
+    /// Encode a mouse event and write it to the PTY (SGR-1006 when negotiated, else X10).
+    fn report_mouse(&mut self, cb: u8, pressed: bool, col: i64, row: i64, sgr: bool) {
+        let bytes = if sgr {
+            format!("\x1b[<{};{};{}{}", cb, col, row, if pressed { 'M' } else { 'm' }).into_bytes()
+        } else {
+            // X10: button+32, coords clamped to 223 and offset by 32; release is button 3.
+            let b = if pressed { cb } else { 3 };
+            vec![0x1b, b'[', b'M', 32 + b, (col.min(223) + 32) as u8, (row.min(223) + 32) as u8]
+        };
+        self.to_pty(&bytes);
+    }
+
+    /// Report motion for the held button (or 3 = no button), deduped to cell changes.
+    fn report_motion(&mut self, cb: u8, sgr: bool) {
+        let Some((col, row)) = self.cell_vp(self.mouse_px.0, self.mouse_px.1) else { return };
+        if self.last_report_cell == Some((col, row)) {
+            return;
+        }
+        self.last_report_cell = Some((col, row));
+        self.report_mouse(cb + 32, true, col, row, sgr);
     }
 
     /// Begin a selection at the mouse, choosing simple/word/line by click count.
@@ -1141,27 +1191,55 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_px = (position.x, position.y);
-                if self.selecting {
+                let (report, sgr, motion, drag) = self.mouse_modes();
+                if report && !self.mods.state().shift_key() {
+                    // Forward motion: held-button drag (1002) or any-motion tracking (1003).
+                    match self.mouse_held {
+                        Some(cb) if drag || motion => self.report_motion(cb, sgr),
+                        None if motion => self.report_motion(3, sgr), // 3 = no button
+                        _ => {}
+                    }
+                } else if self.selecting {
                     self.update_selection();
                 }
             }
-            // A press inside the live pane starts a selection; the tab bar/menus sit outside it.
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed if self.in_term(self.mouse_px.0, self.mouse_px.1) => {
-                    self.start_selection()
-                }
-                ElementState::Released if self.selecting => self.end_selection(),
-                _ => {}
-            },
-            // Middle-click pastes the primary selection (Linux convention).
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Middle,
-                ..
-            } if self.in_term(self.mouse_px.0, self.mouse_px.1) => {
-                let text = self.clipboard.as_ref().and_then(|cb| cb.load_primary().ok());
-                if let Some(t) = text {
-                    self.paste_text(&t);
+            WindowEvent::MouseInput { state, button, .. } => {
+                let (report, sgr, ..) = self.mouse_modes();
+                let shift = self.mods.state().shift_key();
+                let in_term = self.in_term(self.mouse_px.0, self.mouse_px.1);
+                let cb = match button {
+                    MouseButton::Left => Some(0),
+                    MouseButton::Middle => Some(1),
+                    MouseButton::Right => Some(2),
+                    _ => None,
+                };
+                // App mouse mode (and no Shift) → forward to the app (Zellij/vim/htop select).
+                // Shift bypasses reporting and forces our local selection — the standard override.
+                if report && !shift && in_term {
+                    if let (Some(cb), Some((col, row))) =
+                        (cb, self.cell_vp(self.mouse_px.0, self.mouse_px.1))
+                    {
+                        let pressed = state == ElementState::Pressed;
+                        self.mouse_held = if pressed { Some(cb) } else { None };
+                        self.last_report_cell = Some((col, row));
+                        self.report_mouse(cb, pressed, col, row, sgr);
+                    }
+                } else {
+                    match (button, state) {
+                        (MouseButton::Left, ElementState::Pressed) if in_term => {
+                            self.start_selection()
+                        }
+                        (MouseButton::Left, ElementState::Released) if self.selecting => {
+                            self.end_selection()
+                        }
+                        (MouseButton::Middle, ElementState::Pressed) if in_term => {
+                            let text = self.clipboard.as_ref().and_then(|cb| cb.load_primary().ok());
+                            if let Some(t) = text {
+                                self.paste_text(&t);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m,
@@ -1175,7 +1253,18 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h.max(1.0) as f64) as i32,
                 };
                 if lines != 0 {
-                    self.on_wheel(lines);
+                    let (report, sgr, ..) = self.mouse_modes();
+                    if report && !self.mods.state().shift_key() {
+                        // Forward as wheel buttons (64 = up, 65 = down) so the app scrolls.
+                        let cb = if lines > 0 { 64 } else { 65 };
+                        if let Some((col, row)) = self.cell_vp(self.mouse_px.0, self.mouse_px.1) {
+                            for _ in 0..lines.unsigned_abs() {
+                                self.report_mouse(cb, true, col, row, sgr);
+                            }
+                        }
+                    } else {
+                        self.on_wheel(lines);
+                    }
                 }
             }
             WindowEvent::Resized(size) => {
