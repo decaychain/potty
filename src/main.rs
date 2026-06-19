@@ -16,12 +16,15 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use config::Config;
 use notify::Watcher;
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
@@ -33,7 +36,9 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Ime, KeyEvent, Modifiers, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
@@ -212,15 +217,19 @@ fn build_ui(
             for (id, rect) in ws.leaf_rects(area) {
                 let is_home = id == ws.home_pane && ws.active == 0;
 
-                let resp = ui.interact(
-                    rect,
-                    egui::Id::new(("pane", ws.active, id)),
-                    egui::Sense::click(),
-                );
-                if resp.clicked() {
-                    actions.push(Action::Focus(id));
+                // The live pane must NOT capture clicks — they belong to text selection.
+                // Placeholder panes stay clickable (focus) and right-clickable (pane menu).
+                if !is_home {
+                    let resp = ui.interact(
+                        rect,
+                        egui::Id::new(("pane", ws.active, id)),
+                        egui::Sense::click(),
+                    );
+                    if resp.clicked() {
+                        actions.push(Action::Focus(id));
+                    }
+                    resp.context_menu(|ui| pane_menu(ui, actions, Some(id)));
                 }
-                resp.context_menu(|ui| pane_menu(ui, actions, Some(id)));
 
                 let painter = ui.painter();
                 if is_home {
@@ -433,6 +442,13 @@ struct App {
     font_families: Vec<String>,
     scale: f32,
     _watcher: Option<notify::RecommendedWatcher>,
+
+    /// Live terminal pane rect in physical px (origin x, y, width, height) — for hit-testing.
+    term_px: Option<(f32, f32, f32, f32)>,
+    mouse_px: (f64, f64),
+    selecting: bool,
+    last_click: Option<(Instant, Point)>,
+    click_count: u8,
 }
 
 impl App {
@@ -456,6 +472,11 @@ impl App {
             font_families: Vec::new(),
             scale: 1.0,
             _watcher: None,
+            term_px: None,
+            mouse_px: (0.0, 0.0),
+            selecting: false,
+            last_click: None,
+            click_count: 0,
         }
     }
 
@@ -556,6 +577,94 @@ impl App {
         }
     }
 
+    fn request_redraw(&self) {
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+
+    fn display_offset(&self) -> i32 {
+        self.term
+            .as_ref()
+            .map_or(0, |t| t.lock().unwrap().grid().display_offset() as i32)
+    }
+
+    /// Is a physical-pixel position inside the live terminal pane? (Press gate — egui's
+    /// `wants_pointer_input` is over-eager over the whole window, so we test geometry.)
+    fn in_term(&self, px: f64, py: f64) -> bool {
+        self.term_px.is_some_and(|(ox, oy, w, h)| {
+            let (px, py) = (px as f32, py as f32);
+            px >= ox && px < ox + w && py >= oy && py < oy + h
+        })
+    }
+
+    /// Map a physical-pixel position to a grid point (absolute line, incl. scrollback) and
+    /// which half of the cell it falls on. None when outside the live terminal pane.
+    fn point_at(&self, px: f64, py: f64) -> Option<(Point, Side)> {
+        let (ox, oy, w, h) = self.term_px?;
+        let relx = (px as f32 - ox).clamp(0.0, (w - 1.0).max(0.0));
+        let rely = (py as f32 - oy).clamp(0.0, (h - 1.0).max(0.0));
+        let col = ((relx / self.cell_w) as usize).min(self.cur_dims.cols.saturating_sub(1));
+        let vis_row = ((rely / self.cell_h) as i32).min(self.cur_dims.rows as i32 - 1).max(0);
+        let line = vis_row - self.display_offset();
+        let side = if (relx / self.cell_w).fract() > 0.5 { Side::Right } else { Side::Left };
+        Some((Point::new(Line(line), Column(col)), side))
+    }
+
+    /// Begin a selection at the mouse, choosing simple/word/line by click count.
+    fn start_selection(&mut self) {
+        let (px, py) = self.mouse_px;
+        let Some((point, side)) = self.point_at(px, py) else { return };
+
+        let now = Instant::now();
+        let recent = self
+            .last_click
+            .is_some_and(|(t, p)| now.duration_since(t) < Duration::from_millis(350) && p == point);
+        self.click_count = if recent { (self.click_count % 3) + 1 } else { 1 };
+        self.last_click = Some((now, point));
+
+        let ty = match self.click_count {
+            2 => SelectionType::Semantic, // word
+            3 => SelectionType::Lines,    // whole line
+            _ => SelectionType::Simple,
+        };
+        if let Some(term) = &self.term {
+            term.lock().unwrap().selection = Some(Selection::new(ty, point, side));
+        }
+        self.selecting = true;
+        self.request_redraw();
+    }
+
+    /// Extend the in-progress selection to the mouse.
+    fn update_selection(&mut self) {
+        let (px, py) = self.mouse_px;
+        let Some((point, side)) = self.point_at(px, py) else { return };
+        if let Some(term) = &self.term {
+            if let Some(sel) = term.lock().unwrap().selection.as_mut() {
+                sel.update(point, side);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Finish selecting; a plain click (empty selection) clears any highlight.
+    fn end_selection(&mut self) {
+        self.selecting = false;
+        if let Some(term) = &self.term {
+            let mut t = term.lock().unwrap();
+            if t.selection.as_ref().is_some_and(|s| s.is_empty()) {
+                t.selection = None;
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn clear_selection(&mut self) {
+        if let Some(term) = &self.term {
+            term.lock().unwrap().selection = None;
+        }
+    }
+
     fn on_key(&mut self, ev: &KeyEvent) {
         if ev.state != ElementState::Pressed {
             return;
@@ -623,7 +732,8 @@ impl App {
             }
         }
         if !out.is_empty() {
-            // Typing returns the viewport to the prompt (no-op if already at the bottom).
+            // Typing clears any selection and returns the viewport to the prompt.
+            self.clear_selection();
             self.scroll(Scroll::Bottom);
             self.to_pty(&out);
         }
@@ -690,6 +800,11 @@ impl App {
             let dims = dims_for(r.width() * pixels_per_point, r.height() * pixels_per_point, self.cell_w, self.cell_h);
             self.fit_terminal(dims);
         }
+        // Remember the live pane's pixel rect for mouse hit-testing.
+        self.term_px = home_pts.map(|r| {
+            let p = pixels_per_point;
+            (r.min.x * p, r.min.y * p, r.width() * p, r.height() * p)
+        });
 
         let prims = self.egui_ctx.tessellate(shapes, pixels_per_point);
         let guard = self.term.as_ref().map(|t| t.lock().unwrap());
@@ -865,6 +980,20 @@ impl ApplicationHandler<UserEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_px = (position.x, position.y);
+                if self.selecting {
+                    self.update_selection();
+                }
+            }
+            // A press inside the live pane starts a selection; the tab bar/menus sit outside it.
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
+                ElementState::Pressed if self.in_term(self.mouse_px.0, self.mouse_px.1) => {
+                    self.start_selection()
+                }
+                ElementState::Released if self.selecting => self.end_selection(),
+                _ => {}
+            },
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
             // IME commit (composed text, or text from an active input-method framework).

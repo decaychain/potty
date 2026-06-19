@@ -22,6 +22,9 @@ use wgpu::util::DeviceExt;
 
 const ATLAS: u32 = 1024;
 
+/// Selection highlight background (could become a palette entry later).
+const SELECTION_BG: Rgb = Rgb { r: 0x33, g: 0x4a, b: 0x6b };
+
 /// Measured monospace cell box, in physical pixels.
 #[derive(Clone, Copy)]
 pub struct CellMetrics {
@@ -482,6 +485,7 @@ impl GridRenderer {
         let cursor_point = content.cursor.point;
         let cursor_on = content.mode.contains(TermMode::SHOW_CURSOR)
             && content.cursor.shape != CursorShape::Hidden;
+        let selection = content.selection;
         // When scrolled into history, display_iter yields negative line numbers; shift them
         // back into the 0..screen_lines viewport so scrollback renders in place.
         let off = content.display_offset as i32;
@@ -503,6 +507,10 @@ impl GridRenderer {
                 std::mem::swap(&mut fg, &mut bg);
             }
             let mut draw_bg = bg != palette.bg;
+            if selection.as_ref().is_some_and(|r| r.contains(point)) {
+                bg = SELECTION_BG;
+                draw_bg = true;
+            }
             if cursor_on && point == cursor_point {
                 // Block cursor: fill with the cursor color, draw the glyph in the bg color.
                 bg = palette.cursor;
