@@ -482,13 +482,16 @@ impl GridRenderer {
         let cursor_point = content.cursor.point;
         let cursor_on = content.mode.contains(TermMode::SHOW_CURSOR)
             && content.cursor.shape != CursorShape::Hidden;
+        // When scrolled into history, display_iter yields negative line numbers; shift them
+        // back into the 0..screen_lines viewport so scrollback renders in place.
+        let off = content.display_offset as i32;
 
         let (cw, ch, asc) = (self.metrics.w, self.metrics.h, self.metrics.ascent);
 
         for cell in content.display_iter {
             let point = cell.point;
             let col = point.column.0 as f32;
-            let row = point.line.0 as f32;
+            let row = (point.line.0 + off) as f32;
             let x = origin.0 + col * cw;
             let y = origin.1 + row * ch;
 

@@ -21,7 +21,7 @@ use config::Config;
 use notify::Watcher;
 
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
@@ -33,7 +33,7 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Ime, KeyEvent, Modifiers, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, Modifiers, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
@@ -515,11 +515,64 @@ impl App {
             .is_some_and(|t| t.lock().unwrap().mode().contains(TermMode::APP_CURSOR))
     }
 
+    /// (alternate screen, alternate-scroll requested) — wheel behaves differently in each.
+    fn alt_modes(&self) -> (bool, bool) {
+        self.term.as_ref().map_or((false, false), |t| {
+            let guard = t.lock().unwrap();
+            let m = guard.mode();
+            (m.contains(TermMode::ALT_SCREEN), m.contains(TermMode::ALTERNATE_SCROLL))
+        })
+    }
+
+    /// Scroll the history viewport. No-op on the alternate screen (it has no scrollback).
+    fn scroll(&mut self, s: Scroll) {
+        if let Some(term) = &self.term {
+            let mut t = term.lock().unwrap();
+            if t.mode().contains(TermMode::ALT_SCREEN) {
+                return;
+            }
+            t.scroll_display(s);
+        }
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+
+    /// Mouse wheel (lines > 0 = up/into history). Primary screen scrolls scrollback; the
+    /// alternate screen emits arrow keys when the app asked for alternate-scroll (less/vim).
+    /// Forwarding to mouse-reporting apps comes with the selection work.
+    fn on_wheel(&mut self, lines: i32) {
+        let (alt, alt_scroll) = self.alt_modes();
+        if alt {
+            if alt_scroll {
+                let final_byte = if lines > 0 { b'A' } else { b'B' };
+                let seq = [0x1b, if self.app_cursor() { b'O' } else { b'[' }, final_byte];
+                for _ in 0..lines.unsigned_abs() {
+                    self.to_pty(&seq);
+                }
+            }
+        } else {
+            self.scroll(Scroll::Delta(lines));
+        }
+    }
+
     fn on_key(&mut self, ev: &KeyEvent) {
         if ev.state != ElementState::Pressed {
             return;
         }
         let ctrl = self.mods.state().control_key();
+        let shift = self.mods.state().shift_key();
+
+        // Shift+nav scrolls the history viewport (and is not sent to the PTY).
+        if shift {
+            match &ev.logical_key {
+                Key::Named(NamedKey::PageUp) => return self.scroll(Scroll::PageUp),
+                Key::Named(NamedKey::PageDown) => return self.scroll(Scroll::PageDown),
+                Key::Named(NamedKey::Home) => return self.scroll(Scroll::Top),
+                Key::Named(NamedKey::End) => return self.scroll(Scroll::Bottom),
+                _ => {}
+            }
+        }
         // Cursor keys: `ESC O x` in application mode, else `ESC [ x`. mc (ncurses) relies on
         // this; vim is lenient and accepts CSI either way — which is why it "worked".
         let cur = |b: u8| -> Vec<u8> { vec![0x1b, if self.app_cursor() { b'O' } else { b'[' }, b] };
@@ -570,6 +623,8 @@ impl App {
             }
         }
         if !out.is_empty() {
+            // Typing returns the viewport to the prompt (no-op if already at the bottom).
+            self.scroll(Scroll::Bottom);
             self.to_pty(&out);
         }
     }
@@ -814,6 +869,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
             // IME commit (composed text, or text from an active input-method framework).
             WindowEvent::Ime(Ime::Commit(text)) => self.to_pty(text.as_bytes()),
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Positive = up / into history. 3 lines per wheel notch; touchpad by pixels.
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h.max(1.0) as f64) as i32,
+                };
+                if lines != 0 {
+                    self.on_wheel(lines);
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(state) = &mut self.state {
                     state.surface_config.width = size.width.max(1);
