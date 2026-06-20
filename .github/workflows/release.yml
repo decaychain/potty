@@ -45,7 +45,10 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          makensis -DVERSION="$VERSION" -DARCH="${{ matrix.arch }}" packaging/windows/potty.nsi
+          # choco installs NSIS but its dir isn't on the shell PATH here; call
+          # makensis by its full (32-bit Program Files) path on both archs.
+          makensis="/c/Program Files (x86)/NSIS/makensis.exe"
+          "$makensis" -DVERSION="$VERSION" -DARCH="${{ matrix.arch }}" packaging/windows/potty.nsi
           ls -la potty-*-setup.exe
 
       - name: Upload installer to the release
@@ -67,6 +70,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpm
           pipx install copr-cli
+          # copr-cli imports `rich` but doesn't declare it as a dependency,
+          # so pipx's isolated venv lacks it — inject it explicitly.
+          pipx inject copr-cli rich
 
       # v0.2.0          -> Version=0.2.0  Release=1
       # v0.2.0-alpha.3  -> Version=0.2.0  Release=0.alpha.3   (sorts before 1)
