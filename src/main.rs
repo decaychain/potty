@@ -50,7 +50,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
 
 use gridr::GridRenderer;
-use workspace::{PaneId, Split, Workspace};
+use workspace::{PaneId, Split, Workspace, GAP};
 
 const FONT_PX: f32 = 15.0;
 const LINE_PX: f32 = 18.0;
@@ -166,6 +166,7 @@ enum Action {
     ClosePane,
     CloseTab(usize),
     Focus(PaneId),
+    SetRatio(u64, f32),
     SetFontFamily(Option<String>),
     SetFontSize(f32),
     ShowFontSettings,
@@ -180,6 +181,7 @@ fn apply(ws: &mut Workspace, action: Action) {
         Action::ClosePane => ws.close_focused(),
         Action::CloseTab(i) => ws.close_tab(i),
         Action::Focus(id) => ws.focus(id),
+        Action::SetRatio(id, ratio) => ws.set_ratio(id, ratio),
         Action::SetFontFamily(_) | Action::SetFontSize(_) | Action::ShowFontSettings => {}
     }
 }
@@ -289,6 +291,7 @@ fn build_ui(
     show_font_settings: &mut bool,
     actions: &mut Vec<Action>,
     leaves: &mut Vec<(PaneId, egui::Rect)>,
+    dividers: &mut Vec<egui::Rect>,
 ) {
     // The tab bar only earns its space with more than one tab; otherwise the menu lives on the
     // pane's right-click (shift-right-click when an app has grabbed the mouse).
@@ -348,6 +351,43 @@ fn build_ui(
                     egui::StrokeKind::Inside,
                 );
                 leaves.push((id, rect));
+            }
+
+            // Draggable split dividers. The grab region is widened beyond the thin visual gap;
+            // we publish it (`dividers`) so our own mouse handler yields these pixels to egui.
+            for d in ws.dividers(area) {
+                let grab = match d.split {
+                    Split::Cols => d.rect.expand2(egui::vec2(4.0, 0.0)),
+                    Split::Rows => d.rect.expand2(egui::vec2(0.0, 4.0)),
+                };
+                dividers.push(grab);
+                let resp = ui.interact(
+                    grab,
+                    egui::Id::new(("divider", ws.active, d.id)),
+                    egui::Sense::drag(),
+                );
+                let active = resp.hovered() || resp.dragged();
+                if active {
+                    let cursor = match d.split {
+                        Split::Cols => egui::CursorIcon::ResizeHorizontal,
+                        Split::Rows => egui::CursorIcon::ResizeVertical,
+                    };
+                    ui.ctx().set_cursor_icon(cursor);
+                    ui.painter().rect_filled(
+                        d.rect,
+                        egui::CornerRadius::ZERO,
+                        egui::Color32::from_rgb(120, 160, 255),
+                    );
+                }
+                if resp.dragged() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        let ratio = match d.split {
+                            Split::Cols => (p.x - d.area.min.x) / (d.area.width() - GAP),
+                            Split::Rows => (p.y - d.area.min.y) / (d.area.height() - GAP),
+                        };
+                        actions.push(Action::SetRatio(d.id, ratio));
+                    }
+                }
             }
         });
 }
@@ -600,6 +640,12 @@ struct App {
     /// Pane ids currently on screen (the active tab's leaves) — a background pane's output
     /// marks it dirty but doesn't force a redraw.
     visible: std::collections::HashSet<PaneId>,
+    /// Each visible pane's last-prepared pixel rect — a change (drag-resize, window resize)
+    /// means its cached buffers are positioned wrong and must be rebuilt.
+    last_rect: HashMap<PaneId, (f32, f32, f32, f32)>,
+    /// Divider grab regions in physical px — a press here is a resize drag (egui-owned), so our
+    /// terminal mouse handling skips it.
+    divider_px: Vec<(f32, f32, f32, f32)>,
 }
 
 impl App {
@@ -635,6 +681,8 @@ impl App {
             show_font_settings: false,
             dirty: std::collections::HashSet::new(),
             visible: std::collections::HashSet::new(),
+            last_rect: HashMap::new(),
+            divider_px: Vec::new(),
         }
     }
 
@@ -753,6 +801,7 @@ impl App {
         for id in removed {
             self.terms.remove(&id);
             self.dirty.remove(&id);
+            self.last_rect.remove(&id);
             if let Some(state) = self.state.as_mut() {
                 state.grid.forget_pane(id);
             }
@@ -865,6 +914,14 @@ impl App {
     fn display_offset(&self, id: PaneId) -> i32 {
         self.arc(id)
             .map_or(0, |t| t.lock().unwrap().grid().display_offset() as i32)
+    }
+
+    /// Is a physical-pixel position over a split divider's grab region? (egui owns those drags.)
+    fn on_divider(&self, px: f64, py: f64) -> bool {
+        let (px, py) = (px as f32, py as f32);
+        self.divider_px
+            .iter()
+            .any(|(ox, oy, w, h)| px >= *ox && px < ox + w && py >= *oy && py < oy + h)
     }
 
     /// The pane under a physical-pixel position (active tab only), if any.
@@ -1229,6 +1286,7 @@ impl App {
         let raw = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let mut actions = Vec::new();
         let mut leaves: Vec<(PaneId, egui::Rect)> = Vec::new();
+        let mut dividers: Vec<egui::Rect> = Vec::new();
         let mut show_font = self.show_font_settings;
         let full = {
             let ws = &self.workspace;
@@ -1238,7 +1296,7 @@ impl App {
             self.egui_ctx.run(raw, |ctx| {
                 build_ui(
                     ctx, ws, families, cur_family, cur_size, &tab_titles, &mut show_font,
-                    &mut actions, &mut leaves,
+                    &mut actions, &mut leaves, &mut dividers,
                 )
             })
         };
@@ -1289,6 +1347,21 @@ impl App {
             self.dirty.extend(new_visible.iter().copied());
         }
         self.visible = new_visible;
+
+        // Geometry damage: any pane whose pixel rect moved/resized (drag-resize a divider, window
+        // resize) has its cached buffers positioned for the old rect — rebuild it.
+        for (id, ox, oy, w, h) in &self.pane_px {
+            let cur = (*ox, *oy, *w, *h);
+            if self.last_rect.get(id) != Some(&cur) {
+                self.dirty.insert(*id);
+                self.last_rect.insert(*id, cur);
+            }
+        }
+        // Divider grab regions → physical px, for the mouse handler to yield to egui.
+        self.divider_px = dividers
+            .iter()
+            .map(|r| (r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp))
+            .collect();
 
         let prims = self.egui_ctx.tessellate(shapes, ppp);
 
@@ -1543,8 +1616,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                // A menu/popup or the font window is open — let egui own this click.
-                if self.menu_open || self.show_font_settings {
+                // A menu/popup, the font window, or a divider grab — let egui own this click.
+                if self.menu_open
+                    || self.show_font_settings
+                    || self.on_divider(self.mouse_px.0, self.mouse_px.1)
+                {
                     return;
                 }
                 let shift = self.mods.state().shift_key();
