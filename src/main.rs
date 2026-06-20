@@ -1485,8 +1485,19 @@ impl ApplicationHandler<UserEvent> for App {
             let _ = std::fs::create_dir_all(&dir);
             let proxy = self.proxy.clone();
             if let Ok(mut w) = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if res.is_ok() {
-                    let _ = proxy.send_event(UserEvent::ReloadConfig);
+                if let Ok(event) = res {
+                    // Only react to real content changes. Reacting to reads (Access) or
+                    // atime/permission churn (Modify::Metadata) creates a feedback loop —
+                    // ReloadConfig re-reads the file, which trips the watcher again — and two
+                    // instances watching the same dir ping-pong each other's reads to 100% CPU.
+                    let ignore = matches!(
+                        event.kind,
+                        notify::EventKind::Access(_)
+                            | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+                    );
+                    if !ignore {
+                        let _ = proxy.send_event(UserEvent::ReloadConfig);
+                    }
                 }
             }) {
                 if w.watch(&dir, notify::RecursiveMode::NonRecursive).is_ok() {
