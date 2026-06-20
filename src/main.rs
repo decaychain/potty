@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,7 +63,8 @@ type SharedTerm = Arc<Mutex<Term<EventProxy>>>;
 /// Variants that write back to a PTY carry the originating `PaneId`, since there is now a
 /// terminal per pane.
 enum UserEvent {
-    Wake,
+    /// A pane's reader advanced its grid — mark it dirty (and redraw if it's visible).
+    Wake(PaneId),
     ReloadConfig,
     /// OSC 52 store (app writes the system clipboard). Targets the clipboard selection.
     ClipboardStore(String),
@@ -152,6 +154,9 @@ struct Terminal {
     title: String,
     /// What `title` resets to (the shell's basename) on OSC ResetTitle.
     default_title: String,
+    /// Coalesces wake-ups: the reader sets it and only sends a `Wake` when it was unset, so a
+    /// flood of PTY reads can't spam the main loop with one event each. Cleared when handled.
+    wake_pending: Arc<AtomicBool>,
 }
 
 enum Action {
@@ -422,25 +427,34 @@ impl WindowState {
         }
     }
 
+    /// Rebuild one pane's cached instance buffers (only the App's dirty panes call this).
+    fn prepare_pane(
+        &mut self,
+        pane: u64,
+        term: &Term<EventProxy>,
+        origin: (f32, f32),
+        screen: (f32, f32),
+    ) {
+        self.grid.prepare(&self.device, &self.queue, pane, term, origin, screen);
+    }
+
     fn render(
         &mut self,
         egui_renderer: &mut egui_wgpu::Renderer,
         textures_delta: &egui::TexturesDelta,
         prims: &[egui::ClippedPrimitive],
         ppp: f32,
-        panes: &[(egui::Rect, &Term<EventProxy>)],
+        panes: &[(egui::Rect, u64)],
     ) {
         let (sw, sh) = (self.surface_config.width, self.surface_config.height);
         let Some(frame) = self.acquire() else { return };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
 
-        // Pass 1: one submit per pane (the renderer reuses a single instance buffer, so each
-        // pane must prepare→render→submit before the next overwrites it). The first clears the
-        // whole surface — including inter-pane gaps — then each draw is scissored to its rect.
+        // Pass 1: one submit per pane, each drawing from its cached buffers (already prepared
+        // for dirty panes). The first clears the whole surface — including inter-pane gaps —
+        // then each draw is scissored to its rect.
         let mut first = true;
-        for (rect, term) in panes {
-            let origin = (rect.min.x * ppp, rect.min.y * ppp);
-            self.grid.prepare(&self.device, &self.queue, *term, origin, (sw as f32, sh as f32));
+        for (rect, pane) in panes {
             let mut encoder = self
                 .device
                 .create_command_encoder(&CommandEncoderDescriptor { label: Some("terminal") });
@@ -465,7 +479,7 @@ impl WindowState {
                 let h = ((rect.height() * ppp) as u32).min(sh.saturating_sub(y));
                 if w > 0 && h > 0 {
                     pass.set_scissor_rect(x, y, w, h);
-                    self.grid.render(&mut pass);
+                    self.grid.render(&mut pass, *pane);
                 }
             }
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -580,6 +594,12 @@ struct App {
     menu_open: bool,
     /// Whether the floating Font settings window is shown.
     show_font_settings: bool,
+
+    /// Panes whose cached render is stale and must be re-prepared next frame (damage tracking).
+    dirty: std::collections::HashSet<PaneId>,
+    /// Pane ids currently on screen (the active tab's leaves) — a background pane's output
+    /// marks it dirty but doesn't force a redraw.
+    visible: std::collections::HashSet<PaneId>,
 }
 
 impl App {
@@ -613,6 +633,16 @@ impl App {
             window_title: String::new(),
             menu_open: false,
             show_font_settings: false,
+            dirty: std::collections::HashSet::new(),
+            visible: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Flag a pane's render as stale, and ask for a redraw if that pane is on screen.
+    fn touch(&mut self, id: PaneId) {
+        self.dirty.insert(id);
+        if self.visible.contains(&id) {
+            self.request_redraw();
         }
     }
 
@@ -669,6 +699,8 @@ impl App {
 
         let reader_term = term.clone();
         let proxy = self.proxy.clone();
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let reader_wake = wake_pending.clone();
         thread::spawn(move || {
             let mut parser = Processor::<StdSyncHandler>::new();
             let mut buf = [0u8; 4096];
@@ -680,7 +712,11 @@ impl App {
                             let mut t = reader_term.lock().unwrap();
                             parser.advance(&mut *t, &buf[..n]);
                         }
-                        let _ = proxy.send_event(UserEvent::Wake);
+                        // Only wake the main loop if it hasn't an unhandled wake already —
+                        // a flooding program (e.g. `yes`) thus can't spam it one event per read.
+                        if !reader_wake.swap(true, Ordering::AcqRel) {
+                            let _ = proxy.send_event(UserEvent::Wake(id));
+                        }
                     }
                 }
             }
@@ -696,8 +732,10 @@ impl App {
                 dims,
                 title: default_title.clone(),
                 default_title,
+                wake_pending,
             },
         );
+        self.dirty.insert(id); // never rendered yet → prepare on first sight
     }
 
     /// Keep the live terminals in lock-step with the pane tree: spawn one for every leaf that
@@ -710,7 +748,15 @@ impl App {
                 self.spawn_terminal(*id, self.last_dims);
             }
         }
-        self.terms.retain(|id, _| live.contains(id));
+        let removed: Vec<PaneId> =
+            self.terms.keys().copied().filter(|id| !live.contains(id)).collect();
+        for id in removed {
+            self.terms.remove(&id);
+            self.dirty.remove(&id);
+            if let Some(state) = self.state.as_mut() {
+                state.grid.forget_pane(id);
+            }
+        }
     }
 
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
@@ -723,6 +769,8 @@ impl App {
         for t in self.terms.values() {
             t.term.lock().unwrap().set_options(term_config(&self.config));
         }
+        // Palette / font changes affect every pane's render.
+        self.dirty.extend(self.terms.keys().copied());
         let (family, size, scale) = (self.config.font_family.clone(), self.config.font_size, self.scale);
         let palette = self.config.palette();
         let line = self.line_px(size);
@@ -788,7 +836,7 @@ impl App {
             }
             t.scroll_display(s);
         }
-        self.request_redraw();
+        self.touch(id);
     }
 
     /// Mouse wheel over a pane (lines > 0 = up/into history). The primary screen scrolls
@@ -917,7 +965,7 @@ impl App {
             term.lock().unwrap().selection = Some(Selection::new(ty, point, side));
         }
         self.selecting = true;
-        self.request_redraw();
+        self.touch(id);
     }
 
     /// Extend the in-progress selection to the mouse.
@@ -930,7 +978,7 @@ impl App {
                 sel.update(point, side);
             }
         }
-        self.request_redraw();
+        self.touch(id);
     }
 
     /// Finish selecting; a plain click (empty selection) clears any highlight, otherwise the
@@ -952,7 +1000,9 @@ impl App {
                 cb.store_primary(s);
             }
         }
-        self.request_redraw();
+        if let Some(id) = id {
+            self.touch(id);
+        }
     }
 
     /// Clear the focused pane's selection (used when typing into it).
@@ -960,6 +1010,8 @@ impl App {
         if let Some(term) = self.focused_arc() {
             term.lock().unwrap().selection = None;
         }
+        let id = self.focus();
+        self.touch(id);
     }
 
     /// Copy the focused pane's selection to the clipboard and clear it. Returns whether anything
@@ -1122,6 +1174,7 @@ impl App {
                 pixel_width: 0,
                 pixel_height: 0,
             });
+            self.dirty.insert(id);
         }
     }
 
@@ -1219,7 +1272,8 @@ impl App {
             .handle_platform_output(&window, platform_output);
 
         let ppp = pixels_per_point;
-        // Fit each active-tab terminal to its pane, and remember pane rects for hit-testing.
+        // Fit each active-tab terminal to its pane (may mark it dirty), and remember pane rects
+        // for hit-testing. Track the visible set so background output doesn't force redraws.
         for (id, r) in &leaves {
             let dims = dims_for(r.width() * ppp, r.height() * ppp, self.cell_w, self.cell_h);
             self.fit_terminal(*id, dims);
@@ -1228,23 +1282,36 @@ impl App {
             .iter()
             .map(|(id, r)| (*id, r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp))
             .collect();
+        // A changed visible set means a split/close/tab-switch rearranged panes — their rects
+        // may have moved without a dims change, so rebuild all of them this frame.
+        let new_visible: std::collections::HashSet<PaneId> = leaves.iter().map(|(id, _)| *id).collect();
+        if new_visible != self.visible {
+            self.dirty.extend(new_visible.iter().copied());
+        }
+        self.visible = new_visible;
 
         let prims = self.egui_ctx.tessellate(shapes, ppp);
 
-        // Lock every visible pane's grid (cloned Arcs, so `self` stays free) and hand the
-        // renderer a rect+grid for each.
-        let arcs: Vec<(egui::Rect, SharedTerm)> = leaves
-            .iter()
-            .filter_map(|(id, r)| self.terms.get(id).map(|t| (*r, t.term.clone())))
-            .collect();
-        let guards: Vec<(egui::Rect, std::sync::MutexGuard<Term<EventProxy>>)> =
-            arcs.iter().map(|(r, a)| (*r, a.lock().unwrap())).collect();
-        let refs: Vec<(egui::Rect, &Term<EventProxy>)> =
-            guards.iter().map(|(r, g)| (*r, &**g)).collect();
+        // Damage tracking: re-prepare only the visible panes flagged dirty; the rest render from
+        // their cached buffers. We lock each dirty pane just long enough to rebuild it.
+        let (sw, sh) = {
+            let s = self.state.as_ref().unwrap();
+            (s.surface_config.width as f32, s.surface_config.height as f32)
+        };
+        for (id, r) in &leaves {
+            if self.dirty.remove(id) {
+                if let Some(term) = self.arc(*id) {
+                    let origin = (r.min.x * ppp, r.min.y * ppp);
+                    let guard = term.lock().unwrap();
+                    self.state.as_mut().unwrap().prepare_pane(*id as u64, &guard, origin, (sw, sh));
+                }
+            }
+        }
 
+        let panes: Vec<(egui::Rect, u64)> = leaves.iter().map(|(id, r)| (*r, *id as u64)).collect();
         let renderer = self.egui_renderer.as_mut().unwrap();
         if let Some(state) = self.state.as_mut() {
-            state.render(renderer, &textures_delta, &prims, ppp, &refs);
+            state.render(renderer, &textures_delta, &prims, ppp, &panes);
         }
     }
 }
@@ -1343,6 +1410,8 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Spawn the home terminal (and any other leaves, though there's only one at startup).
         self.reconcile_terms();
+        // Kick the first frame — `visible` is still empty, so an early Wake wouldn't.
+        self.request_redraw();
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1353,7 +1422,15 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Wake => self.request_redraw(),
+            // PTY output: mark the pane dirty; redraw only if it's on screen (a background
+            // pane's output is absorbed until its tab is shown). Re-arm the reader's coalescing
+            // flag so further output sends a fresh wake.
+            UserEvent::Wake(id) => {
+                if let Some(t) = self.terms.get(&id) {
+                    t.wake_pending.store(false, Ordering::Release);
+                }
+                self.touch(id);
+            }
             UserEvent::ReloadConfig => {
                 let cfg = Config::load(&self.config_path);
                 self.apply_config(cfg);
@@ -1390,6 +1467,10 @@ impl ApplicationHandler<UserEvent> for App {
             // A shell exited — close its pane. Exit the app once no terminals remain.
             UserEvent::PaneExited(id) => {
                 self.terms.remove(&id);
+                self.dirty.remove(&id);
+                if let Some(state) = self.state.as_mut() {
+                    state.grid.forget_pane(id as u64);
+                }
                 self.workspace.remove_pane(id);
                 if self.terms.is_empty() {
                     event_loop.exit();
@@ -1547,6 +1628,8 @@ impl ApplicationHandler<UserEvent> for App {
                     state.surface.configure(&state.device, &state.surface_config);
                     state.window.request_redraw();
                 }
+                // Every pane's pixel rect (and the surface uniform) changed — rebuild all.
+                self.dirty.extend(self.terms.keys().copied());
             }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}

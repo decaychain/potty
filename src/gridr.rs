@@ -119,6 +119,32 @@ impl Atlas {
     }
 }
 
+/// Per-pane instance data + GPU buffers. Built by `prepare` and kept between frames so a pane
+/// that didn't change is rendered straight from its cache (no rebuild) — the heart of damage
+/// tracking. `bg`/`fg` are retained to reuse their allocation across rebuilds.
+struct PaneBuffers {
+    bg: Vec<BgInstance>,
+    fg: Vec<FgInstance>,
+    bg_buf: wgpu::Buffer,
+    fg_buf: wgpu::Buffer,
+    bg_cap: usize,
+    fg_cap: usize,
+}
+
+impl PaneBuffers {
+    fn new(device: &wgpu::Device) -> Self {
+        let cap = 1024;
+        Self {
+            bg: Vec::new(),
+            fg: Vec::new(),
+            bg_buf: inst_buf(device, "bg-inst", cap * std::mem::size_of::<BgInstance>()),
+            fg_buf: inst_buf(device, "fg-inst", cap * std::mem::size_of::<FgInstance>()),
+            bg_cap: cap,
+            fg_cap: cap,
+        }
+    }
+}
+
 pub struct GridRenderer {
     font_system: FontSystem,
     swash: SwashCache,
@@ -138,12 +164,8 @@ pub struct GridRenderer {
     fg_pipeline: wgpu::RenderPipeline,
     quad: wgpu::Buffer,
 
-    bg: Vec<BgInstance>,
-    fg: Vec<FgInstance>,
-    bg_buf: wgpu::Buffer,
-    fg_buf: wgpu::Buffer,
-    bg_cap: usize,
-    fg_cap: usize,
+    /// Cached instance buffers, one set per pane (keyed by PaneId as a u64).
+    panes: HashMap<u64, PaneBuffers>,
 }
 
 /// sRGB u8 → linear f32 (surface is *_Srgb, so it re-encodes linear → sRGB on write).
@@ -353,11 +375,6 @@ impl GridRenderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let bg_cap = 4096;
-        let fg_cap = 4096;
-        let bg_buf = inst_buf(device, "bg-inst", bg_cap * std::mem::size_of::<BgInstance>());
-        let fg_buf = inst_buf(device, "fg-inst", fg_cap * std::mem::size_of::<FgInstance>());
-
         let _ = queue; // atlas is written lazily as glyphs are rasterized
 
         Self {
@@ -376,12 +393,7 @@ impl GridRenderer {
             bg_pipeline,
             fg_pipeline,
             quad,
-            bg: Vec::new(),
-            fg: Vec::new(),
-            bg_buf,
-            fg_buf,
-            bg_cap,
-            fg_cap,
+            panes: HashMap::new(),
         }
     }
 
@@ -466,18 +478,27 @@ impl GridRenderer {
         })
     }
 
-    /// Build instance data for the visible grid, positioned within the pane at `origin` (px).
+    /// Rebuild a pane's instance data, positioned within the pane at `origin` (px). Only called
+    /// for panes flagged dirty; clean panes keep their cached buffers from a previous call.
     pub fn prepare<L: EventListener>(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pane: u64,
         term: &Term<L>,
         origin: (f32, f32),
         screen: (f32, f32),
     ) {
         queue.write_buffer(&self.screen_buf, 0, bytemuck::cast_slice(&[screen.0, screen.1, 0.0, 0.0]));
-        self.bg.clear();
-        self.fg.clear();
+
+        // Detach this pane's vectors (reusing their capacity) so the loop can also borrow
+        // `self` mutably for glyph rasterization.
+        let (mut bg, mut fg) = match self.panes.get_mut(&pane) {
+            Some(pb) => (std::mem::take(&mut pb.bg), std::mem::take(&mut pb.fg)),
+            None => (Vec::new(), Vec::new()),
+        };
+        bg.clear();
+        fg.clear();
 
         let palette = self.palette; // Copy — frees `self` for self.glyph() below
         let content = term.renderable_content();
@@ -501,61 +522,71 @@ impl GridRenderer {
 
             let flags = cell.flags;
             let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
-            let mut fg = resolve(cell.fg, colors, &palette, bold);
-            let mut bg = resolve(cell.bg, colors, &palette, false);
+            let mut fg_col = resolve(cell.fg, colors, &palette, bold);
+            let mut bg_col = resolve(cell.bg, colors, &palette, false);
             if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
+                std::mem::swap(&mut fg_col, &mut bg_col);
             }
-            let mut draw_bg = bg != palette.bg;
+            let mut draw_bg = bg_col != palette.bg;
             if selection.as_ref().is_some_and(|r| r.contains(point)) {
-                bg = SELECTION_BG;
+                bg_col = SELECTION_BG;
                 draw_bg = true;
             }
             if cursor_on && point == cursor_point {
                 // Block cursor: fill with the cursor color, draw the glyph in the bg color.
-                bg = palette.cursor;
-                fg = palette.bg;
+                bg_col = palette.cursor;
+                fg_col = palette.bg;
                 draw_bg = true;
             }
 
             if draw_bg {
-                self.bg.push(BgInstance { pos: [x, y], size: [cw, ch], color: rgba(bg, 1.0) });
+                bg.push(BgInstance { pos: [x, y], size: [cw, ch], color: rgba(bg_col, 1.0) });
             }
 
             let c = cell.c;
             if c != ' ' && c != '\0' && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN) {
                 if let Some(g) = self.glyph(queue, c, bold) {
-                    self.fg.push(FgInstance {
+                    fg.push(FgInstance {
                         pos: [x + g.offset[0], y + asc - g.offset[1]],
                         size: g.size,
                         uv0: g.uv0,
                         uv1: g.uv1,
-                        color: rgba(fg, 1.0),
+                        color: rgba(fg_col, 1.0),
                     });
                 }
             }
         }
 
-        upload(device, queue, &mut self.bg_buf, &mut self.bg_cap, &self.bg, "bg-inst");
-        upload(device, queue, &mut self.fg_buf, &mut self.fg_cap, &self.fg, "fg-inst");
+        // Store the rebuilt vectors back and upload them (growing the GPU buffers if needed).
+        let pb = self.panes.entry(pane).or_insert_with(|| PaneBuffers::new(device));
+        upload(device, queue, &mut pb.bg_buf, &mut pb.bg_cap, &bg, "bg-inst");
+        upload(device, queue, &mut pb.fg_buf, &mut pb.fg_cap, &fg, "fg-inst");
+        pb.bg = bg;
+        pb.fg = fg;
     }
 
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if !self.bg.is_empty() {
+    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, pane: u64) {
+        let Some(pb) = self.panes.get(&pane) else { return };
+        if !pb.bg.is_empty() {
             pass.set_pipeline(&self.bg_pipeline);
             pass.set_bind_group(0, &self.common_bg, &[]);
             pass.set_vertex_buffer(0, self.quad.slice(..));
-            pass.set_vertex_buffer(1, self.bg_buf.slice(..));
-            pass.draw(0..6, 0..self.bg.len() as u32);
+            pass.set_vertex_buffer(1, pb.bg_buf.slice(..));
+            pass.draw(0..6, 0..pb.bg.len() as u32);
         }
-        if !self.fg.is_empty() {
+        if !pb.fg.is_empty() {
             pass.set_pipeline(&self.fg_pipeline);
             pass.set_bind_group(0, &self.common_bg, &[]);
             pass.set_bind_group(1, &self.atlas_bg, &[]);
             pass.set_vertex_buffer(0, self.quad.slice(..));
-            pass.set_vertex_buffer(1, self.fg_buf.slice(..));
-            pass.draw(0..6, 0..self.fg.len() as u32);
+            pass.set_vertex_buffer(1, pb.fg_buf.slice(..));
+            pass.draw(0..6, 0..pb.fg.len() as u32);
         }
+    }
+
+    /// Drop a closed pane's cached buffers.
+    pub fn forget_pane(&mut self, pane: u64) {
+        self.panes.remove(&pane);
     }
 }
 
