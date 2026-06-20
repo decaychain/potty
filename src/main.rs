@@ -10,6 +10,10 @@
 //! pane, scissored); background tabs keep running. Keyboard goes to the focused pane;
 //! the mouse acts on the pane under the cursor.
 
+// On Windows, use the GUI subsystem so launching doesn't spawn a console window alongside
+// our own window. (No effect on other platforms.)
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod clip;
 mod config;
 mod gridr;
@@ -756,7 +760,7 @@ impl App {
         // Declare what we actually emulate so terminfo-driven apps (mc, ncurses) agree with
         // the escape sequences we send (e.g. application cursor keys).
         cmd.env("TERM", "xterm-256color");
-        let _child = pair.slave.spawn_command(cmd).unwrap();
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
         let writer = pair.master.take_writer().unwrap();
 
@@ -783,7 +787,16 @@ impl App {
                     }
                 }
             }
-            let _ = proxy.send_event(UserEvent::PaneExited(id));
+        });
+
+        // Close the pane when the shell exits. We wait on the child process rather than the
+        // reader's EOF: on Windows ConPTY often keeps the output pipe open after the child
+        // exits, so the reader never sees EOF — but the process handle still signals. (On unix
+        // this fires at the same time as the reader EOF; PaneExited is idempotent.)
+        let exit_proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let _ = child.wait();
+            let _ = exit_proxy.send_event(UserEvent::PaneExited(id));
         });
 
         self.terms.insert(
