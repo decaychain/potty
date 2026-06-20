@@ -10,12 +10,12 @@
 //! pane, scissored); background tabs keep running. Keyboard goes to the focused pane;
 //! the mouse acts on the pane under the cursor.
 
+mod clip;
 mod config;
 mod gridr;
 mod workspace;
 
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use config::Config;
 use notify::Watcher;
-use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -133,6 +132,22 @@ impl Dimensions for Dims {
     }
     fn columns(&self) -> usize {
         self.cols
+    }
+}
+
+/// The shell to spawn: the configured one, else the platform default ($SHELL on unix, %COMSPEC%
+/// — i.e. cmd.exe — on Windows).
+fn default_shell(cfg: &Config) -> String {
+    if let Some(s) = &cfg.shell {
+        return s.clone();
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
     }
 }
 
@@ -624,8 +639,8 @@ struct App {
     mouse_held: Option<u8>,
     last_report_cell: Option<(i64, i64)>,
 
-    /// Wayland clipboard (clipboard + primary selection) via the app's own seat.
-    clipboard: Option<smithay_clipboard::Clipboard>,
+    /// Platform clipboard (+ primary selection on Linux). See `clip`.
+    clipboard: Option<clip::Clipboard>,
 
     /// Last title pushed to the OS window (so we only call set_title on change).
     window_title: String,
@@ -730,7 +745,7 @@ impl App {
                 pixel_height: 0,
             })
             .unwrap();
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let shell = default_shell(&self.config);
         // Default title until the program sets one: the shell's basename (e.g. "zsh").
         let default_title = std::path::Path::new(&shell)
             .file_name()
@@ -1110,7 +1125,7 @@ impl App {
     }
 
     fn paste(&mut self) {
-        let text = self.clipboard.as_ref().and_then(|cb| cb.load().ok());
+        let text = self.clipboard.as_ref().and_then(|cb| cb.load());
         if let Some(t) = text {
             self.paste_text(self.focus(), &t);
         }
@@ -1121,7 +1136,9 @@ impl App {
             return;
         }
         let focus = self.focus();
-        let ctrl = self.mods.state().control_key();
+        // On Windows AltGr is reported as Ctrl+Alt; excluding Alt keeps AltGr symbols
+        // (`@ { [ ] } \\ | ~ €` on the German layout) out of the Ctrl-shortcut / control-code path.
+        let ctrl = self.mods.state().control_key() && !self.mods.state().alt_key();
         let shift = self.mods.state().shift_key();
 
         // Shift+nav scrolls the focused pane's history viewport (and is not sent to the PTY).
@@ -1463,14 +1480,8 @@ impl ApplicationHandler<UserEvent> for App {
         // Accept IME commits so an active ibus/fcitx can't swallow input (layout-agnostic safety net).
         window.set_ime_allowed(true);
 
-        // Clipboard via our own wl_display — uses the app's seat, so it works on KWin and any
-        // Wayland compositor without XWayland or data-control protocols. None on non-Wayland.
-        self.clipboard = match window.display_handle().map(|h| h.as_raw()) {
-            Ok(RawDisplayHandle::Wayland(h)) => {
-                Some(unsafe { smithay_clipboard::Clipboard::new(h.display.as_ptr() as *mut c_void) })
-            }
-            _ => None,
-        };
+        // Platform clipboard (Wayland seat on Linux, Win32 on Windows). See `clip`.
+        self.clipboard = clip::Clipboard::new(&window);
         let egui_renderer = egui_wgpu::Renderer::new(
             &state.device,
             state.surface_config.format,
@@ -1516,7 +1527,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // OSC 52: app reads the clipboard; format the response and send it to that pane.
             UserEvent::ClipboardLoad(pane, fmt) => {
-                let text = self.clipboard.as_ref().and_then(|cb| cb.load().ok());
+                let text = self.clipboard.as_ref().and_then(|cb| cb.load());
                 if let Some(t) = text {
                     let response = fmt(&t);
                     self.to_pty(pane, response.as_bytes());
@@ -1659,7 +1670,7 @@ impl ApplicationHandler<UserEvent> for App {
                             self.end_selection()
                         }
                         (MouseButton::Middle, ElementState::Pressed) => {
-                            let text = self.clipboard.as_ref().and_then(|cb| cb.load_primary().ok());
+                            let text = self.clipboard.as_ref().and_then(|cb| cb.load_primary());
                             if let Some(t) = text {
                                 self.paste_text(id, &t);
                             }

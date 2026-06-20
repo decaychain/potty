@@ -17,6 +17,9 @@ pub struct Config {
     /// None → generic monospace; otherwise a specific family name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    /// Shell to spawn; None → platform default ($SHELL on unix, %COMSPEC% on Windows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
     pub font_size: f32,
     /// Point size for the chrome (tab bar + menus). The terminal grid uses `font_size`.
     pub ui_font_size: f32,
@@ -41,6 +44,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             font_family: None,
+            shell: None,
             font_size: 15.0,
             ui_font_size: 13.0,
             osc52: "copy".into(),
@@ -96,8 +100,14 @@ impl Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/potty/potty.toml`, falling back to `~/.config/...`.
+/// Config file location: `%APPDATA%\potty\potty.toml` on Windows, else
+/// `$XDG_CONFIG_HOME/potty/potty.toml` falling back to `~/.config/...`.
 pub fn config_path() -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(not(windows))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
