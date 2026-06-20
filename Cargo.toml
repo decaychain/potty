@@ -27,3 +27,7 @@ smithay-clipboard = "0.7.3"
 [target.'cfg(windows)'.dependencies]
 # Text only — skip the default image-data feature (and its `image` dependency).
 arboard = { version = "3", default-features = false }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds assets/icon.ico into the .exe (build.rs).
+winresource = "0.1"

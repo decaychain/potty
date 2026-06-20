@@ -60,6 +60,14 @@ const LINE_PX: f32 = 18.0;
 /// Top-bar height reserve (logical px) for the initial PTY sizing.
 const TOPBAR: f32 = 34.0;
 
+/// 64×64 RGBA window icon, embedded raw (no PNG decoder needed). Used by winit's
+/// `set_window_icon` — drives the title bar / taskbar / alt-tab on Windows (a no-op on Wayland,
+/// where the icon comes from the `.desktop` file matched by `app_id`).
+const WINDOW_ICON_RGBA: &[u8] = include_bytes!("../assets/icon-64.rgba");
+/// Wayland app_id (and the basename of the installed `.desktop` / icon on Linux).
+#[cfg(target_os = "linux")]
+const APP_ID: &str = "io.github.decaychain.potty";
+
 type SharedTerm = Arc<Mutex<Term<EventProxy>>>;
 
 /// Events the terminal raises (from a PTY reader thread) that the main loop must service.
@@ -1425,15 +1433,19 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("potty")
-                        .with_inner_size(LogicalSize::new(960.0, 600.0)),
-                )
-                .unwrap(),
-        );
+        let icon = winit::window::Icon::from_rgba(WINDOW_ICON_RGBA.to_vec(), 64, 64).ok();
+        let attrs = Window::default_attributes()
+            .with_title("potty")
+            .with_inner_size(LogicalSize::new(960.0, 600.0))
+            .with_window_icon(icon);
+        // Wayland has no per-window icon protocol — set the app_id so KWin matches the installed
+        // `.desktop` (and its Icon=) instead. (Shadow rather than `mut` so Windows stays warning-free.)
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attrs.with_name(APP_ID, "potty")
+        };
+        let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
