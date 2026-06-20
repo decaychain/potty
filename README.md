@@ -2,6 +2,12 @@
   <img src="assets/icon.png" alt="potty" width="128">
   <h1>potty</h1>
   <p><em>A GPU-accelerated terminal emulator in Rust, with a deliberately visual, pointer-driven take on tabs and panes.</em></p>
+
+  <p>
+    <a href="https://copr.fedorainfracloud.org/coprs/decaychain/potty/"><img src="https://copr.fedorainfracloud.org/coprs/decaychain/potty/package/potty/status_image/last_build.png" alt="COPR build status"></a>
+    <a href="https://github.com/decaychain/potty/releases/latest"><img src="https://img.shields.io/github/v/release/decaychain/potty" alt="Latest release"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  </p>
 </div>
 
 A research spike — built for fun and to learn the stack — that grew into something genuinely
@@ -11,6 +17,23 @@ for the menu.
 
 > Status: a **personal tool**, scoped to the author's own machines (Linux + Windows). Not a
 > general-purpose product — but it runs real shells, multiplexes, and behaves well.
+
+## Install
+
+**Fedora** (via [COPR](https://copr.fedorainfracloud.org/coprs/decaychain/potty/) — updates come
+with `dnf upgrade`):
+
+```sh
+sudo dnf copr enable decaychain/potty
+sudo dnf install potty
+```
+
+**Windows** — grab the installer for your architecture from the
+[latest release](https://github.com/decaychain/potty/releases/latest):
+`potty-<version>-x64-setup.exe` or `potty-<version>-arm64-setup.exe` (a per-user install, no admin
+needed).
+
+Or [build from source](#build--run).
 
 ## Features
 
