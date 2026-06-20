@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  # Windows installers: one NSIS .exe per arch, attached to the GitHub Release.
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, arch: x64 }
+          - { runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Drive Cargo.toml's version (and therefore the embedded .exe version
+      # resource) off the pushed tag, so a release isn't stuck at 0.1.0.
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
+          grep '^version' Cargo.toml | head -1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      # Run makensis from the repo root so the File/Icon paths in potty.nsi
+      # (target\release\potty.exe, assets\icon.ico) resolve, and the
+      # OutFile (potty-<ver>-<arch>-setup.exe) lands in the workspace.
+      - name: Build installer
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          makensis -DVERSION="$VERSION" -DARCH="${{ matrix.arch }}" packaging/windows/potty.nsi
+          ls -la potty-*-setup.exe
+
+      - name: Upload installer to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: potty-*-setup.exe
+
+  # Fedora: submit an SRPM to COPR, which rebuilds the binary RPM in its mock
+  # chroots and publishes to https://copr.fedorainfracloud.org/coprs/decaychain/potty/.
+  # Users `dnf copr enable decaychain/potty && dnf install potty` and get updates
+  # via `dnf upgrade`. No RPMs are attached to the GitHub Release.
+  copr:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          pipx install copr-cli
+
+      # v0.2.0          -> Version=0.2.0  Release=1
+      # v0.2.0-alpha.3  -> Version=0.2.0  Release=0.alpha.3   (sorts before 1)
+      - name: Compute version + release from tag
+        run: |
+          VERSION_RAW="${GITHUB_REF_NAME#v}"
+          if [[ "$VERSION_RAW" == *-* ]]; then
+            RPM_VERSION="${VERSION_RAW%%-*}"
+            RPM_RELEASE="0.${VERSION_RAW#*-}"
+          else
+            RPM_VERSION="$VERSION_RAW"
+            RPM_RELEASE="1"
+          fi
+          {
+            echo "VERSION_RAW=$VERSION_RAW"
+            echo "RPM_VERSION=$RPM_VERSION"
+            echo "RPM_RELEASE=$RPM_RELEASE"
+          } >> "$GITHUB_ENV"
+          echo "Version=$RPM_VERSION  Release=$RPM_RELEASE"
+
+      - name: Sync Cargo.toml version
+        run: |
+          sed -i "0,/^version = .*/s//version = \"$VERSION_RAW\"/" Cargo.toml
+          grep '^version' Cargo.toml | head -1
+
+      - name: Create source tarball
+        run: |
+          mkdir -p "$HOME/rpmbuild/SOURCES" "$HOME/rpmbuild/SPECS" "$HOME/rpmbuild/SRPMS"
+          STAGE=$(mktemp -d)
+          DIRNAME="potty-${RPM_VERSION}"
+          cp -r "$GITHUB_WORKSPACE" "$STAGE/$DIRNAME"
+          rm -rf "$STAGE/$DIRNAME/.git" "$STAGE/$DIRNAME/target"
+          tar -C "$STAGE" -czf "$HOME/rpmbuild/SOURCES/$DIRNAME.tar.gz" "$DIRNAME"
+          rm -rf "$STAGE"
+
+      - name: Render .spec
+        run: |
+          sed -e "s/@@VERSION@@/${RPM_VERSION}/g" \
+              -e "s/@@RELEASE@@/${RPM_RELEASE}/g" \
+              packaging/fedora/potty.spec.in > "$HOME/rpmbuild/SPECS/potty.spec"
+
+      - name: Build SRPM
+        run: rpmbuild -bs "$HOME/rpmbuild/SPECS/potty.spec"
+
+      - name: Configure COPR credentials
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          mkdir -p ~/.config
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
+
+      # --nowait: kick off the COPR build and exit; COPR compiles across the
+      # configured Fedora chroots on its own infra (we don't tie up a runner).
+      - name: Submit to COPR
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          SRPM=$(ls "$HOME/rpmbuild/SRPMS"/*.src.rpm | head -1)
+          copr-cli build --nowait decaychain/potty "$SRPM"

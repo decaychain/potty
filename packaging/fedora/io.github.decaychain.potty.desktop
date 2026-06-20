@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=potty
+GenericName=Terminal Emulator
+Comment=GPU-accelerated terminal emulator with visual tabs and panes
+Exec=potty
+Icon=io.github.decaychain.potty
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;prompt;command;console;
+StartupNotify=true
+StartupWMClass=io.github.decaychain.potty

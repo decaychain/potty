@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+# Cross-platform build check — the most valuable signal, since most breakage on
+# this stack is platform-specific cfg drift. No system deps are needed: the
+# graphical libraries (wayland, xkbcommon, vulkan) are all dlopen'd at runtime,
+# so nothing GUI is linked at build time.
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, name: linux }
+          - { runner: windows-latest, name: windows }
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release

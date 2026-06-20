@@ -1,0 +1,66 @@
+Name:           potty
+Version:        @@VERSION@@
+Release:        @@RELEASE@@%{?dist}
+Summary:        GPU-accelerated terminal emulator with visual tabs and panes
+
+License:        MIT
+URL:            https://github.com/decaychain/potty
+Source0:        %{name}-%{version}.tar.gz
+
+# COPR mock chroots must have network access enabled in the project settings,
+# otherwise cargo cannot fetch crate dependencies while building.
+BuildRequires:  rust
+BuildRequires:  cargo
+BuildRequires:  gcc
+# Used via RUSTFLAGS=-fuse-ld=lld below.
+BuildRequires:  lld
+
+# Everything graphical is dlopen'd at runtime (wayland, xkbcommon, vulkan) — the
+# binary only links libc/libm/libgcc — so rpm's automatic dependency generator
+# can't see these. Declare them by hand.
+Requires:       libwayland-client
+Requires:       libwayland-cursor
+Requires:       libwayland-egl
+Requires:       libxkbcommon
+Requires:       vulkan-loader
+# A monospace font for the default family (fontdb scans the system font dirs).
+Requires:       dejavu-sans-mono-fonts
+
+%description
+potty is a GPU-accelerated terminal emulator in Rust with a deliberately visual,
+pointer-driven take on tabs and panes: click to focus, drag the dividers to
+resize, right-click for the menu. Wayland-native, with a custom per-cell GPU
+renderer and real multiplexing (a PTY per pane).
+
+%prep
+%setup -q
+
+%build
+# Link with LLD to match the binary produced by the project's GitHub-Actions /
+# upstream builds. (Defensive: the upstream Fedora package this mirrors hit a
+# DT_NEEDED ordering crash on NVIDIA + Wayland with the default BFD linker.)
+export RUSTFLAGS="${RUSTFLAGS:-} -Clink-arg=-fuse-ld=lld"
+cargo build --release
+
+%install
+install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
+install -Dm644 packaging/fedora/io.github.decaychain.potty.desktop \
+  %{buildroot}%{_datadir}/applications/io.github.decaychain.potty.desktop
+# Scalable source plus a few raster sizes for the hicolor icon theme.
+install -Dm644 assets/icon.svg \
+  %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/io.github.decaychain.potty.svg
+for s in 48 64 128 256; do
+  install -Dm644 assets/icon-${s}.png \
+    %{buildroot}%{_datadir}/icons/hicolor/${s}x${s}/apps/io.github.decaychain.potty.png
+done
+
+%files
+%license LICENSE
+%{_bindir}/%{name}
+%{_datadir}/applications/io.github.decaychain.potty.desktop
+%{_datadir}/icons/hicolor/scalable/apps/io.github.decaychain.potty.svg
+%{_datadir}/icons/hicolor/*/apps/io.github.decaychain.potty.png
+
+%changelog
+* Sat Jun 20 2026 Decay Chain <noreply@github.com> - @@VERSION@@-@@RELEASE@@
+- Automated COPR build
