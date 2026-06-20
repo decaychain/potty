@@ -315,6 +315,8 @@ fn build_ui(
     cur_family: Option<&str>,
     cur_size: f32,
     tab_titles: &[String],
+    border_color: egui::Color32,
+    pane_padding: f32,
     show_font_settings: &mut bool,
     actions: &mut Vec<Action>,
     leaves: &mut Vec<(PaneId, egui::Rect)>,
@@ -363,11 +365,21 @@ fn build_ui(
             // fall through to our own handler (which gates geometrically, not on egui
             // consumption), so selection/focus still work. Plain right-click in a mouse-mode
             // app is withheld from egui upstream so it reaches the app instead.
-            for (id, rect) in ws.leaf_rects(area) {
+            //
+            // A lone pane draws no border (it'd just be noise) and fills its area. With several
+            // panes the border helps, and the terminal is inset by `pane_padding` so the cells
+            // don't touch it.
+            let rects = ws.leaf_rects(area);
+            let single = rects.len() == 1;
+            for (id, rect) in rects {
                 ui.interact(rect, egui::Id::new(("pane", ws.active, id)), egui::Sense::click())
                     .context_menu(|ui| full_menu(ui, actions, Some(id)));
+                if single {
+                    leaves.push((id, rect));
+                    continue;
+                }
                 let stroke = if id == focus {
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 160, 255))
+                    egui::Stroke::new(1.5, border_color)
                 } else {
                     egui::Stroke::new(1.0, egui::Color32::from_gray(60))
                 };
@@ -377,7 +389,7 @@ fn build_ui(
                     stroke,
                     egui::StrokeKind::Inside,
                 );
-                leaves.push((id, rect));
+                leaves.push((id, rect.shrink(pane_padding)));
             }
 
             // Draggable split dividers. The grab region is widened beyond the thin visual gap;
@@ -400,11 +412,7 @@ fn build_ui(
                         Split::Rows => egui::CursorIcon::ResizeVertical,
                     };
                     ui.ctx().set_cursor_icon(cursor);
-                    ui.painter().rect_filled(
-                        d.rect,
-                        egui::CornerRadius::ZERO,
-                        egui::Color32::from_rgb(120, 160, 255),
-                    );
+                    ui.painter().rect_filled(d.rect, egui::CornerRadius::ZERO, border_color);
                 }
                 if resp.dragged() {
                     if let Some(p) = resp.interact_pointer_pos() {
@@ -1326,6 +1334,9 @@ impl App {
         let mut leaves: Vec<(PaneId, egui::Rect)> = Vec::new();
         let mut dividers: Vec<egui::Rect> = Vec::new();
         let mut show_font = self.show_font_settings;
+        let b = self.config.border();
+        let border_color = egui::Color32::from_rgb(b.r, b.g, b.b);
+        let pane_padding = self.config.pane_padding;
         let full = {
             let ws = &self.workspace;
             let families = &self.font_families;
@@ -1333,8 +1344,8 @@ impl App {
             let cur_size = self.config.font_size;
             self.egui_ctx.run(raw, |ctx| {
                 build_ui(
-                    ctx, ws, families, cur_family, cur_size, &tab_titles, &mut show_font,
-                    &mut actions, &mut leaves, &mut dividers,
+                    ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
+                    pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
                 )
             })
         };

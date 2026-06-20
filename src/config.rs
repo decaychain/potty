@@ -27,6 +27,9 @@ pub struct Config {
     /// "paste"/"copy-paste" let programs READ your clipboard via escape sequence — including
     /// remote hosts over SSH. Enable read deliberately.
     pub osc52: String,
+    /// Inner padding (logical px) between a pane's border and its terminal cells. Only applies
+    /// when a tab has more than one pane (a lone pane draws no border and fills its area).
+    pub pane_padding: f32,
     pub colors: Colors,
 }
 
@@ -36,6 +39,10 @@ pub struct Colors {
     pub foreground: String,
     pub background: String,
     pub cursor: String,
+    /// Mouse-selection highlight background.
+    pub selection: String,
+    /// Active (focused) pane border, when a tab has more than one pane.
+    pub border: String,
     /// The 16 base ANSI colors as `#rrggbb`. Missing/short entries fall back to defaults.
     pub ansi: Vec<String>,
 }
@@ -48,6 +55,7 @@ impl Default for Config {
             font_size: 15.0,
             ui_font_size: 13.0,
             osc52: "copy".into(),
+            pane_padding: 5.0,
             colors: Colors::default(),
         }
     }
@@ -59,6 +67,8 @@ impl Default for Colors {
             foreground: "#cccccc".into(),
             background: "#0d0d10".into(),
             cursor: "#cccccc".into(),
+            selection: "#334a6b".into(),
+            border: "#78a0ff".into(),
             ansi: BASE16.iter().map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}")).collect(),
         }
     }
@@ -95,8 +105,14 @@ impl Config {
             fg: parse_hex(&self.colors.foreground).unwrap_or(Rgb { r: 0xcc, g: 0xcc, b: 0xcc }),
             bg: parse_hex(&self.colors.background).unwrap_or(Rgb { r: 0x0d, g: 0x0d, b: 0x10 }),
             cursor: parse_hex(&self.colors.cursor).unwrap_or(Rgb { r: 0xcc, g: 0xcc, b: 0xcc }),
+            selection: parse_hex(&self.colors.selection).unwrap_or(Rgb { r: 0x33, g: 0x4a, b: 0x6b }),
             ansi,
         }
+    }
+
+    /// Active pane border colour for the chrome.
+    pub fn border(&self) -> Rgb {
+        parse_hex(&self.colors.border).unwrap_or(Rgb { r: 0x78, g: 0xa0, b: 0xff })
     }
 }
 

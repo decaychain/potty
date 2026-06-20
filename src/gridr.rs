@@ -51,6 +51,7 @@ pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
     pub cursor: Rgb,
+    pub selection: Rgb,
     pub ansi: [Rgb; 16],
 }
 
@@ -60,6 +61,7 @@ impl Default for Palette {
             fg: Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
             bg: Rgb { r: 0x0d, g: 0x0d, b: 0x10 },
             cursor: Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
+            selection: SELECTION_BG,
             ansi: default_ansi(),
         }
     }
@@ -529,7 +531,7 @@ impl GridRenderer {
             }
             let mut draw_bg = bg_col != palette.bg;
             if selection.as_ref().is_some_and(|r| r.contains(point)) {
-                bg_col = SELECTION_BG;
+                bg_col = palette.selection;
                 draw_bg = true;
             }
             if cursor_on && point == cursor_point {
