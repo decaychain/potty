@@ -490,6 +490,10 @@ impl GridRenderer {
         term: &Term<L>,
         origin: (f32, f32),
         screen: (f32, f32),
+        // Whether to draw the cursor this frame (false during a blink's "off" phase).
+        show_cursor: bool,
+        // Underline/beam thickness as a fraction of the cell.
+        cursor_thickness: f32,
     ) {
         queue.write_buffer(&self.screen_buf, 0, bytemuck::cast_slice(&[screen.0, screen.1, 0.0, 0.0]));
 
@@ -506,8 +510,10 @@ impl GridRenderer {
         let content = term.renderable_content();
         let colors = content.colors;
         let cursor_point = content.cursor.point;
-        let cursor_on = content.mode.contains(TermMode::SHOW_CURSOR)
-            && content.cursor.shape != CursorShape::Hidden;
+        let cursor_shape = content.cursor.shape;
+        let cursor_on = show_cursor
+            && content.mode.contains(TermMode::SHOW_CURSOR)
+            && cursor_shape != CursorShape::Hidden;
         let selection = content.selection;
         // When scrolled into history, display_iter yields negative line numbers; shift them
         // back into the 0..screen_lines viewport so scrollback renders in place.
@@ -534,7 +540,8 @@ impl GridRenderer {
                 bg_col = palette.selection;
                 draw_bg = true;
             }
-            if cursor_on && point == cursor_point {
+            let is_cursor = cursor_on && point == cursor_point;
+            if is_cursor && cursor_shape == CursorShape::Block {
                 // Block cursor: fill with the cursor color, draw the glyph in the bg color.
                 bg_col = palette.cursor;
                 fg_col = palette.bg;
@@ -543,6 +550,31 @@ impl GridRenderer {
 
             if draw_bg {
                 bg.push(BgInstance { pos: [x, y], size: [cw, ch], color: rgba(bg_col, 1.0) });
+            }
+
+            // Non-block cursors are drawn as bars over the cell's normal bg/glyph. (They land in
+            // the bg pass, i.e. behind the glyph — the standard look for an underline/beam.)
+            if is_cursor {
+                let cc = rgba(palette.cursor, 1.0);
+                match cursor_shape {
+                    CursorShape::Underline => {
+                        let th = (ch * cursor_thickness).max(1.0);
+                        bg.push(BgInstance { pos: [x, y + ch - th], size: [cw, th], color: cc });
+                    }
+                    CursorShape::Beam => {
+                        let th = (cw * cursor_thickness).max(1.0);
+                        bg.push(BgInstance { pos: [x, y], size: [th, ch], color: cc });
+                    }
+                    CursorShape::HollowBlock => {
+                        // Outline the cell (e.g. an unfocused-window cursor).
+                        let t = (ch * 0.07).max(1.0);
+                        bg.push(BgInstance { pos: [x, y], size: [cw, t], color: cc });
+                        bg.push(BgInstance { pos: [x, y + ch - t], size: [cw, t], color: cc });
+                        bg.push(BgInstance { pos: [x, y], size: [t, ch], color: cc });
+                        bg.push(BgInstance { pos: [x + cw - t, y], size: [t, ch], color: cc });
+                    }
+                    _ => {}
+                }
             }
 
             let c = cell.c;

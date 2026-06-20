@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use alacritty_terminal::vte::ansi::Rgb;
+use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use serde::{Deserialize, Serialize};
 
 use crate::gridr::{default_ansi, Palette, BASE16};
@@ -30,6 +30,15 @@ pub struct Config {
     /// Inner padding (logical px) between a pane's border and its terminal cells. Only applies
     /// when a tab has more than one pane (a lone pane draws no border and fills its area).
     pub pane_padding: f32,
+    /// Default cursor shape: "block", "underline" (or "underscore"), or "beam" (or "bar").
+    /// Programs may override this at runtime via DECSCUSR (`CSI Ps SP q`).
+    pub cursor_shape: String,
+    /// Default cursor blinking. Programs may override via DECSCUSR. The blink only consumes CPU
+    /// while the *focused* pane's cursor is actually blinking and idle.
+    pub cursor_blink: bool,
+    /// Thickness of the underline/beam cursor as a fraction of the cell (height for underline,
+    /// width for beam). Bump it for a fatter underscore. Ignored for the block cursor.
+    pub cursor_thickness: f32,
     pub colors: Colors,
 }
 
@@ -56,6 +65,9 @@ impl Default for Config {
             ui_font_size: 13.0,
             osc52: "copy".into(),
             pane_padding: 5.0,
+            cursor_shape: "block".into(),
+            cursor_blink: false,
+            cursor_thickness: 0.15,
             colors: Colors::default(),
         }
     }
@@ -107,6 +119,16 @@ impl Config {
             cursor: parse_hex(&self.colors.cursor).unwrap_or(Rgb { r: 0xcc, g: 0xcc, b: 0xcc }),
             selection: parse_hex(&self.colors.selection).unwrap_or(Rgb { r: 0x33, g: 0x4a, b: 0x6b }),
             ansi,
+        }
+    }
+
+    /// The configured default cursor shape (the starting style before any program issues
+    /// DECSCUSR). Unknown values fall back to a block.
+    pub fn cursor_shape(&self) -> CursorShape {
+        match self.cursor_shape.trim().to_ascii_lowercase().as_str() {
+            "underline" | "underscore" => CursorShape::Underline,
+            "beam" | "bar" => CursorShape::Beam,
+            _ => CursorShape::Block,
         }
     }
 

@@ -59,6 +59,8 @@ const FONT_PX: f32 = 15.0;
 const LINE_PX: f32 = 18.0;
 /// Top-bar height reserve (logical px) for the initial PTY sizing.
 const TOPBAR: f32 = 34.0;
+/// Cursor blink half-period (time the cursor stays solid, then hidden). ~1.2 Hz, the classic feel.
+const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 64×64 RGBA window icon, embedded raw (no PNG decoder needed). Used by winit's
 /// `set_window_icon` — drives the title bar / taskbar / alt-tab on Windows (a no-op on Wayland,
@@ -125,6 +127,10 @@ fn term_config(cfg: &Config) -> TermConfig {
         "paste" => Osc52::OnlyPaste,
         "copy-paste" => Osc52::CopyPaste,
         _ => Osc52::OnlyCopy,
+    };
+    tc.default_cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
+        shape: cfg.cursor_shape(),
+        blinking: cfg.cursor_blink,
     };
     tc
 }
@@ -509,8 +515,12 @@ impl WindowState {
         term: &Term<EventProxy>,
         origin: (f32, f32),
         screen: (f32, f32),
+        show_cursor: bool,
+        cursor_thickness: f32,
     ) {
-        self.grid.prepare(&self.device, &self.queue, pane, term, origin, screen);
+        self.grid.prepare(
+            &self.device, &self.queue, pane, term, origin, screen, show_cursor, cursor_thickness,
+        );
     }
 
     fn render(
@@ -681,6 +691,12 @@ struct App {
     /// Divider grab regions in physical px — a press here is a resize drag (egui-owned), so our
     /// terminal mouse handling skips it.
     divider_px: Vec<(f32, f32, f32, f32)>,
+
+    /// Cursor-blink state. `blink_on` is the current visible phase (always true unless the focused
+    /// cursor is actively blinking); `blink_next` is when to next toggle. The timer only runs
+    /// while the focused pane's cursor blinks and is idle — see `about_to_wait`.
+    blink_on: bool,
+    blink_next: Option<Instant>,
 }
 
 impl App {
@@ -718,7 +734,25 @@ impl App {
             visible: std::collections::HashSet::new(),
             last_rect: HashMap::new(),
             divider_px: Vec::new(),
+            blink_on: true,
+            blink_next: None,
         }
+    }
+
+    /// Whether the focused pane's cursor is currently set to blink (config default or a program's
+    /// DECSCUSR), and visible. Drives the blink timer in `about_to_wait`.
+    fn focused_cursor_blinks(&self) -> bool {
+        self.focused_arc().is_some_and(|t| {
+            let g = t.lock().unwrap();
+            g.cursor_style().blinking && g.mode().contains(TermMode::SHOW_CURSOR)
+        })
+    }
+
+    /// Return the cursor to its solid phase and restart the blink cycle — called on focused-pane
+    /// activity so the cursor never blinks out mid-keystroke.
+    fn reset_blink(&mut self) {
+        self.blink_on = true;
+        self.blink_next = None;
     }
 
     /// Flag a pane's render as stale, and ask for a redraw if that pane is on screen.
@@ -1164,6 +1198,8 @@ impl App {
         if ev.state != ElementState::Pressed || self.terms.is_empty() {
             return;
         }
+        // Typing keeps the cursor solid and restarts the blink cycle.
+        self.reset_blink();
         let focus = self.focus();
         // On Windows AltGr is reported as Ctrl+Alt; excluding Alt keeps AltGr symbols
         // (`@ { [ ] } \\ | ~ €` on the German layout) out of the Ctrl-shortcut / control-code path.
@@ -1420,12 +1456,18 @@ impl App {
             let s = self.state.as_ref().unwrap();
             (s.surface_config.width as f32, s.surface_config.height as f32)
         };
+        let focus = self.focus();
+        let cursor_thickness = self.config.cursor_thickness;
         for (id, r) in &leaves {
             if self.dirty.remove(id) {
                 if let Some(term) = self.arc(*id) {
                     let origin = (r.min.x * ppp, r.min.y * ppp);
+                    // Only the focused pane's cursor blinks; suppress it during the off phase.
+                    let show_cursor = !(*id == focus && !self.blink_on);
                     let guard = term.lock().unwrap();
-                    self.state.as_mut().unwrap().prepare_pane(*id as u64, &guard, origin, (sw, sh));
+                    self.state.as_mut().unwrap().prepare_pane(
+                        *id as u64, &guard, origin, (sw, sh), show_cursor, cursor_thickness,
+                    );
                 }
             }
         }
@@ -1551,6 +1593,41 @@ impl ApplicationHandler<UserEvent> for App {
         self.clipboard = None;
     }
 
+    /// Drive the cursor blink. We otherwise wait idle (everything else is redraw-on-demand), so
+    /// the timer — and the CPU it costs — exists only while the focused cursor is actually
+    /// blinking. On each toggle we re-prepare just the focused pane and ask for one redraw.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        use winit::event_loop::ControlFlow;
+        // During teardown the workspace is empty; `focus()` would index an empty leaf vec and
+        // panic — and unwinding back through winit's C frames becomes a segfault.
+        if self.state.is_none() || self.terms.is_empty() {
+            return;
+        }
+        if self.focused_cursor_blinks() {
+            let now = Instant::now();
+            let next = *self.blink_next.get_or_insert(now + BLINK_INTERVAL);
+            if now >= next {
+                self.blink_on = !self.blink_on;
+                self.blink_next = Some(now + BLINK_INTERVAL);
+                let focus = self.focus();
+                self.dirty.insert(focus);
+                self.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                self.blink_next.unwrap_or(now + BLINK_INTERVAL),
+            ));
+        } else {
+            // Not blinking: make sure the cursor is shown, then go fully idle.
+            if !self.blink_on {
+                self.blink_on = true;
+                self.dirty.insert(self.focus());
+                self.request_redraw();
+            }
+            self.blink_next = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             // PTY output: mark the pane dirty; redraw only if it's on screen (a background
@@ -1559,6 +1636,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Wake(id) => {
                 if let Some(t) = self.terms.get(&id) {
                     t.wake_pending.store(false, Ordering::Release);
+                }
+                // Output in the focused pane keeps its cursor solid (and restarts the blink cycle).
+                if !self.terms.is_empty() && id == self.focus() {
+                    self.reset_blink();
                 }
                 self.touch(id);
             }
