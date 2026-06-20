@@ -46,15 +46,17 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           # choco installs NSIS but its dir isn't on the shell PATH here; call
-          # makensis by its full (32-bit Program Files) path on both archs.
+          # makensis by its full (32-bit Program Files) path on both archs. cd
+          # into the script dir so its relative paths and OutFile resolve there.
           makensis="/c/Program Files (x86)/NSIS/makensis.exe"
-          "$makensis" -DVERSION="$VERSION" -DARCH="${{ matrix.arch }}" packaging/windows/potty.nsi
+          cd packaging/windows
+          "$makensis" -DVERSION="$VERSION" -DARCH="${{ matrix.arch }}" potty.nsi
           ls -la potty-*-setup.exe
 
       - name: Upload installer to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: potty-*-setup.exe
+          files: packaging/windows/potty-*-setup.exe
 
   # Fedora: submit an SRPM to COPR, which rebuilds the binary RPM in its mock
   # chroots and publishes to https://copr.fedorainfracloud.org/coprs/decaychain/potty/.

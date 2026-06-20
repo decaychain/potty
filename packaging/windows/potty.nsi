@@ -1,7 +1,8 @@
 ; potty Windows installer (NSIS).
 ;
-; Built from the repo root: makensis -DVERSION=x.y.z -DARCH=x64 packaging\windows\potty.nsi
-; so the File/Icon paths below resolve relative to the repo root. Per-user install
+; NSIS resolves File/Icon paths relative to THIS script's directory, so the inputs
+; below reach back to the repo root with ..\..\. The workflow cd's here before
+; invoking makensis, so the OutFile lands next to this script. Per-user install
 ; (no UAC); the bundled potty.exe is whatever the matching job compiled.
 
 !ifndef VERSION
@@ -24,8 +25,8 @@ InstallDirRegKey HKCU "Software\${APPNAME}" "InstallDir"
 
 !include "MUI2.nsh"
 
-!define MUI_ICON "assets\icon.ico"
-!define MUI_UNICON "assets\icon.ico"
+!define MUI_ICON "..\..\assets\icon.ico"
+!define MUI_UNICON "..\..\assets\icon.ico"
 
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -35,8 +36,8 @@ InstallDirRegKey HKCU "Software\${APPNAME}" "InstallDir"
 
 Section "Install"
   SetOutPath "$INSTDIR"
-  File "target\release\potty.exe"
-  File "assets\icon.ico"
+  File "..\..\target\release\potty.exe"
+  File "..\..\assets\icon.ico"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\potty"
