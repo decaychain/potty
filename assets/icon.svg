@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect x="16" y="16" width="480" height="480" rx="104" fill="#0d0d10"/>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="102.5" fill="none" stroke="#2a2a33" stroke-width="3"/>
+
+  <!-- porcelain -->
+  <g fill="#e8e8ee">
+    <rect x="120" y="120" width="112" height="184" rx="18"/>          <!-- tank -->
+    <rect x="108" y="102" width="136" height="32" rx="15"/>           <!-- lid -->
+    <rect x="196" y="218" width="214" height="50" rx="25"/>           <!-- seat -->
+    <path d="M212 258 L212 300 Q212 364 276 364 L322 364 Q394 364 394 292 L394 258 Z"/> <!-- bowl -->
+    <path d="M252 360 L240 418 Q238 428 254 428 L350 428 Q366 428 364 418 L350 360 Z"/> <!-- pedestal -->
+  </g>
+  <!-- flush button -->
+  <rect x="150" y="92" width="40" height="15" rx="7.5" fill="#b9b9c4"/>
+
+  <!-- seat opening -->
+  <ellipse cx="302" cy="243" rx="88" ry="17" fill="#0d0d10"/>
+
+  <!-- prompt on the cistern -->
+  <polyline points="150,168 180,194 150,220" fill="none" stroke="#36d399" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="150" y="232" width="52" height="13" rx="6.5" fill="#36d399"/>
+
+  <!-- block cursor in the bowl opening -->
+  <rect x="288" y="232" width="28" height="22" rx="4" fill="#78a0ff"/>
+</svg>
