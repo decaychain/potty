@@ -57,6 +57,8 @@ use workspace::{PaneId, Split, Workspace, GAP};
 // The attention-feed wire contract lives in the lib crate (shared with the `potty-notify` bin).
 // Aliased to avoid clashing with the `notify` file-watcher crate used below.
 use potty::notify as feed;
+use potty::proto::{self, Control, Frame};
+use potty::remote;
 
 const FONT_PX: f32 = 15.0;
 const LINE_PX: f32 = 18.0;
@@ -96,6 +98,13 @@ enum UserEvent {
     PaneExited(PaneId),
     /// An attention note arrived on the notify socket (from `potty-notify`).
     Notify(feed::Note),
+    /// A remote SSH session authenticated and exec'd `potty-session`; carries the channel to send
+    /// it input/resize/close frames.
+    RemoteConnected { outbound: tokio::sync::mpsc::Sender<potty::proto::Frame> },
+    /// A wire-protocol frame arrived from a remote session.
+    RemoteFrame(potty::proto::Frame),
+    /// A remote connection attempt failed (auth, network, host key, …).
+    RemoteError(String),
 }
 
 /// Terminal event listener for one pane: forwards the events we care about to the main loop,
@@ -183,10 +192,33 @@ fn dims_for(width_px: f32, height_px: f32, cell_w: f32, cell_h: f32) -> Dims {
 
 /// One live terminal: its grid model + the PTY master (for writes and resize) and current size.
 /// The reader thread that feeds the grid is detached; it ends when the PTY closes.
+/// SPIKE: an `Authenticator` that trusts any host key (agent/key-file auth, no dialogs yet).
+struct SpikeAuth;
+impl remote::Authenticator for SpikeAuth {
+    fn accept_host_key(&self, _h: &str, _f: &str, _s: remote::HostKeyStatus) -> bool {
+        true
+    }
+}
+
+/// A pane's I/O backend: a local PTY, or a pane on a remote `potty-session` reached over the wire
+/// protocol. The renderer and the `Term` grid don't care which — only input and resize differ.
+enum Backend {
+    Local {
+        writer: Box<dyn Write + Send>,
+        master: Box<dyn portable_pty::MasterPty + Send>,
+    },
+    Remote {
+        /// Input/resize/close frames go here (to the russh writer task).
+        outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
+        /// Per-pane vte parse state — for a local pane this lives in its reader thread; a remote
+        /// pane is fed from the main loop, so it owns its parser here.
+        parser: Processor<StdSyncHandler>,
+    },
+}
+
 struct Terminal {
     term: SharedTerm,
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
+    backend: Backend,
     dims: Dims,
     /// Current title (OSC 0/2), shown in the tab label and (when focused) the window title.
     title: String,
@@ -879,6 +911,13 @@ struct App {
     /// Attention feed: sessions waiting for the user, keyed by `(host, session)`. Fed by the
     /// notify socket (`UserEvent::Notify`); rendered as a floating overlay in the chrome.
     pending: HashMap<(String, String), Pending>,
+
+    /// Tokio runtime hosting the russh client tasks (the only async in potty). Frames cross back
+    /// to this loop via `UserEvent`.
+    runtime: tokio::runtime::Runtime,
+    /// Panes whose backend is a remote session — `reconcile_terms` must not spawn a local PTY for
+    /// them, and closing them sends a `Close` frame rather than dropping a PTY.
+    remote_panes: std::collections::HashSet<PaneId>,
     /// Whether the feed overlay is currently shown. Auto-opens on a fresh wave of notes, toggled
     /// by the tab-bar bell, hidden by the overlay's close button.
     feed_open: bool,
@@ -927,6 +966,12 @@ impl App {
             pending: HashMap::new(),
             feed_open: false,
             chrome_latched: false,
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .expect("tokio runtime"),
+            remote_panes: std::collections::HashSet::new(),
         }
     }
 
@@ -1133,8 +1178,7 @@ impl App {
             id,
             Terminal {
                 term,
-                writer,
-                master: pair.master,
+                backend: Backend::Local { writer, master: pair.master },
                 dims,
                 title: default_title.clone(),
                 default_title,
@@ -1150,20 +1194,143 @@ impl App {
     fn reconcile_terms(&mut self) {
         let live = self.workspace.all_leaves();
         for id in &live {
-            if !self.terms.contains_key(id) {
+            // Remote panes get their Terminal at connect time — never spawn a local PTY for them.
+            if !self.terms.contains_key(id) && !self.remote_panes.contains(id) {
                 self.spawn_terminal(*id, self.last_dims);
             }
         }
         let removed: Vec<PaneId> =
             self.terms.keys().copied().filter(|id| !live.contains(id)).collect();
         for id in removed {
+            // A remote pane closed via the UI: tell the remote to kill its shell.
+            if let Some(Backend::Remote { outbound, .. }) = self.terms.get(&id).map(|t| &t.backend) {
+                let _ = outbound.try_send(Frame::Control(Control::Close { pane: id }));
+            }
             self.terms.remove(&id);
+            self.remote_panes.remove(&id);
             self.dirty.remove(&id);
             self.last_rect.remove(&id);
             if let Some(state) = self.state.as_mut() {
                 state.grid.forget_pane(id);
             }
         }
+    }
+
+    /// Remove a pane (its local shell exited, its remote pane reported `Exited`, or the UI closed
+    /// it). Exits the app once no panes remain.
+    fn close_pane(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
+        self.terms.remove(&id);
+        self.remote_panes.remove(&id);
+        self.dirty.remove(&id);
+        if let Some(state) = self.state.as_mut() {
+            state.grid.forget_pane(id);
+        }
+        self.workspace.remove_pane(id);
+        if self.terms.is_empty() {
+            event_loop.exit();
+        } else {
+            self.request_redraw();
+        }
+    }
+
+    /// Spawn the russh client for `cfg` on the tokio runtime. On success it forwards the remote's
+    /// frames back to this loop as `UserEvent`s; on failure it reports `RemoteError`.
+    fn connect_remote(&self, cfg: remote::SshConfig, auth: Arc<dyn remote::Authenticator>, command: String) {
+        let proxy = self.proxy.clone();
+        self.runtime.spawn(async move {
+            match remote::connect_and_exec(&cfg, auth, &command).await {
+                Ok((session, mut rx)) => {
+                    let connected = UserEvent::RemoteConnected { outbound: session.outbound.clone() };
+                    if proxy.send_event(connected).is_err() {
+                        return;
+                    }
+                    while let Some(frame) = rx.recv().await {
+                        if proxy.send_event(UserEvent::RemoteFrame(frame)).is_err() {
+                            break;
+                        }
+                    }
+                    drop(session); // keep the SSH session alive until the stream ends
+                }
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::RemoteError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// A remote session connected: open a tab with one shell pane backed by it.
+    fn open_remote_pane(&mut self, outbound: tokio::sync::mpsc::Sender<Frame>) {
+        self.workspace.new_tab();
+        let id = self.workspace.active_tab().focus;
+        let dims = self.last_dims;
+        let term: SharedTerm = Arc::new(Mutex::new(Term::new(
+            term_config(&self.config),
+            &dims,
+            EventProxy { proxy: self.proxy.clone(), pane: id },
+        )));
+        self.terms.insert(
+            id,
+            Terminal {
+                term,
+                backend: Backend::Remote { outbound: outbound.clone(), parser: Processor::new() },
+                dims,
+                title: "remote".into(),
+                default_title: "remote".into(),
+                wake_pending: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        self.remote_panes.insert(id);
+        let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
+        let _ = outbound.try_send(Frame::Control(Control::Open {
+            pane: id,
+            cols: dims.cols as u16,
+            rows: dims.rows as u16,
+        }));
+        // Spike: optional canned input, to prove the input→remote→output loop without a keyboard.
+        if let Ok(input) = std::env::var("POTTY_TEST_INPUT") {
+            let _ = outbound.try_send(Frame::Data { pane: id, bytes: input.into_bytes() });
+        }
+        self.dirty.insert(id);
+        self.request_redraw();
+    }
+
+    /// Feed a frame from a remote session into the owning pane (output) or handle its lifecycle.
+    fn on_remote_frame(&mut self, event_loop: &ActiveEventLoop, frame: Frame) {
+        match frame {
+            Frame::Data { pane, bytes } => {
+                if let Some(t) = self.terms.get_mut(&pane) {
+                    if let Backend::Remote { parser, .. } = &mut t.backend {
+                        let mut term = t.term.lock().unwrap();
+                        parser.advance(&mut *term, &bytes);
+                    }
+                }
+                self.touch(pane);
+            }
+            Frame::Control(Control::Exited { pane }) => self.close_pane(event_loop, pane),
+            // Welcome / Opened: nothing to do yet.
+            Frame::Control(_) => {}
+        }
+    }
+
+    /// SPIKE SCAFFOLDING: auto-connect to a host from `$POTTY_TEST_*` env on startup, to exercise
+    /// the remote path before the `+`/menu connect flow exists. To be removed once that lands.
+    fn maybe_test_connect(&self) {
+        let Ok(host) = std::env::var("POTTY_TEST_HOST") else {
+            return;
+        };
+        let cfg = remote::SshConfig {
+            host,
+            port: std::env::var("POTTY_TEST_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22),
+            user: std::env::var("POTTY_TEST_USER").unwrap_or_default(),
+            keys: std::env::var("POTTY_TEST_KEY").ok().map(std::path::PathBuf::from).into_iter().collect(),
+            known_hosts: std::env::var("POTTY_TEST_KNOWN_HOSTS").ok().map(std::path::PathBuf::from),
+            // Off by default for the spike so the test doesn't offer the dev's real agent keys to a
+            // throwaway sshd (which can exhaust MaxAuthTries before the test key is tried).
+            use_agent: std::env::var("POTTY_TEST_AGENT").is_ok(),
+            agent_sock: None,
+        };
+        let command = std::env::var("POTTY_TEST_SESSION_BIN").unwrap_or_else(|_| "potty-session".into());
+        self.connect_remote(cfg, Arc::new(SpikeAuth), command);
     }
 
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
@@ -1211,11 +1378,18 @@ impl App {
         self.apply_config(c);
     }
 
-    /// Write raw bytes to a pane's PTY.
+    /// Write raw bytes to a pane: its local PTY, or the remote session as an input `Data` frame.
     fn to_pty(&mut self, id: PaneId, bytes: &[u8]) {
         if let Some(t) = self.terms.get_mut(&id) {
-            let _ = t.writer.write_all(bytes);
-            let _ = t.writer.flush();
+            match &mut t.backend {
+                Backend::Local { writer, .. } => {
+                    let _ = writer.write_all(bytes);
+                    let _ = writer.flush();
+                }
+                Backend::Remote { outbound, .. } => {
+                    let _ = outbound.try_send(potty::proto::Frame::Data { pane: id, bytes: bytes.to_vec() });
+                }
+            }
         }
     }
 
@@ -1591,12 +1765,23 @@ impl App {
             t.dims = dims;
             self.last_dims = dims;
             t.term.lock().unwrap().resize(dims);
-            let _ = t.master.resize(portable_pty::PtySize {
-                rows: dims.rows as u16,
-                cols: dims.cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
+            match &t.backend {
+                Backend::Local { master, .. } => {
+                    let _ = master.resize(portable_pty::PtySize {
+                        rows: dims.rows as u16,
+                        cols: dims.cols as u16,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+                Backend::Remote { outbound, .. } => {
+                    let _ = outbound.try_send(potty::proto::Frame::Control(potty::proto::Control::Resize {
+                        pane: id,
+                        cols: dims.cols as u16,
+                        rows: dims.rows as u16,
+                    }));
+                }
+            }
             self.dirty.insert(id);
         }
     }
@@ -1893,6 +2078,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.reconcile_terms();
         // Kick the first frame — `visible` is still empty, so an early Wake wouldn't.
         self.request_redraw();
+        // Spike: optionally auto-connect to a remote test host (see `maybe_test_connect`).
+        self.maybe_test_connect();
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1985,21 +2172,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             // A shell exited — close its pane. Exit the app once no terminals remain.
-            UserEvent::PaneExited(id) => {
-                self.terms.remove(&id);
-                self.dirty.remove(&id);
-                if let Some(state) = self.state.as_mut() {
-                    state.grid.forget_pane(id as u64);
-                }
-                self.workspace.remove_pane(id);
-                if self.terms.is_empty() {
-                    event_loop.exit();
-                } else {
-                    self.request_redraw();
-                }
-            }
+            UserEvent::PaneExited(id) => self.close_pane(event_loop, id),
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_note(note),
+            // A remote session connected — give it a tab with one shell pane.
+            UserEvent::RemoteConnected { outbound } => self.open_remote_pane(outbound),
+            // Output / lifecycle from a remote session.
+            UserEvent::RemoteFrame(frame) => self.on_remote_frame(event_loop, frame),
+            UserEvent::RemoteError(msg) => eprintln!("potty: remote connection failed: {msg}"),
         }
     }
 

@@ -107,6 +107,19 @@ attention-feed passthrough are added once the spike proves the round trip and fe
      **ssh-agent** auth (agent started + key added in-test). Windows agent uses Pageant/named-pipe
      (compiled, not yet E2E-tested); keyboard-interactive/password are wired but need PAM/root to
      test, so they're not covered E2E.
-3. **GUI wiring:** a remote pane rendered natively; input/resize back; `+`/menu connect flow.
+3. **GUI wiring.**
+   - *Step 3a (done):* the async bridge + remote panes. A tokio runtime on its own threads hosts
+     the russh client; frames cross back to the winit loop as `UserEvent`s. `Terminal` gained a
+     `Backend` (Local PTY vs Remote), so input/resize route to a `Data`/`Resize` frame and a remote
+     pane's bytes feed its own vte `Processor`. A remote session opens as a new tab (flatten model).
+     Verified visually: potty auto-connected to a throwaway sshd, exec'd `potty-session`, and a
+     remote `echo` round-tripped and rendered in a remote tab. *Driven by `$POTTY_TEST_*` spike
+     scaffolding (`maybe_test_connect`/`SpikeAuth`) — temporary, replaced by the connect flow below.*
+   - *Step 3b (next):* the real connect flow — `+`/right-click "Connect to host…", `potty attach`,
+     host badges on tabs — and the auth dialogs (host-key approval, passphrase, keyboard-interactive)
+     that implement `Authenticator`, bridging its sync calls off the UI thread.
+   - *Known gap:* a busy ssh-agent can exhaust the server's `MaxAuthTries` before the ladder reaches
+     a working method (seen as "Channel send error"). The ladder should cap/triage agent identities
+     or handle the disconnect.
 4. **Persistence:** daemonize + reattach-repaint; the pane/tab tree server-side.
 5. **Later:** auto-reattach, bootstrapping, ProxyJump, agent forwarding, Windows `potty attach` IPC.
