@@ -100,8 +100,13 @@ attention-feed passthrough are added once the spike proves the round trip and fe
    - *Step 1 (done):* connect, **publickey** auth, exec `potty-session`, bidirectional frame pump
      (`src/remote.rs`). Host key accepted blindly. Tested over a throwaway localhost sshd
      (`tests/remote_ssh.rs`): a shell command run on the "remote" round-trips its output as frames.
-   - *Step 2 (next):* the auth ladder — agent (`$SSH_AUTH_SOCK` / Windows named pipe) → key files
-     (passphrase dialog) → keyboard-interactive/password — with host-key verification.
+   - *Step 2 (done):* the auth ladder — agent → key files (passphrase) → keyboard-interactive →
+     password — plus host-key verification against known_hosts. Interactive bits go through the
+     `Authenticator` trait (the GUI implements it with dialogs; step 3 bridges the sync calls to
+     the UI thread). Tested: publickey round trip, host-key rejection aborts connect, and
+     **ssh-agent** auth (agent started + key added in-test). Windows agent uses Pageant/named-pipe
+     (compiled, not yet E2E-tested); keyboard-interactive/password are wired but need PAM/root to
+     test, so they're not covered E2E.
 3. **GUI wiring:** a remote pane rendered natively; input/resize back; `+`/menu connect flow.
 4. **Persistence:** daemonize + reattach-repaint; the pane/tab tree server-side.
 5. **Later:** auto-reattach, bootstrapping, ProxyJump, agent forwarding, Windows `potty attach` IPC.

@@ -1,6 +1,8 @@
-//! End-to-end test of the russh client (step 1): stand up a throwaway localhost sshd, then
-//! `connect_and_exec` → `potty-session` over real SSH and prove the wire protocol round-trips.
-//! Unix-only, and skipped (not failed) when `sshd`/`ssh-keygen` aren't installed.
+//! End-to-end tests of the russh client over a throwaway localhost sshd:
+//!   - publickey round trip → `potty-session` (the protocol survives real SSH),
+//!   - host-key rejection aborts the connect,
+//!   - ssh-agent authentication.
+//! Unix-only, and each test skips (not fails) when the tools it needs aren't installed.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -8,7 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use potty::proto::{Control, Frame};
-use potty::remote::connect_and_exec;
+use potty::remote::{connect_and_exec, Authenticator, HostKeyStatus, RemoteSession, SshConfig};
+use tokio::sync::mpsc::Receiver;
 
 fn which(candidates: &[&str]) -> Option<PathBuf> {
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
@@ -22,7 +25,15 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// A throwaway sshd on localhost, with its own host + client keys. Killed and cleaned on drop.
+/// An `Authenticator` that accepts (or rejects) host keys; no secrets needed for these tests.
+struct AcceptHost(bool);
+impl Authenticator for AcceptHost {
+    fn accept_host_key(&self, _host: &str, _fp: &str, _status: HostKeyStatus) -> bool {
+        self.0
+    }
+}
+
+/// A throwaway sshd on localhost with its own host + client keys. Cleaned up on drop.
 struct Sshd {
     child: Child,
     dir: PathBuf,
@@ -38,27 +49,28 @@ impl Drop for Sshd {
     }
 }
 
-/// Returns `None` (→ skip the test) if the tools aren't available.
+fn keygen(keygen: &Path, out: &Path) -> bool {
+    Command::new(keygen)
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(out)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `None` → skip the test (tools unavailable / sshd wouldn't start).
 fn start_sshd() -> Option<Sshd> {
     let sshd = which(&["/usr/sbin/sshd", "/usr/bin/sshd"])?;
-    let keygen = which(&["/usr/bin/ssh-keygen", "/bin/ssh-keygen"])?;
+    let keygen_bin = which(&["/usr/bin/ssh-keygen", "/bin/ssh-keygen"])?;
 
-    let dir = std::env::temp_dir().join(format!("potty-sshtest-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("potty-sshtest-{}-{}", std::process::id(), free_port()));
     std::fs::create_dir_all(&dir).ok()?;
     let hostkey = dir.join("hostkey");
     let client_key = dir.join("clientkey");
     let authorized = dir.join("authorized_keys");
     let config = dir.join("sshd_config");
 
-    let keygen_ok = |path: &Path| {
-        Command::new(&keygen)
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-    if !keygen_ok(&hostkey) || !keygen_ok(&client_key) {
+    if !keygen(&keygen_bin, &hostkey) || !keygen(&keygen_bin, &client_key) {
         return None;
     }
     std::fs::copy(client_key.with_extension("pub"), &authorized).ok()?;
@@ -92,7 +104,6 @@ fn start_sshd() -> Option<Sshd> {
         .spawn()
         .ok()?;
 
-    // Wait for it to accept connections.
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -103,24 +114,24 @@ fn start_sshd() -> Option<Sshd> {
     None
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ssh_round_trip_to_potty_session() {
-    let Some(sshd) = start_sshd() else {
-        eprintln!("skipping: sshd/ssh-keygen unavailable");
-        return;
-    };
-    let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) else {
-        eprintln!("skipping: no $USER");
-        return;
-    };
+fn user() -> Option<String> {
+    std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok()
+}
 
-    let session_bin = env!("CARGO_BIN_EXE_potty-session");
-    let (session, mut rx) =
-        connect_and_exec(("127.0.0.1", sshd.port), &user, &sshd.client_key, session_bin)
-            .await
-            .expect("connect/auth/exec over ssh");
+fn config(sshd: &Sshd, user: &str, keys: Vec<PathBuf>, use_agent: bool, agent_sock: Option<PathBuf>) -> SshConfig {
+    SshConfig {
+        host: "127.0.0.1".into(),
+        port: sshd.port,
+        user: user.into(),
+        keys,
+        known_hosts: Some(sshd.dir.join("known_hosts")),
+        use_agent,
+        agent_sock,
+    }
+}
 
-    // Drive a pane and run a command in it, all over the SSH channel.
+/// Open a pane, run a marker echo in it, and assert the output round-trips back as frames.
+async fn assert_echo_round_trip(session: RemoteSession, mut rx: Receiver<Frame>) {
     for f in [
         Frame::Control(Control::Hello { version: 1 }),
         Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }),
@@ -129,25 +140,100 @@ async fn ssh_round_trip_to_potty_session() {
         session.outbound.send(f).await.expect("send frame");
     }
 
-    let mut welcomed = false;
-    let mut opened = false;
     let mut out = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-            Ok(Some(Frame::Control(Control::Welcome { .. }))) => welcomed = true,
-            Ok(Some(Frame::Control(Control::Opened { pane: 1 }))) => opened = true,
             Ok(Some(Frame::Data { pane: 1, bytes })) => out.extend(bytes),
             Ok(Some(_)) => {}
-            Ok(None) => break, // channel closed
-            Err(_) => {}       // timeout tick
+            Ok(None) => break,
+            Err(_) => {}
         }
-        if welcomed && opened && contains(&out, b"SSH_ROUNDTRIP_OK") {
-            break;
+        if contains(&out, b"SSH_ROUNDTRIP_OK") {
+            return;
         }
     }
+    panic!("echo did not round-trip over SSH");
+}
 
-    assert!(welcomed, "no Welcome over SSH");
-    assert!(opened, "no Opened over SSH");
-    assert!(contains(&out, b"SSH_ROUNDTRIP_OK"), "echo did not round-trip over SSH");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publickey_round_trip_to_potty_session() {
+    let Some(sshd) = start_sshd() else {
+        eprintln!("skipping: sshd/ssh-keygen unavailable");
+        return;
+    };
+    let Some(user) = user() else { return };
+
+    let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+    let (session, rx) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), env!("CARGO_BIN_EXE_potty-session"))
+            .await
+            .expect("connect/auth/exec over ssh");
+    assert_echo_round_trip(session, rx).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_host_key_aborts_connect() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+
+    // The host key is unknown (fresh known_hosts) and the authenticator refuses it.
+    let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+    let result =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(false)), env!("CARGO_BIN_EXE_potty-session")).await;
+    assert!(result.is_err(), "connect should fail when the host key is rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_auth_round_trip() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+    let (Some(ssh_agent), Some(ssh_add)) =
+        (which(&["/usr/bin/ssh-agent"]), which(&["/usr/bin/ssh-add"]))
+    else {
+        eprintln!("skipping: ssh-agent/ssh-add unavailable");
+        return;
+    };
+
+    // Start an agent on its own socket and load the (unencrypted) client key into it.
+    let sock = sshd.dir.join("agent.sock");
+    let agent = Command::new(&ssh_agent)
+        .args(["-D", "-a"])
+        .arg(&sock)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn ssh-agent");
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    // Wait for the agent socket, then add the key.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !sock.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let added = Command::new(&ssh_add)
+        .arg(&sshd.client_key)
+        .env("SSH_AUTH_SOCK", &sock)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _guard = Kill(agent);
+    if !added {
+        eprintln!("skipping: ssh-add failed");
+        return;
+    }
+
+    // Authenticate via the agent only — no key files.
+    let cfg = config(&sshd, &user, vec![], true, Some(sock));
+    let (session, rx) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), env!("CARGO_BIN_EXE_potty-session"))
+            .await
+            .expect("agent auth over ssh");
+    assert_echo_round_trip(session, rx).await;
+    // `_guard` keeps the agent process alive until here.
 }
