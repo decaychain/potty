@@ -324,6 +324,8 @@ enum Action {
     CloseConnect,
     /// Connect to the given `[user@]host[:port]`.
     Connect(String),
+    /// Dismiss the connection-error dialog.
+    DismissError,
 }
 
 /// Display data for the active auth prompt, handed to the chrome (the reply channel stays in
@@ -382,7 +384,8 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::AuthText(_)
         | Action::OpenConnect
         | Action::CloseConnect
-        | Action::Connect(_) => {}
+        | Action::Connect(_)
+        | Action::DismissError => {}
     }
 }
 
@@ -569,6 +572,7 @@ fn build_ui(
     auth_inputs: &mut Vec<String>,
     show_connect: bool,
     connect_host: &mut String,
+    error: Option<&str>,
 ) {
     // The tab bar earns its space with more than one tab, or once the attention feed has latched
     // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
@@ -811,16 +815,16 @@ fn build_ui(
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.set_max_width(440.0);
-                    let mut submit = false;
+                    // Capture Enter before the fields — a singleline TextEdit consumes it.
+                    let mut submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     for (i, (label, echo)) in fields.iter().enumerate() {
                         ui.label(label.as_str());
                         let edit = egui::TextEdit::singleline(&mut auth_inputs[i]).password(!echo);
                         let resp = ui.add(edit);
-                        if i == 0 {
+                        // Auto-focus the first field on open (only while nothing else is focused, so
+                        // it doesn't fight the user tabbing between fields).
+                        if i == 0 && ui.memory(|m| m.focused().is_none()) {
                             resp.request_focus();
-                        }
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            submit = true;
                         }
                     }
                     ui.separator();
@@ -847,9 +851,12 @@ fn build_ui(
             .show(ctx, |ui| {
                 ui.set_max_width(360.0);
                 ui.label("Host  ([user@]host[:port])");
+                // Capture Enter before the field — a singleline TextEdit consumes it.
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let resp = ui.add(egui::TextEdit::singleline(connect_host).hint_text("user@host"));
-                resp.request_focus();
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.memory(|m| m.focused().is_none()) {
+                    resp.request_focus();
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     if (ui.button("Connect").clicked() || enter) && !connect_host.trim().is_empty() {
@@ -859,6 +866,22 @@ fn build_ui(
                         actions.push(Action::CloseConnect);
                     }
                 });
+            });
+    }
+
+    // Connection error, shown instead of printing to stderr.
+    if let Some(msg) = error {
+        egui::Window::new("Connection failed")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                ui.label(msg);
+                ui.separator();
+                if ui.button("OK").clicked() {
+                    actions.push(Action::DismissError);
+                }
             });
     }
 }
@@ -1143,6 +1166,8 @@ struct App {
     /// Whether the "Connect to host…" dialog is open, and its host-field buffer.
     show_connect: bool,
     connect_host: String,
+    /// A connection error to show in a dialog (instead of stderr).
+    error_msg: Option<String>,
     /// Whether the feed overlay is currently shown. Auto-opens on a fresh wave of notes, toggled
     /// by the tab-bar bell, hidden by the overlay's close button.
     feed_open: bool,
@@ -1196,6 +1221,7 @@ impl App {
             auth_inputs: Vec::new(),
             show_connect: false,
             connect_host: String::new(),
+            error_msg: None,
         }
     }
 
@@ -2150,6 +2176,7 @@ impl App {
             },
         });
         let show_connect = self.show_connect;
+        let error = self.error_msg.clone();
         let auth_inputs = &mut self.auth_inputs;
         let connect_host = &mut self.connect_host;
         let full = {
@@ -2162,7 +2189,7 @@ impl App {
                     ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
                     pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
                     &feed_items, &mut feed_active, chrome_latched, feed_open, auth_view.as_ref(),
-                    auth_inputs, show_connect, connect_host,
+                    auth_inputs, show_connect, connect_host, error.as_deref(),
                 )
             })
         };
@@ -2175,7 +2202,8 @@ impl App {
         self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open())
             || feed_active
             || auth_view.is_some()
-            || self.show_connect;
+            || self.show_connect
+            || self.error_msg.is_some();
         for a in actions {
             match a {
                 Action::SetFontFamily(f) => self.set_font_family(f),
@@ -2209,6 +2237,10 @@ impl App {
                     self.request_redraw();
                 }
                 Action::Connect(host) => self.start_connect(&host),
+                Action::DismissError => {
+                    self.error_msg = None;
+                    self.request_redraw();
+                }
                 a => apply(&mut self.workspace, a),
             }
         }
@@ -2505,7 +2537,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::RemoteConnected { host, outbound } => self.open_remote_pane(host, outbound),
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(frame) => self.on_remote_frame(event_loop, frame),
-            UserEvent::RemoteError(msg) => eprintln!("potty: remote connection failed: {msg}"),
+            UserEvent::RemoteError(msg) => {
+                self.error_msg = Some(msg);
+                self.request_redraw();
+            }
             // A connection needs the user — queue it and show the dialog.
             UserEvent::Auth(prompt) => {
                 self.auth_prompts.push(prompt);
