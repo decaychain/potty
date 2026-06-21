@@ -71,7 +71,15 @@ babysit a pane to check "is it waiting yet?". The signal comes from the tool's o
 hook via a tiny helper (`potty-notify`) over a Unix socket — **not** by watching the terminal
 output — so a session in an unfocused pane still shows up. Click an entry to jump straight to it.
 
-Wire it up once (the `potty` package installs `potty-notify` on `PATH`):
+Wire it up once (the `potty` package installs `potty-notify` on `PATH`) — let the helper edit the
+configs for you (idempotent, won't clobber existing settings):
+
+```sh
+potty-notify --install-hook claude   # ~/.claude/settings.json
+potty-notify --install-hook codex    # ~/.codex/config.toml
+```
+
+<details><summary>…or wire them by hand</summary>
 
 **Claude Code** — `~/.claude/settings.json`:
 
@@ -84,14 +92,16 @@ Wire it up once (the `potty` package installs `potty-notify` on `PATH`):
 }
 ```
 
-**Codex** — `~/.codex/config.toml`:
+**Codex** — `~/.codex/config.toml`: `notify = ["potty-notify", "--tool", "codex"]`
+</details>
 
-```toml
-notify = ["potty-notify", "--tool", "codex"]
-```
+**Over SSH** (including a session in a background Zellij tab on the remote): it works with no extra
+code — SSH forwards the socket and propagates the env. `potty-notify --print-ssh-config <host>`
+emits the `~/.ssh/config` block; with `SendEnv POTTY_PANE` even remote sessions click-to-jump to
+the pane running `ssh`. potty can't switch the *remote* Zellij tab for you, but the entry shows
+which one to go to. Details in the [design doc](docs/attention-feed.md#phasing).
 
 A session outside potty (or on a host without the socket) just no-ops — the hook is harmless.
-SSH and Zellij-tab correlation are [planned next](docs/attention-feed.md#phasing).
 
 ## Platforms
 

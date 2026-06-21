@@ -112,19 +112,37 @@ POTTY_PANE   = <PaneId>                              # which pane this shell liv
 Because `POTTY_PANE` rides the local process tree, a local Claude Code's helper reports its exact
 pane. **Local correlation is exact** — "click to focus" lands on the right pane every time.
 
-**SSH sessions (the hard case).** The helper runs on the *remote* host, so it can't see the local
-socket. We bridge with **SSH remote socket forwarding** — the helper connects to a socket on the
-remote that is tunnelled back over the *existing* SSH connection to potty's local listener:
+**SSH sessions (the hard case — implemented & verified, no core code change).** The helper runs on
+the *remote* host, so it can't see the local socket. We bridge with **SSH remote socket
+forwarding** — the helper connects to a socket on the remote that is tunnelled back over the
+*existing* SSH connection to potty's local listener. The architecture already supports this: the
+helper connects to whatever `$POTTY_NOTIFY` names, and the listener accepts any connection. So SSH
+is pure configuration — `potty-notify --print-ssh-config <host>` emits it:
 
 ```sshconfig
 # ~/.ssh/config
 Host devbox
     RemoteForward /tmp/potty-notify.sock /run/user/1000/potty/notify.sock
     SetEnv POTTY_NOTIFY=/tmp/potty-notify.sock
+    SendEnv POTTY_PANE
 ```
 
-(`AcceptEnv POTTY_NOTIFY` on the server, or set it in the remote shell rc, completes the env
-propagation since SSH doesn't forward env by default.)
+```sshdconfig
+# remote /etc/ssh/sshd_config (or a drop-in)
+AcceptEnv POTTY_NOTIFY POTTY_PANE
+StreamLocalBindUnlink yes
+```
+
+The `SendEnv POTTY_PANE` line is the **correlation trick**: potty injects `$POTTY_PANE` into every
+pane's shell, `ssh` inherits it, and SSH carries it to the remote — so a note raised on the remote
+reports the *local* pane that ran `ssh`, and click-to-jump lands you on that SSH pane. Without
+`AcceptEnv POTTY_PANE` the remote note still appears in the feed (host, cwd, Zellij), just not
+jumpable. (`StreamLocalBindUnlink yes` lets a reconnect reclaim a stale remote socket. If you can't
+touch sshd_config, drop `SetEnv` and `export POTTY_NOTIFY` from the remote shell rc instead.)
+
+Verified end-to-end through a throwaway localhost sshd: a note from the "remote" helper arrived at
+the local listener carrying `pane` (forwarded) **and** `zellij: {session, pane}` (read from the
+remote's own env) — i.e. the full SSH-inside-Zellij case.
 
 The crucial property: **this path never touches the terminal byte stream.** The remote Claude
 Code's `Notification` hook → `potty-notify` → forwarded socket → potty. **Zellij is bypassed
@@ -158,13 +176,16 @@ struct Pending {
 
 ## Lifecycle / clearing
 
-A pending entry clears on the first of:
+A pending entry clears on the first of (all implemented):
 
 1. An explicit `clear` event (Claude `UserPromptSubmit`; Codex next-turn-start).
-2. The owning **local** pane gaining focus **and** receiving a keypress — belt-and-suspenders for
-   the local case, handled entirely inside potty.
-3. A TTL sweep (e.g. drop entries older than N minutes with no refresh) so a crashed helper or a
-   missed `clear` can't wedge a ghost entry on the list.
+2. The owning **local** pane receiving a keypress, or being jumped to from the feed — you've
+   engaged with it, so it no longer needs flagging. Handled entirely inside potty.
+3. A manual dismiss — the `×` on a feed row. (No time-based TTL: a prompt can legitimately wait
+   indefinitely, so dismiss is explicit rather than automatic.)
+
+When the last entry clears the overlay auto-hides; the tab-bar bell stays (the chrome latches on
+for the session so content doesn't jump), and clicking it with nothing waiting dismisses the bell.
 
 ## The honest limitation: remote correlation
 
@@ -191,6 +212,10 @@ SSH pane" is the bulk of the win.
 
 ## Setup the user writes once
 
+The hooks can be wired automatically — `potty-notify --install-hook claude` and
+`potty-notify --install-hook codex` (idempotent; merges into existing config, never clobbers).
+For reference, what they write:
+
 **Claude Code** (`~/.claude/settings.json`):
 
 ```json
@@ -208,19 +233,24 @@ SSH pane" is the bulk of the win.
 notify = ["potty-notify", "--tool", "codex"]
 ```
 
-On remote hosts: drop the `potty-notify` binary on `$PATH`, add the `RemoteForward` + `SetEnv`
-lines to `~/.ssh/config`, and the same hook config in the remote `~/.claude`/`~/.codex`.
+For SSH: `potty-notify --print-ssh-config <host>` emits the `~/.ssh/config` block (and the remote
+sshd_config lines). Then drop the `potty-notify` binary on the remote's `$PATH` and install the
+same hooks in the remote `~/.claude` / `~/.codex`.
 
 ## Phasing
 
-- **Phase 1 — local, fully robust.** Listener thread + `UserEvent` variant + per-pane env
-  injection + `potty-notify` bin + the attention-feed UI (badge, overlay, jump). Exact correlation;
-  no SSH plumbing. This is shippable on its own and covers single-machine multi-session use.
-- **Phase 2 — SSH.** Document the `RemoteForward`/env-propagation setup; helper reports
-  `host` + Zellij context; remote entries land on the SSH-hosting pane.
-- **Phase 3 — polish.** OSC fallback for tools without hooks; the Zellij last-hop auto-switch;
-  richer clear heuristics; a potty `ssh` wrapper that injects the `RemoteForward` so you don't
-  hand-edit ssh config.
+- **Phase 1 — local, fully robust. ✅ shipped.** Listener thread + `UserEvent` variant + per-pane
+  env injection + `potty-notify` bin + the attention-feed UI (overlay, bell, jump, dismiss). Exact
+  correlation; covers single-machine multi-session use.
+- **Phase 2 — SSH. ✅ verified, config-only (no core code change).** The helper honours
+  `$POTTY_NOTIFY` and the listener takes any connection, so SSH is just `RemoteForward` + env
+  propagation. `SendEnv POTTY_PANE` makes remote notes jump to the SSH-hosting pane; the helper
+  reports `host` + Zellij context. Ergonomics: `--install-hook`, `--print-ssh-config`. Tested
+  end-to-end (incl. SSH-inside-Zellij) through a throwaway localhost sshd.
+- **Phase 3 — polish (open).** OSC fallback for tools without hooks; the Zellij last-hop
+  auto-switch (`zellij action go-to-tab` over the wire); a potty `ssh` wrapper that injects the
+  `RemoteForward` so you don't hand-edit ssh config; the multi-session-per-host socket-collision
+  case (`StreamLocalBindUnlink` covers reconnect, not two live sessions to one host).
 
 ## Open questions
 

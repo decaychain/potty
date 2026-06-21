@@ -16,32 +16,49 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+use lexopt::prelude::{Long, Short, Value};
 use potty::notify::{
     default_socket_path, Kind, Note, Tool, ZellijLoc, ENV_PANE, ENV_SOCK, SCHEMA_VERSION,
 };
 
 fn main() {
-    // Hand-rolled arg parsing — no need to pull in a parser for a handful of flags.
     let mut tool = Tool::Other;
     let mut kind = Kind::Raise;
     let mut positional: Option<String> = None;
     let mut install: Option<String> = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--tool" => {
-                tool = match args.next().as_deref() {
+    let mut print_ssh = false;
+    let mut parser = lexopt::Parser::from_env();
+    loop {
+        match parser.next() {
+            Ok(Some(Long("tool"))) => {
+                tool = match parser.value().ok().and_then(|v| v.into_string().ok()).as_deref() {
                     Some("claude") => Tool::Claude,
                     Some("codex") => Tool::Codex,
                     _ => Tool::Other,
-                }
+                };
             }
-            "--clear" => kind = Kind::Clear,
-            "--install-hook" => install = args.next(),
-            // Codex spawns `notify <json>`; the lone positional is that payload.
-            other if !other.starts_with('-') => positional = Some(other.to_string()),
-            _ => {}
+            Ok(Some(Long("clear"))) => kind = Kind::Clear,
+            Ok(Some(Long("install-hook"))) => {
+                install = parser.value().ok().and_then(|v| v.into_string().ok());
+            }
+            Ok(Some(Long("print-ssh-config"))) => print_ssh = true,
+            Ok(Some(Long("help") | Short('h'))) => {
+                print_help();
+                return;
+            }
+            // A bare positional is Codex's JSON payload, or the host for --print-ssh-config.
+            Ok(Some(Value(val))) => positional = val.into_string().ok(),
+            // Ignore unknown flags and stop on a parse error — a hook helper must never abort
+            // the tool that invoked it.
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
         }
+    }
+
+    // Print a ready-to-paste ssh config block for forwarding the feed over SSH, then exit.
+    if print_ssh {
+        print_ssh_config(positional.as_deref());
+        return;
     }
 
     // Installer mode: edit the tool's config so it calls this helper, then exit. Interactive
@@ -157,6 +174,59 @@ fn zellij_loc() -> Option<ZellijLoc> {
 fn unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn print_help() {
+    print!(
+        "\
+potty-notify — attention-feed helper for potty
+
+Tells a running potty when an agentic CLI is waiting for you. Normally invoked from a
+tool's notification hook (not by hand); also wires up those hooks and prints SSH config.
+
+USAGE:
+  potty-notify --tool <claude|codex> [--clear]   Send a note. Reads the event JSON on
+                                                  stdin (claude) or as an argument (codex).
+                                                  --clear retracts a note (Claude UserPromptSubmit).
+  potty-notify --install-hook <claude|codex>     Wire the hook into the tool's config (idempotent).
+  potty-notify --print-ssh-config [host]         Print an ~/.ssh/config block to forward over SSH.
+  potty-notify --help                            Show this help.
+
+Sending is best-effort and silent: with no potty socket ($POTTY_NOTIFY) it exits 0 and does
+nothing, so a shell outside potty is unaffected.
+
+ENV (potty sets these per pane; you don't):
+  POTTY_NOTIFY   socket to send notes to
+  POTTY_PANE     pane id, for click-to-jump correlation
+
+See docs/attention-feed.md for the design and the SSH/Zellij setup.
+"
+    );
+}
+
+/// Print an `~/.ssh/config` block that forwards the feed socket over SSH and propagates the env,
+/// so notes from a remote session (even inside a background Zellij tab) reach the local potty.
+/// `SendEnv POTTY_PANE` is what makes a remote note jump-correlatable to the pane that ran ssh.
+fn print_ssh_config(host: Option<&str>) {
+    let local = default_socket_path();
+    let local = local.display();
+    let remote = "/tmp/potty-notify.sock";
+    let host = host.unwrap_or("your-remote-host");
+    println!("# ~/.ssh/config — forward potty's attention feed over SSH");
+    println!("Host {host}");
+    println!("    RemoteForward {remote} {local}");
+    println!("    SetEnv POTTY_NOTIFY={remote}");
+    println!("    SendEnv POTTY_PANE");
+    println!();
+    println!("# On the REMOTE host, allow those through in sshd_config (or a drop-in), then");
+    println!("# restart sshd:");
+    println!("#     AcceptEnv POTTY_NOTIFY POTTY_PANE");
+    println!("#     StreamLocalBindUnlink yes");
+    println!("#");
+    println!("# Without AcceptEnv POTTY_PANE a remote session still shows in the feed — it just");
+    println!("# can't be clicked-to-jump. If you can't edit sshd_config, drop the SetEnv line and");
+    println!("# instead add to the remote shell rc:");
+    println!("#     [ -S {remote} ] && export POTTY_NOTIFY={remote}");
 }
 
 // --------------------------------------------------------------------------------------------
