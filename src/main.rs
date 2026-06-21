@@ -98,9 +98,9 @@ enum UserEvent {
     PaneExited(PaneId),
     /// An attention note arrived on the notify socket (from `potty-notify`).
     Notify(feed::Note),
-    /// A remote SSH session authenticated and exec'd `potty-session`; carries the channel to send
-    /// it input/resize/close frames.
-    RemoteConnected { outbound: tokio::sync::mpsc::Sender<potty::proto::Frame> },
+    /// A remote SSH session authenticated and exec'd `potty-session`; carries the host (for the tab
+    /// label) and the channel to send it input/resize/close frames.
+    RemoteConnected { host: String, outbound: tokio::sync::mpsc::Sender<potty::proto::Frame> },
     /// A wire-protocol frame arrived from a remote session.
     RemoteFrame(potty::proto::Frame),
     /// A remote connection attempt failed (auth, network, host key, …).
@@ -203,6 +203,13 @@ enum AuthPrompt {
         status: remote::HostKeyStatus,
         reply: std::sync::mpsc::Sender<bool>,
     },
+    /// One or more text fields (passphrase, password, keyboard-interactive). `echo` is false for
+    /// secrets. The reply is one answer per field, or `None` if cancelled.
+    Text {
+        title: String,
+        fields: Vec<(String, bool)>,
+        reply: std::sync::mpsc::Sender<Option<Vec<String>>>,
+    },
 }
 
 /// `Authenticator` that bridges a connection thread's prompts to the UI thread: it sends an
@@ -226,8 +233,34 @@ impl remote::Authenticator for GuiAuth {
         }
         rx.recv().unwrap_or(false)
     }
-    // key_passphrase / answer / password keep the declining defaults for now — the text-prompt
-    // dialog (passphrase, keyboard-interactive, password) lands in step 3b-ii.
+
+    fn key_passphrase(&self, path: &str) -> Option<String> {
+        self.text_prompt(format!("Passphrase for {path}"), vec![("Passphrase".into(), false)])
+            .map(|mut v| v.pop().unwrap_or_default())
+    }
+
+    fn password(&self, user: &str, host: &str) -> Option<String> {
+        self.text_prompt(format!("Password for {user}@{host}"), vec![("Password".into(), false)])
+            .map(|mut v| v.pop().unwrap_or_default())
+    }
+
+    fn answer(&self, name: &str, instructions: &str, prompts: &[remote::PromptInfo]) -> Option<Vec<String>> {
+        let title = [name, instructions].iter().find(|s| !s.is_empty()).map_or("Authentication", |s| s);
+        let fields = prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect();
+        self.text_prompt(title.to_string(), fields)
+    }
+}
+
+impl GuiAuth {
+    /// Send a text prompt to the UI and block the connection thread until the user answers.
+    fn text_prompt(&self, title: String, fields: Vec<(String, bool)>) -> Option<Vec<String>> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        let ask = AuthPrompt::Text { title, fields, reply };
+        if self.proxy.send_event(UserEvent::Auth(ask)).is_err() {
+            return None;
+        }
+        rx.recv().unwrap_or(None)
+    }
 }
 
 /// A pane's I/O backend: a local PTY, or a pane on a remote `potty-session` reached over the wire
@@ -238,6 +271,9 @@ enum Backend {
         master: Box<dyn portable_pty::MasterPty + Send>,
     },
     Remote {
+        /// The host this pane lives on — prefixed onto the tab label so remote tabs are
+        /// distinguishable even after the remote shell sets its own title.
+        host: String,
         /// Input/resize/close frames go here (to the russh writer task).
         outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
         /// Per-pane vte parse state — for a local pane this lives in its reader thread; a remote
@@ -279,16 +315,22 @@ enum Action {
     /// Dismiss the feed entirely: un-latch the tab bar (so it disappears again with a lone tab).
     /// Triggered by clicking the bell when nothing is waiting.
     DismissFeed,
-    /// Answer the current SSH auth prompt (e.g. accept/reject a host key).
+    /// Answer the current SSH host-key prompt (accept/reject).
     AuthAnswer(bool),
+    /// Submit (true) or cancel (false) the current text auth prompt.
+    AuthText(bool),
+    /// Open / close the "Connect to host…" dialog.
+    OpenConnect,
+    CloseConnect,
+    /// Connect to the given `[user@]host[:port]`.
+    Connect(String),
 }
 
 /// Display data for the active auth prompt, handed to the chrome (the reply channel stays in
-/// `App::auth_prompts`).
-struct AuthView {
-    host: String,
-    fingerprint: String,
-    status: remote::HostKeyStatus,
+/// `App::auth_prompts`; text answers come back via `App::auth_inputs`).
+enum AuthView {
+    HostKey { host: String, fingerprint: String, status: remote::HostKeyStatus },
+    Text { title: String, fields: Vec<(String, bool)> },
 }
 
 /// A session currently waiting for the user, as tracked by the attention feed. Keyed in `App`
@@ -336,7 +378,11 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::DismissNote(..)
         | Action::ShowFeed(_)
         | Action::DismissFeed
-        | Action::AuthAnswer(_) => {}
+        | Action::AuthAnswer(_)
+        | Action::AuthText(_)
+        | Action::OpenConnect
+        | Action::CloseConnect
+        | Action::Connect(_) => {}
     }
 }
 
@@ -371,6 +417,38 @@ fn feed_label(host: &str, cwd: &str, zellij: Option<&feed::ZellijLoc>) -> String
         s.push_str(&format!(" · zellij:{sess}"));
     }
     s
+}
+
+/// Parse a connect-dialog target `[user@]host[:port]` into (user, host, port). Missing user
+/// defaults to `$USER`; missing port to 22.
+fn parse_host(input: &str) -> (String, String, u16) {
+    let input = input.trim();
+    let (user, rest) = match input.split_once('@') {
+        Some((u, r)) => (u.to_string(), r),
+        None => (default_user(), input),
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(22)),
+        None => (rest.to_string(), 22),
+    };
+    (user, host, port)
+}
+
+fn default_user() -> String {
+    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default()
+}
+
+/// The common identity files under `~/.ssh` that exist — tried after the agent.
+fn default_keys() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return Vec::new();
+    };
+    let ssh = PathBuf::from(home).join(".ssh");
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .map(|n| ssh.join(n))
+        .filter(|p| p.exists())
+        .collect()
 }
 
 /// Compact age label: seconds under a minute, then minutes, then hours.
@@ -416,6 +494,10 @@ fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<Pane
     }
     if ui.button("New tab").clicked() {
         actions.push(Action::NewTab);
+        ui.close_menu();
+    }
+    if ui.button("Connect to host…").clicked() {
+        actions.push(Action::OpenConnect);
         ui.close_menu();
     }
     ui.separator();
@@ -484,6 +566,9 @@ fn build_ui(
     chrome_latched: bool,
     feed_open: bool,
     auth: Option<&AuthView>,
+    auth_inputs: &mut Vec<String>,
+    show_connect: bool,
+    connect_host: &mut String,
 ) {
     // The tab bar earns its space with more than one tab, or once the attention feed has latched
     // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
@@ -684,36 +769,94 @@ fn build_ui(
         *feed_active = r.response.contains_pointer();
     }
 
-    // SSH auth prompt — currently host-key approval. Centered; the connection thread is blocked
-    // waiting on the answer.
-    if let Some(av) = auth {
-        egui::Window::new("SSH host key")
+    // SSH auth prompt, centered. The connection thread is blocked waiting on the answer.
+    match auth {
+        Some(AuthView::HostKey { host, fingerprint, status }) => {
+            egui::Window::new("SSH host key")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    let what = match status {
+                        remote::HostKeyStatus::Unknown => "is not in your known_hosts yet",
+                        remote::HostKeyStatus::Changed => "HAS CHANGED since you last connected",
+                    };
+                    ui.label(format!("The host key for {host} {what}:"));
+                    ui.add_space(4.0);
+                    ui.monospace(fingerprint);
+                    if *status == remote::HostKeyStatus::Changed {
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
+                            "If you didn't change it, this could be a man-in-the-middle attack.",
+                        );
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Connect").clicked() {
+                            actions.push(Action::AuthAnswer(true));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            actions.push(Action::AuthAnswer(false));
+                        }
+                    });
+                });
+        }
+        Some(AuthView::Text { title, fields }) => {
+            auth_inputs.resize(fields.len(), String::new());
+            egui::Window::new(title.as_str())
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    let mut submit = false;
+                    for (i, (label, echo)) in fields.iter().enumerate() {
+                        ui.label(label.as_str());
+                        let edit = egui::TextEdit::singleline(&mut auth_inputs[i]).password(!echo);
+                        let resp = ui.add(edit);
+                        if i == 0 {
+                            resp.request_focus();
+                        }
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            submit = true;
+                        }
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        submit |= ui.button("OK").clicked();
+                        if ui.button("Cancel").clicked() {
+                            actions.push(Action::AuthText(false));
+                        }
+                    });
+                    if submit {
+                        actions.push(Action::AuthText(true));
+                    }
+                });
+        }
+        None => {}
+    }
+
+    // "Connect to host…" dialog.
+    if show_connect {
+        egui::Window::new("Connect to host")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                let what = match av.status {
-                    remote::HostKeyStatus::Unknown => "is not in your known_hosts yet",
-                    remote::HostKeyStatus::Changed => "HAS CHANGED since you last connected",
-                };
-                ui.label(format!("The host key for {} {what}:", av.host));
-                ui.add_space(4.0);
-                ui.monospace(&av.fingerprint);
-                if av.status == remote::HostKeyStatus::Changed {
-                    ui.add_space(4.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
-                        "If you didn't change it, this could be a man-in-the-middle attack.",
-                    );
-                }
+                ui.set_max_width(360.0);
+                ui.label("Host  ([user@]host[:port])");
+                let resp = ui.add(egui::TextEdit::singleline(connect_host).hint_text("user@host"));
+                resp.request_focus();
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() {
-                        actions.push(Action::AuthAnswer(true));
+                    if (ui.button("Connect").clicked() || enter) && !connect_host.trim().is_empty() {
+                        actions.push(Action::Connect(connect_host.clone()));
                     }
                     if ui.button("Cancel").clicked() {
-                        actions.push(Action::AuthAnswer(false));
+                        actions.push(Action::CloseConnect);
                     }
                 });
             });
@@ -995,6 +1138,11 @@ struct App {
     /// Pending auth prompts from remote connections, awaiting the user (host-key approval, …).
     /// Each carries a reply channel back to the blocked connection thread.
     auth_prompts: Vec<AuthPrompt>,
+    /// Text-field buffers for the active `AuthPrompt::Text` dialog (one per prompt field).
+    auth_inputs: Vec<String>,
+    /// Whether the "Connect to host…" dialog is open, and its host-field buffer.
+    show_connect: bool,
+    connect_host: String,
     /// Whether the feed overlay is currently shown. Auto-opens on a fresh wave of notes, toggled
     /// by the tab-bar bell, hidden by the overlay's close button.
     feed_open: bool,
@@ -1045,6 +1193,9 @@ impl App {
             chrome_latched: false,
             remote_panes: std::collections::HashSet::new(),
             auth_prompts: Vec::new(),
+            auth_inputs: Vec::new(),
+            show_connect: false,
+            connect_host: String::new(),
         }
     }
 
@@ -1319,7 +1470,10 @@ impl App {
             rt.block_on(async move {
                 match remote::connect_and_exec(&cfg, auth, &command).await {
                     Ok((session, mut rx)) => {
-                        let connected = UserEvent::RemoteConnected { outbound: session.outbound.clone() };
+                        let connected = UserEvent::RemoteConnected {
+                            host: cfg.host.clone(),
+                            outbound: session.outbound.clone(),
+                        };
                         if proxy.send_event(connected).is_err() {
                             return;
                         }
@@ -1338,8 +1492,8 @@ impl App {
         });
     }
 
-    /// A remote session connected: open a tab with one shell pane backed by it.
-    fn open_remote_pane(&mut self, outbound: tokio::sync::mpsc::Sender<Frame>) {
+    /// A remote session connected: open a tab with one shell pane backed by it, labelled `host`.
+    fn open_remote_pane(&mut self, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
         self.workspace.new_tab();
         let id = self.workspace.active_tab().focus;
         let dims = self.last_dims;
@@ -1352,10 +1506,14 @@ impl App {
             id,
             Terminal {
                 term,
-                backend: Backend::Remote { outbound: outbound.clone(), parser: Processor::new() },
+                backend: Backend::Remote {
+                    host,
+                    outbound: outbound.clone(),
+                    parser: Processor::new(),
+                },
                 dims,
-                title: "remote".into(),
-                default_title: "remote".into(),
+                title: "shell".into(),
+                default_title: "shell".into(),
                 wake_pending: Arc::new(AtomicBool::new(false)),
             },
         );
@@ -1366,10 +1524,6 @@ impl App {
             cols: dims.cols as u16,
             rows: dims.rows as u16,
         }));
-        // Spike: optional canned input, to prove the input→remote→output loop without a keyboard.
-        if let Ok(input) = std::env::var("POTTY_TEST_INPUT") {
-            let _ = outbound.try_send(Frame::Data { pane: id, bytes: input.into_bytes() });
-        }
         self.dirty.insert(id);
         self.request_redraw();
     }
@@ -1392,17 +1546,54 @@ impl App {
         }
     }
 
-    /// Answer the active auth prompt, unblocking the connection thread waiting on it.
+    /// Answer the active host-key prompt, unblocking the connection thread waiting on it.
     fn answer_auth(&mut self, accept: bool) {
-        if self.auth_prompts.is_empty() {
-            return;
-        }
-        match self.auth_prompts.remove(0) {
-            AuthPrompt::HostKey { reply, .. } => {
+        if let Some(AuthPrompt::HostKey { .. }) = self.auth_prompts.first() {
+            if let AuthPrompt::HostKey { reply, .. } = self.auth_prompts.remove(0) {
                 let _ = reply.send(accept);
             }
+            self.request_redraw();
         }
-        self.request_redraw();
+    }
+
+    /// Answer the active text prompt (passphrase/keyboard-interactive/password). `submit` sends the
+    /// typed fields; otherwise the method is cancelled.
+    fn answer_auth_text(&mut self, submit: bool) {
+        if let Some(AuthPrompt::Text { .. }) = self.auth_prompts.first() {
+            if let AuthPrompt::Text { reply, .. } = self.auth_prompts.remove(0) {
+                let answer = submit.then(|| std::mem::take(&mut self.auth_inputs));
+                let _ = reply.send(answer);
+            }
+            self.auth_inputs.clear();
+            self.request_redraw();
+        }
+    }
+
+    /// Start a connection from the "Connect to host…" dialog input (`[user@]host[:port]`).
+    fn start_connect(&mut self, input: &str) {
+        let (user, host, port) = parse_host(input);
+        if host.is_empty() {
+            return;
+        }
+        let cfg = remote::SshConfig {
+            host,
+            port,
+            user,
+            keys: default_keys(),
+            known_hosts: None,
+            use_agent: true,
+            agent_sock: None,
+        };
+        let auth = Arc::new(GuiAuth { proxy: self.proxy.clone() });
+        self.connect_remote(cfg, auth, self.config.remote_command.clone());
+        self.show_connect = false;
+        self.connect_host.clear();
+    }
+
+    /// Whether an egui text field (connect dialog or a text auth prompt) is capturing keyboard —
+    /// if so, keys go to egui rather than the focused pane.
+    fn text_input_active(&self) -> bool {
+        self.show_connect || matches!(self.auth_prompts.first(), Some(AuthPrompt::Text { .. }))
     }
 
     /// SPIKE SCAFFOLDING: auto-connect to a host from `$POTTY_TEST_*` env on startup, to exercise
@@ -1742,6 +1933,10 @@ impl App {
     }
 
     fn on_key(&mut self, ev: &KeyEvent) {
+        // A dialog text field owns the keyboard while open — let egui handle it.
+        if self.text_input_active() {
+            return;
+        }
         if ev.state != ElementState::Pressed || self.terms.is_empty() {
             return;
         }
@@ -1909,11 +2104,15 @@ impl App {
             .tabs
             .iter()
             .map(|t| {
-                self.terms
-                    .get(&t.focus)
-                    .map(|x| x.title.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| t.title.clone())
+                let Some(term) = self.terms.get(&t.focus) else {
+                    return t.title.clone();
+                };
+                let title = if term.title.is_empty() { t.title.clone() } else { term.title.clone() };
+                // Remote tabs carry a host prefix so they're distinguishable at a glance.
+                match &term.backend {
+                    Backend::Remote { host, .. } => format!("{host}: {title}"),
+                    Backend::Local { .. } => title,
+                }
             })
             .collect();
 
@@ -1940,12 +2139,19 @@ impl App {
         let chrome_latched = self.chrome_latched;
         let feed_open = self.feed_open;
         let auth_view = self.auth_prompts.first().map(|p| match p {
-            AuthPrompt::HostKey { host, fingerprint, status, .. } => AuthView {
+            AuthPrompt::HostKey { host, fingerprint, status, .. } => AuthView::HostKey {
                 host: host.clone(),
                 fingerprint: fingerprint.clone(),
                 status: *status,
             },
+            AuthPrompt::Text { title, fields, .. } => AuthView::Text {
+                title: title.clone(),
+                fields: fields.clone(),
+            },
         });
+        let show_connect = self.show_connect;
+        let auth_inputs = &mut self.auth_inputs;
+        let connect_host = &mut self.connect_host;
         let full = {
             let ws = &self.workspace;
             let families = &self.font_families;
@@ -1956,6 +2162,7 @@ impl App {
                     ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
                     pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
                     &feed_items, &mut feed_active, chrome_latched, feed_open, auth_view.as_ref(),
+                    auth_inputs, show_connect, connect_host,
                 )
             })
         };
@@ -1965,8 +2172,10 @@ impl App {
         // The feed overlay isn't a popup, so OR in whether the pointer is over it — otherwise a
         // click on the feed would also start a selection in the terminal beneath it. The auth
         // dialog likewise suppresses terminal mouse handling.
-        self.menu_open =
-            self.egui_ctx.memory(|m| m.any_popup_open()) || feed_active || auth_view.is_some();
+        self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open())
+            || feed_active
+            || auth_view.is_some()
+            || self.show_connect;
         for a in actions {
             match a {
                 Action::SetFontFamily(f) => self.set_font_family(f),
@@ -1990,6 +2199,16 @@ impl App {
                     self.request_redraw();
                 }
                 Action::AuthAnswer(accept) => self.answer_auth(accept),
+                Action::AuthText(submit) => self.answer_auth_text(submit),
+                Action::OpenConnect => {
+                    self.show_connect = true;
+                    self.request_redraw();
+                }
+                Action::CloseConnect => {
+                    self.show_connect = false;
+                    self.request_redraw();
+                }
+                Action::Connect(host) => self.start_connect(&host),
                 a => apply(&mut self.workspace, a),
             }
         }
@@ -2181,8 +2400,12 @@ impl ApplicationHandler<UserEvent> for App {
         self.reconcile_terms();
         // Kick the first frame — `visible` is still empty, so an early Wake wouldn't.
         self.request_redraw();
-        // Spike: optionally auto-connect to a remote test host (see `maybe_test_connect`).
+        // Spike: optionally auto-connect to a remote test host (see `maybe_test_connect`), or open
+        // the connect dialog (for testing the UI without clicking the menu).
         self.maybe_test_connect();
+        if std::env::var_os("POTTY_TEST_CONNECT").is_some() {
+            self.show_connect = true;
+        }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -2279,7 +2502,7 @@ impl ApplicationHandler<UserEvent> for App {
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_note(note),
             // A remote session connected — give it a tab with one shell pane.
-            UserEvent::RemoteConnected { outbound } => self.open_remote_pane(outbound),
+            UserEvent::RemoteConnected { host, outbound } => self.open_remote_pane(host, outbound),
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(frame) => self.on_remote_frame(event_loop, frame),
             UserEvent::RemoteError(msg) => eprintln!("potty: remote connection failed: {msg}"),
@@ -2303,7 +2526,9 @@ impl ApplicationHandler<UserEvent> for App {
         //  - A plain right-click over a mouse-reporting pane: it belongs to the app, not our
         //    context menu (shift, or a non-reporting pane, lets egui open the menu as usual).
         let withhold_from_egui = match &event {
-            WindowEvent::KeyboardInput { .. } => true,
+            // Keys normally go to the focused pane, not egui — except while a dialog text field is
+            // open, when egui needs them.
+            WindowEvent::KeyboardInput { .. } => !self.text_input_active(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,

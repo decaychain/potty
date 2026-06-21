@@ -120,9 +120,15 @@ attention-feed passthrough are added once the spike proves the round trip and fe
      `GuiAuth` implements `Authenticator` by sending an `AuthPrompt` over the event loop and
      blocking on a reply channel; the UI shows the dialog and the answer unblocks the thread. The
      host-key approval dialog (host + fingerprint + Unknown/Changed) is wired and verified visually.
-   - *Step 3b-ii (next):* the connect flow — `+`/right-click "Connect to host…", `potty attach`,
-     host badges on tabs; the text-prompt dialog (passphrase, keyboard-interactive, password)
-     reusing the bridge; and removing the `$POTTY_TEST_*` scaffolding. Also the `MaxAuthTries` fix.
+   - *Step 3b-ii (done):* the connect flow. Right-click / ☰ → "Connect to host…" opens a dialog
+     (`[user@]host[:port]`); connecting uses the agent + `~/.ssh/id_*` + `~/.ssh/known_hosts` and
+     the `remote_command` config (default `potty-session`). The text-prompt dialog (passphrase,
+     keyboard-interactive, password) reuses the same bridge; keyboard routes to egui while a dialog
+     field is open. Remote tabs are host-badged. The `MaxAuthTries` exhaustion now stops the ladder
+     and reports a clear, actionable error instead of "Channel send error". Verified visually:
+     connect dialog and host-badged tab. *Still env-driven `maybe_test_connect`/`POTTY_TEST_*` kept
+     as a scripting/testing aid; `potty attach`, auto-reattach, and bootstrapping remain later.*
+   - *Step 3c (next):* splits within a remote tab; then persistence (step 4).
    - *Known gap:* a busy ssh-agent can exhaust the server's `MaxAuthTries` before the ladder reaches
      a working method (seen as "Channel send error"). The ladder should cap/triage agent identities
      or handle the disconnect.

@@ -39,6 +39,9 @@ pub struct Config {
     /// Thickness of the underline/beam cursor as a fraction of the cell (height for underline,
     /// width for beam). Bump it for a fatter underscore. Ignored for the block cursor.
     pub cursor_thickness: f32,
+    /// Command run on a remote host by "Connect to host…" to start the multiplexer backend. Must
+    /// be on the remote's PATH, or an absolute path (until bootstrapping installs it for you).
+    pub remote_command: String,
     pub colors: Colors,
 }
 
@@ -68,6 +71,7 @@ impl Default for Config {
             cursor_shape: "block".into(),
             cursor_blink: false,
             cursor_thickness: 0.15,
+            remote_command: "potty-session".into(),
             colors: Colors::default(),
         }
     }

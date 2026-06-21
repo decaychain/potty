@@ -199,16 +199,15 @@ async fn authenticate(
     // 1. ssh-agent.
     if cfg.use_agent {
         #[cfg(unix)]
-        if let Some(agent) = connect_agent_unix(cfg).await
-            && agent_auth(session, &cfg.user, agent, rsa_hash).await
-        {
-            return Ok(());
-        }
+        let agent = connect_agent_unix(cfg).await;
         #[cfg(windows)]
-        if let Some(agent) = connect_agent_windows().await
-            && agent_auth(session, &cfg.user, agent, rsa_hash).await
-        {
-            return Ok(());
+        let agent = connect_agent_windows().await;
+        if let Some(agent) = agent {
+            match agent_auth(session, &cfg.user, agent, rsa_hash).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(Disconnected) => return Err(disconnected_during_auth()),
+            }
         }
     }
 
@@ -226,7 +225,7 @@ async fn authenticate(
 
     // 4. Plain password.
     if let Some(pw) = auth.password(&cfg.user, &cfg.host)
-        && session.authenticate_password(&cfg.user, pw).await.map_err(io_err)?.success()
+        && matches!(session.authenticate_password(&cfg.user, pw).await, Ok(r) if r.success())
     {
         return Ok(());
     }
@@ -247,29 +246,43 @@ async fn connect_agent_windows() -> Option<AgentClient<russh::keys::agent::clien
     AgentClient::connect_pageant().await.ok()
 }
 
-/// Try every identity the agent holds, letting the agent do the signing.
+/// The SSH session dropped mid-authentication (the server likely caps attempts).
+struct Disconnected;
+
+/// Build the user-facing error for a mid-auth disconnect.
+fn disconnected_during_auth() -> std::io::Error {
+    std::io::Error::other(
+        "the SSH server closed the connection during authentication — it may limit attempts \
+         (MaxAuthTries). Try `IdentitiesOnly yes` or specifying a single key.",
+    )
+}
+
+/// Try every identity the agent holds, letting the agent do the signing. `Err(Disconnected)` means
+/// the session died (vs `Ok(false)` = all keys rejected) — so the ladder stops hammering a server
+/// that caps attempts and reports it clearly instead of failing obscurely later.
 async fn agent_auth<R>(
     session: &mut Handle<ClientHandler>,
     user: &str,
     mut agent: AgentClient<R>,
     rsa_hash: Option<HashAlg>,
-) -> bool
+) -> Result<bool, Disconnected>
 where
     R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Ok(identities) = agent.request_identities().await else {
-        return false;
+        return Ok(false);
     };
     for id in identities {
         // Certificates are skipped for now; plain keys cover the common case.
-        if let AgentIdentity::PublicKey { key, .. } = id
-            && let Ok(result) = session.authenticate_publickey_with(user, key, rsa_hash, &mut agent).await
-            && result.success()
-        {
-            return true;
+        if let AgentIdentity::PublicKey { key, .. } = id {
+            match session.authenticate_publickey_with(user, key, rsa_hash, &mut agent).await {
+                Ok(result) if result.success() => return Ok(true),
+                Ok(_) => {} // rejected — try the next identity
+                Err(_) => return Err(Disconnected), // transport/session gone
+            }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Try one private-key file, prompting for a passphrase if it's encrypted.
@@ -304,10 +317,10 @@ async fn try_keyboard_interactive(
     user: &str,
     auth: &Arc<dyn Authenticator>,
 ) -> std::io::Result<bool> {
-    let mut response = session
-        .authenticate_keyboard_interactive_start(user, None::<String>)
-        .await
-        .map_err(io_err)?;
+    let Ok(mut response) = session.authenticate_keyboard_interactive_start(user, None::<String>).await
+    else {
+        return Ok(false); // method unavailable or session gone — let the ladder finish cleanly
+    };
     loop {
         match response {
             KeyboardInteractiveAuthResponse::Success => return Ok(true),
