@@ -115,9 +115,14 @@ attention-feed passthrough are added once the spike proves the round trip and fe
      Verified visually: potty auto-connected to a throwaway sshd, exec'd `potty-session`, and a
      remote `echo` round-tripped and rendered in a remote tab. *Driven by `$POTTY_TEST_*` spike
      scaffolding (`maybe_test_connect`/`SpikeAuth`) — temporary, replaced by the connect flow below.*
-   - *Step 3b (next):* the real connect flow — `+`/right-click "Connect to host…", `potty attach`,
-     host badges on tabs — and the auth dialogs (host-key approval, passphrase, keyboard-interactive)
-     that implement `Authenticator`, bridging its sync calls off the UI thread.
+   - *Step 3b-i (done):* the auth-dialog bridge. Each connection runs on its own thread (a
+     current-thread runtime), so a prompt can block *that* connection while the UI keeps rendering.
+     `GuiAuth` implements `Authenticator` by sending an `AuthPrompt` over the event loop and
+     blocking on a reply channel; the UI shows the dialog and the answer unblocks the thread. The
+     host-key approval dialog (host + fingerprint + Unknown/Changed) is wired and verified visually.
+   - *Step 3b-ii (next):* the connect flow — `+`/right-click "Connect to host…", `potty attach`,
+     host badges on tabs; the text-prompt dialog (passphrase, keyboard-interactive, password)
+     reusing the bridge; and removing the `$POTTY_TEST_*` scaffolding. Also the `MaxAuthTries` fix.
    - *Known gap:* a busy ssh-agent can exhaust the server's `MaxAuthTries` before the ladder reaches
      a working method (seen as "Channel send error"). The ladder should cap/triage agent identities
      or handle the disconnect.

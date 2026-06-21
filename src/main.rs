@@ -105,6 +105,8 @@ enum UserEvent {
     RemoteFrame(potty::proto::Frame),
     /// A remote connection attempt failed (auth, network, host key, …).
     RemoteError(String),
+    /// A remote connection's auth ladder needs the user (host-key approval, …).
+    Auth(AuthPrompt),
 }
 
 /// Terminal event listener for one pane: forwards the events we care about to the main loop,
@@ -192,12 +194,40 @@ fn dims_for(width_px: f32, height_px: f32, cell_w: f32, cell_h: f32) -> Dims {
 
 /// One live terminal: its grid model + the PTY master (for writes and resize) and current size.
 /// The reader thread that feeds the grid is detached; it ends when the PTY closes.
-/// SPIKE: an `Authenticator` that trusts any host key (agent/key-file auth, no dialogs yet).
-struct SpikeAuth;
-impl remote::Authenticator for SpikeAuth {
-    fn accept_host_key(&self, _h: &str, _f: &str, _s: remote::HostKeyStatus) -> bool {
-        true
+/// A request from a remote connection's auth ladder that needs the user, carrying a reply channel
+/// back to the (blocked) connection thread.
+enum AuthPrompt {
+    HostKey {
+        host: String,
+        fingerprint: String,
+        status: remote::HostKeyStatus,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+}
+
+/// `Authenticator` that bridges a connection thread's prompts to the UI thread: it sends an
+/// `AuthPrompt` over the event loop and *blocks the connection thread* on a reply channel until the
+/// user answers. Safe because each connection runs on its own thread (see `connect_remote`).
+struct GuiAuth {
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+impl remote::Authenticator for GuiAuth {
+    fn accept_host_key(&self, host: &str, fingerprint: &str, status: remote::HostKeyStatus) -> bool {
+        let (reply, rx) = std::sync::mpsc::channel();
+        let ask = AuthPrompt::HostKey {
+            host: host.into(),
+            fingerprint: fingerprint.into(),
+            status,
+            reply,
+        };
+        if self.proxy.send_event(UserEvent::Auth(ask)).is_err() {
+            return false;
+        }
+        rx.recv().unwrap_or(false)
     }
+    // key_passphrase / answer / password keep the declining defaults for now — the text-prompt
+    // dialog (passphrase, keyboard-interactive, password) lands in step 3b-ii.
 }
 
 /// A pane's I/O backend: a local PTY, or a pane on a remote `potty-session` reached over the wire
@@ -249,6 +279,16 @@ enum Action {
     /// Dismiss the feed entirely: un-latch the tab bar (so it disappears again with a lone tab).
     /// Triggered by clicking the bell when nothing is waiting.
     DismissFeed,
+    /// Answer the current SSH auth prompt (e.g. accept/reject a host key).
+    AuthAnswer(bool),
+}
+
+/// Display data for the active auth prompt, handed to the chrome (the reply channel stays in
+/// `App::auth_prompts`).
+struct AuthView {
+    host: String,
+    fingerprint: String,
+    status: remote::HostKeyStatus,
 }
 
 /// A session currently waiting for the user, as tracked by the attention feed. Keyed in `App`
@@ -295,7 +335,8 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::JumpToPane(_)
         | Action::DismissNote(..)
         | Action::ShowFeed(_)
-        | Action::DismissFeed => {}
+        | Action::DismissFeed
+        | Action::AuthAnswer(_) => {}
     }
 }
 
@@ -442,6 +483,7 @@ fn build_ui(
     feed_active: &mut bool,
     chrome_latched: bool,
     feed_open: bool,
+    auth: Option<&AuthView>,
 ) {
     // The tab bar earns its space with more than one tab, or once the attention feed has latched
     // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
@@ -640,6 +682,41 @@ fn build_ui(
         // Suppress our terminal mouse handling while the pointer is over the feed (it gates on
         // geometry, not egui consumption — see the CentralPanel comment).
         *feed_active = r.response.contains_pointer();
+    }
+
+    // SSH auth prompt — currently host-key approval. Centered; the connection thread is blocked
+    // waiting on the answer.
+    if let Some(av) = auth {
+        egui::Window::new("SSH host key")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                let what = match av.status {
+                    remote::HostKeyStatus::Unknown => "is not in your known_hosts yet",
+                    remote::HostKeyStatus::Changed => "HAS CHANGED since you last connected",
+                };
+                ui.label(format!("The host key for {} {what}:", av.host));
+                ui.add_space(4.0);
+                ui.monospace(&av.fingerprint);
+                if av.status == remote::HostKeyStatus::Changed {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
+                        "If you didn't change it, this could be a man-in-the-middle attack.",
+                    );
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Connect").clicked() {
+                        actions.push(Action::AuthAnswer(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        actions.push(Action::AuthAnswer(false));
+                    }
+                });
+            });
     }
 }
 
@@ -912,12 +989,12 @@ struct App {
     /// notify socket (`UserEvent::Notify`); rendered as a floating overlay in the chrome.
     pending: HashMap<(String, String), Pending>,
 
-    /// Tokio runtime hosting the russh client tasks (the only async in potty). Frames cross back
-    /// to this loop via `UserEvent`.
-    runtime: tokio::runtime::Runtime,
     /// Panes whose backend is a remote session — `reconcile_terms` must not spawn a local PTY for
     /// them, and closing them sends a `Close` frame rather than dropping a PTY.
     remote_panes: std::collections::HashSet<PaneId>,
+    /// Pending auth prompts from remote connections, awaiting the user (host-key approval, …).
+    /// Each carries a reply channel back to the blocked connection thread.
+    auth_prompts: Vec<AuthPrompt>,
     /// Whether the feed overlay is currently shown. Auto-opens on a fresh wave of notes, toggled
     /// by the tab-bar bell, hidden by the overlay's close button.
     feed_open: bool,
@@ -966,12 +1043,8 @@ impl App {
             pending: HashMap::new(),
             feed_open: false,
             chrome_latched: false,
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .build()
-                .expect("tokio runtime"),
             remote_panes: std::collections::HashSet::new(),
+            auth_prompts: Vec::new(),
         }
     }
 
@@ -1233,28 +1306,35 @@ impl App {
         }
     }
 
-    /// Spawn the russh client for `cfg` on the tokio runtime. On success it forwards the remote's
-    /// frames back to this loop as `UserEvent`s; on failure it reports `RemoteError`.
+    /// Spawn the russh client for `cfg` on its own thread (a current-thread tokio runtime). On
+    /// success it forwards the remote's frames back to this loop as `UserEvent`s; on failure it
+    /// reports `RemoteError`. Per-connection threads mean an auth prompt can block *this*
+    /// connection (while the UI keeps rendering the dialog) without stalling anything else.
     fn connect_remote(&self, cfg: remote::SshConfig, auth: Arc<dyn remote::Authenticator>, command: String) {
         let proxy = self.proxy.clone();
-        self.runtime.spawn(async move {
-            match remote::connect_and_exec(&cfg, auth, &command).await {
-                Ok((session, mut rx)) => {
-                    let connected = UserEvent::RemoteConnected { outbound: session.outbound.clone() };
-                    if proxy.send_event(connected).is_err() {
-                        return;
-                    }
-                    while let Some(frame) = rx.recv().await {
-                        if proxy.send_event(UserEvent::RemoteFrame(frame)).is_err() {
-                            break;
+        thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                return;
+            };
+            rt.block_on(async move {
+                match remote::connect_and_exec(&cfg, auth, &command).await {
+                    Ok((session, mut rx)) => {
+                        let connected = UserEvent::RemoteConnected { outbound: session.outbound.clone() };
+                        if proxy.send_event(connected).is_err() {
+                            return;
                         }
+                        while let Some(frame) = rx.recv().await {
+                            if proxy.send_event(UserEvent::RemoteFrame(frame)).is_err() {
+                                break;
+                            }
+                        }
+                        drop(session); // keep the SSH session alive until the stream ends
                     }
-                    drop(session); // keep the SSH session alive until the stream ends
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::RemoteError(e.to_string()));
+                    }
                 }
-                Err(e) => {
-                    let _ = proxy.send_event(UserEvent::RemoteError(e.to_string()));
-                }
-            }
+            });
         });
     }
 
@@ -1312,6 +1392,19 @@ impl App {
         }
     }
 
+    /// Answer the active auth prompt, unblocking the connection thread waiting on it.
+    fn answer_auth(&mut self, accept: bool) {
+        if self.auth_prompts.is_empty() {
+            return;
+        }
+        match self.auth_prompts.remove(0) {
+            AuthPrompt::HostKey { reply, .. } => {
+                let _ = reply.send(accept);
+            }
+        }
+        self.request_redraw();
+    }
+
     /// SPIKE SCAFFOLDING: auto-connect to a host from `$POTTY_TEST_*` env on startup, to exercise
     /// the remote path before the `+`/menu connect flow exists. To be removed once that lands.
     fn maybe_test_connect(&self) {
@@ -1330,7 +1423,7 @@ impl App {
             agent_sock: None,
         };
         let command = std::env::var("POTTY_TEST_SESSION_BIN").unwrap_or_else(|_| "potty-session".into());
-        self.connect_remote(cfg, Arc::new(SpikeAuth), command);
+        self.connect_remote(cfg, Arc::new(GuiAuth { proxy: self.proxy.clone() }), command);
     }
 
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
@@ -1846,6 +1939,13 @@ impl App {
         let mut feed_active = false;
         let chrome_latched = self.chrome_latched;
         let feed_open = self.feed_open;
+        let auth_view = self.auth_prompts.first().map(|p| match p {
+            AuthPrompt::HostKey { host, fingerprint, status, .. } => AuthView {
+                host: host.clone(),
+                fingerprint: fingerprint.clone(),
+                status: *status,
+            },
+        });
         let full = {
             let ws = &self.workspace;
             let families = &self.font_families;
@@ -1855,7 +1955,7 @@ impl App {
                 build_ui(
                     ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
                     pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
-                    &feed_items, &mut feed_active, chrome_latched, feed_open,
+                    &feed_items, &mut feed_active, chrome_latched, feed_open, auth_view.as_ref(),
                 )
             })
         };
@@ -1863,8 +1963,10 @@ impl App {
         // Remember whether a popup/menu is open so the next frame's clicks don't leak through
         // the menu into the terminal underneath.
         // The feed overlay isn't a popup, so OR in whether the pointer is over it — otherwise a
-        // click on the feed would also start a selection in the terminal beneath it.
-        self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open()) || feed_active;
+        // click on the feed would also start a selection in the terminal beneath it. The auth
+        // dialog likewise suppresses terminal mouse handling.
+        self.menu_open =
+            self.egui_ctx.memory(|m| m.any_popup_open()) || feed_active || auth_view.is_some();
         for a in actions {
             match a {
                 Action::SetFontFamily(f) => self.set_font_family(f),
@@ -1887,6 +1989,7 @@ impl App {
                     self.chrome_latched = false;
                     self.request_redraw();
                 }
+                Action::AuthAnswer(accept) => self.answer_auth(accept),
                 a => apply(&mut self.workspace, a),
             }
         }
@@ -2180,6 +2283,11 @@ impl ApplicationHandler<UserEvent> for App {
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(frame) => self.on_remote_frame(event_loop, frame),
             UserEvent::RemoteError(msg) => eprintln!("potty: remote connection failed: {msg}"),
+            // A connection needs the user — queue it and show the dialog.
+            UserEvent::Auth(prompt) => {
+                self.auth_prompts.push(prompt);
+                self.request_redraw();
+            }
         }
     }
 
