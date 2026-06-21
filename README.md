@@ -97,8 +97,10 @@ potty-notify --install-hook codex    # ~/.codex/config.toml
 
 **Over SSH** (including a session in a background Zellij tab on the remote): it works with no extra
 code — SSH forwards the socket and propagates the env. `potty-notify --print-ssh-config <host>`
-emits the `~/.ssh/config` block; with `SendEnv POTTY_PANE` even remote sessions click-to-jump to
-the pane running `ssh`. potty can't switch the *remote* Zellij tab for you, but the entry shows
+emits an `~/.ssh/config` block; with `SendEnv POTTY_PANE` even remote sessions click-to-jump to the
+pane running `ssh`. If you open **two sessions to the same host at once**, use
+`potty-notify --print-ssh-wrapper` instead — a shell `ssh` function that forwards a per-pane socket
+so they don't collide. potty can't switch the *remote* Zellij tab for you, but the entry shows
 which one to go to. Details in the [design doc](docs/attention-feed.md#phasing).
 
 A session outside potty (or on a host without the socket) just no-ops — the hook is harmless.

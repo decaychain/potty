@@ -144,6 +144,14 @@ Verified end-to-end through a throwaway localhost sshd: a note from the "remote"
 the local listener carrying `pane` (forwarded) **and** `zellij: {session, pane}` (read from the
 remote's own env) — i.e. the full SSH-inside-Zellij case.
 
+**Two sessions to one host.** The fixed `/tmp/potty-notify.sock` above is fine for one session per
+host at a time, but two concurrent sessions to the same host fight over that single path (the
+second bind steals it; a survivor goes mute when the owner disconnects). The fix is a per-pane
+remote path, which a static ssh config can't express (it can't template `$POTTY_PANE`) — so
+`potty-notify --print-ssh-wrapper` emits a shell `ssh` function that forwards
+`/tmp/potty-notify-$POTTY_PANE.sock` instead. Each pane gets its own remote socket, so concurrent
+same-host sessions coexist (verified). Outside potty the wrapper is plain `ssh`.
+
 The crucial property: **this path never touches the terminal byte stream.** The remote Claude
 Code's `Notification` hook → `potty-notify` → forwarded socket → potty. **Zellij is bypassed
 entirely** — it is irrelevant that the tab is inactive or that Zellij muxes the output, because
@@ -247,10 +255,12 @@ same hooks in the remote `~/.claude` / `~/.codex`.
   propagation. `SendEnv POTTY_PANE` makes remote notes jump to the SSH-hosting pane; the helper
   reports `host` + Zellij context. Ergonomics: `--install-hook`, `--print-ssh-config`. Tested
   end-to-end (incl. SSH-inside-Zellij) through a throwaway localhost sshd.
-- **Phase 3 — polish (open).** OSC fallback for tools without hooks; the Zellij last-hop
-  auto-switch (`zellij action go-to-tab` over the wire); a potty `ssh` wrapper that injects the
-  `RemoteForward` so you don't hand-edit ssh config; the multi-session-per-host socket-collision
-  case (`StreamLocalBindUnlink` covers reconnect, not two live sessions to one host).
+- **Phase 3 — polish.** *Done:* the `ssh` wrapper (`potty-notify --print-ssh-wrapper`) injects a
+  **per-pane** `RemoteForward`, which both removes the hand-edited ssh config *and* fixes the
+  multi-session-per-host collision — each pane forwards `/tmp/potty-notify-$POTTY_PANE.sock`, so two
+  live sessions to one host no longer fight over a single path (verified with concurrent sessions).
+  *Still open:* OSC fallback for tools without hooks; the Zellij last-hop auto-switch
+  (`zellij action go-to-tab` over the wire).
 
 ## Open questions
 

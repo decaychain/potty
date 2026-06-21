@@ -27,6 +27,7 @@ fn main() {
     let mut positional: Option<String> = None;
     let mut install: Option<String> = None;
     let mut print_ssh = false;
+    let mut print_wrapper = false;
     let mut parser = lexopt::Parser::from_env();
     loop {
         match parser.next() {
@@ -42,6 +43,7 @@ fn main() {
                 install = parser.value().ok().and_then(|v| v.into_string().ok());
             }
             Ok(Some(Long("print-ssh-config"))) => print_ssh = true,
+            Ok(Some(Long("print-ssh-wrapper"))) => print_wrapper = true,
             Ok(Some(Long("help") | Short('h'))) => {
                 print_help();
                 return;
@@ -58,6 +60,10 @@ fn main() {
     // Print a ready-to-paste ssh config block for forwarding the feed over SSH, then exit.
     if print_ssh {
         print_ssh_config(positional.as_deref());
+        return;
+    }
+    if print_wrapper {
+        print_ssh_wrapper();
         return;
     }
 
@@ -189,7 +195,10 @@ USAGE:
                                                   stdin (claude) or as an argument (codex).
                                                   --clear retracts a note (Claude UserPromptSubmit).
   potty-notify --install-hook <claude|codex>     Wire the hook into the tool's config (idempotent).
-  potty-notify --print-ssh-config [host]         Print an ~/.ssh/config block to forward over SSH.
+  potty-notify --print-ssh-config [host]         Print an ~/.ssh/config block to forward over SSH
+                                                  (simple; one session per host at a time).
+  potty-notify --print-ssh-wrapper               Print a shell `ssh` wrapper with per-pane sockets
+                                                  (handles concurrent sessions to one host).
   potty-notify --help                            Show this help.
 
 Sending is best-effort and silent: with no potty socket ($POTTY_NOTIFY) it exits 0 and does
@@ -227,6 +236,31 @@ fn print_ssh_config(host: Option<&str>) {
     println!("# can't be clicked-to-jump. If you can't edit sshd_config, drop the SetEnv line and");
     println!("# instead add to the remote shell rc:");
     println!("#     [ -S {remote} ] && export POTTY_NOTIFY={remote}");
+    println!("#");
+    println!("# NOTE: this fixed remote path collides if you open two sessions to {host} at once.");
+    println!("# For that, use the per-pane wrapper instead:  potty-notify --print-ssh-wrapper");
+}
+
+/// Print a shell `ssh` wrapper that forwards the feed on every connection using a *per-pane*
+/// remote socket path. Unlike the static `--print-ssh-config` block, this lets concurrent
+/// sessions to the same host coexist (each pane gets its own remote socket). No-op outside potty.
+fn print_ssh_wrapper() {
+    let remote = "/tmp/potty-notify-$POTTY_PANE.sock";
+    println!("# potty attention feed over SSH — add to ~/.bashrc or ~/.zshrc.");
+    println!("# Forwards the notify socket on every ssh, with a PER-PANE remote path so two");
+    println!("# sessions to the same host don't collide. Outside potty (no $POTTY_PANE) it's plain ssh.");
+    println!("ssh() {{");
+    println!("  if [ -n \"$POTTY_PANE\" ] && [ -S \"$POTTY_NOTIFY\" ]; then");
+    println!("    command ssh -R \"{remote}:$POTTY_NOTIFY\" \\");
+    println!("      -o \"SetEnv POTTY_NOTIFY={remote}\" -o \"SendEnv POTTY_PANE\" \"$@\"");
+    println!("  else");
+    println!("    command ssh \"$@\"");
+    println!("  fi");
+    println!("}}");
+    println!();
+    println!("# On each REMOTE host, in sshd_config (or a drop-in), then restart sshd:");
+    println!("#     AcceptEnv POTTY_NOTIFY POTTY_PANE");
+    println!("#     StreamLocalBindUnlink yes");
 }
 
 // --------------------------------------------------------------------------------------------
