@@ -1518,10 +1518,18 @@ impl App {
         });
     }
 
-    /// A remote session connected: open a tab with one shell pane backed by it, labelled `host`.
+    /// A remote session connected: greet it, then open a tab with one shell pane backed by it.
     fn open_remote_pane(&mut self, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
+        let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
         self.workspace.new_tab();
         let id = self.workspace.active_tab().focus;
+        self.create_remote_pane(id, host, outbound);
+        self.request_redraw();
+    }
+
+    /// Wire pane `id` to a remote session: a `Term` fed from the wire, input/resize routed to
+    /// `outbound`, and an `Open` sent so the remote spawns its shell.
+    fn create_remote_pane(&mut self, id: PaneId, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
         let dims = self.last_dims;
         let term: SharedTerm = Arc::new(Mutex::new(Term::new(
             term_config(&self.config),
@@ -1544,14 +1552,42 @@ impl App {
             },
         );
         self.remote_panes.insert(id);
-        let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
         let _ = outbound.try_send(Frame::Control(Control::Open {
             pane: id,
             cols: dims.cols as u16,
             rows: dims.rows as u16,
         }));
         self.dirty.insert(id);
-        self.request_redraw();
+    }
+
+    /// The (host, outbound) of the focused pane, if it's a remote pane — so a split or new tab can
+    /// reuse the same connection.
+    fn focused_remote(&self) -> Option<(String, tokio::sync::mpsc::Sender<Frame>)> {
+        match self.terms.get(&self.focus()).map(|t| &t.backend) {
+            Some(Backend::Remote { host, outbound, .. }) => Some((host.clone(), outbound.clone())),
+            _ => None,
+        }
+    }
+
+    /// Split the focused pane. From a remote pane, the new pane is another shell on the *same*
+    /// connection; from a local pane, a normal local split (reconcile spawns its PTY).
+    fn split_pane(&mut self, split: Split) {
+        let remote = self.focused_remote();
+        self.workspace.split(split);
+        if let Some((host, outbound)) = remote {
+            let new_id = self.workspace.active_tab().focus;
+            self.create_remote_pane(new_id, host, outbound);
+        }
+    }
+
+    /// New tab. From a remote pane, it's a new tab on the same connection; otherwise a local tab.
+    fn new_tab(&mut self) {
+        let remote = self.focused_remote();
+        self.workspace.new_tab();
+        if let Some((host, outbound)) = remote {
+            let new_id = self.workspace.active_tab().focus;
+            self.create_remote_pane(new_id, host, outbound);
+        }
     }
 
     /// Feed a frame from a remote session into the owning pane (output) or handle its lifecycle.
@@ -2241,6 +2277,9 @@ impl App {
                     self.error_msg = None;
                     self.request_redraw();
                 }
+                // Remote-aware: a split/new-tab from a remote pane stays on its connection.
+                Action::Split(s) => self.split_pane(s),
+                Action::NewTab => self.new_tab(),
                 a => apply(&mut self.workspace, a),
             }
         }

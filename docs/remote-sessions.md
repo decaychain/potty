@@ -128,7 +128,10 @@ attention-feed passthrough are added once the spike proves the round trip and fe
      and reports a clear, actionable error instead of "Channel send error". Verified visually:
      connect dialog and host-badged tab. *Still env-driven `maybe_test_connect`/`POTTY_TEST_*` kept
      as a scripting/testing aid; `potty attach`, auto-reattach, and bootstrapping remain later.*
-   - *Step 3c (next):* splits within a remote tab; then persistence (step 4).
+   - *Step 3c (done):* multi-pane-per-connection. Splitting a remote pane, or "New tab" from one,
+     creates another shell on the *same* connection (clones its `outbound`) rather than a local
+     PTY. `potty-session` already multiplexed many panes; this is the client side. Verified
+     visually: a split remote tab showing two remote shells side by side.
    - *Known gap:* a busy ssh-agent can exhaust the server's `MaxAuthTries` before the ladder reaches
      a working method (seen as "Channel send error"). The ladder should cap/triage agent identities
      or handle the disconnect.
