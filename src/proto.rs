@@ -73,32 +73,54 @@ impl Frame {
         w.flush()
     }
 
-    /// Read one frame. `Ok(None)` is a clean EOF at a frame boundary (peer detached).
+    /// Read one frame from a blocking stream. `Ok(None)` is a clean EOF at a frame boundary.
     pub fn read(r: &mut impl Read) -> io::Result<Option<Frame>> {
         let mut len = [0u8; 4];
         if !read_full(r, &mut len)? {
             return Ok(None);
         }
-        let len = u32::from_be_bytes(len) as usize;
-        if len == 0 || len > MAX_FRAME {
-            return Err(io::Error::other(format!("bad frame length {len}")));
-        }
+        let len = checked_len(len)?;
         let mut payload = vec![0u8; len];
         if !read_full(r, &mut payload)? {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        match payload[0] {
-            TAG_CONTROL => {
-                let c = serde_json::from_slice(&payload[1..]).map_err(io::Error::other)?;
-                Ok(Some(Frame::Control(c)))
-            }
-            TAG_DATA if payload.len() >= 9 => {
-                let pane = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-                Ok(Some(Frame::Data { pane, bytes: payload[9..].to_vec() }))
-            }
-            TAG_DATA => Err(io::Error::other("short data frame")),
-            other => Err(io::Error::other(format!("unknown frame tag {other}"))),
+        Ok(Some(decode_payload(&payload)?))
+    }
+
+    /// Try to parse one frame from the front of `buf` (a growing async-read buffer). Returns the
+    /// frame and how many bytes it consumed, or `None` if `buf` doesn't yet hold a whole frame.
+    pub fn try_parse(buf: &[u8]) -> io::Result<Option<(Frame, usize)>> {
+        if buf.len() < 4 {
+            return Ok(None);
         }
+        let len = checked_len(buf[0..4].try_into().unwrap())?;
+        if buf.len() < 4 + len {
+            return Ok(None);
+        }
+        Ok(Some((decode_payload(&buf[4..4 + len])?, 4 + len)))
+    }
+}
+
+fn checked_len(bytes: [u8; 4]) -> io::Result<usize> {
+    let len = u32::from_be_bytes(bytes) as usize;
+    if len == 0 || len > MAX_FRAME {
+        return Err(io::Error::other(format!("bad frame length {len}")));
+    }
+    Ok(len)
+}
+
+fn decode_payload(payload: &[u8]) -> io::Result<Frame> {
+    match payload.first().copied() {
+        Some(TAG_CONTROL) => {
+            Ok(Frame::Control(serde_json::from_slice(&payload[1..]).map_err(io::Error::other)?))
+        }
+        Some(TAG_DATA) if payload.len() >= 9 => {
+            let pane = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+            Ok(Frame::Data { pane, bytes: payload[9..].to_vec() })
+        }
+        Some(TAG_DATA) => Err(io::Error::other("short data frame")),
+        Some(other) => Err(io::Error::other(format!("unknown frame tag {other}"))),
+        None => Err(io::Error::other("empty frame")),
     }
 }
 

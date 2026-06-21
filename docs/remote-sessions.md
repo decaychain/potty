@@ -96,8 +96,12 @@ attention-feed passthrough are added once the spike proves the round trip and fe
 
 1. **Spike (now):** `potty::proto` + `potty-session` owning PTYs over stdin/stdout, multiplexed,
    tested with a pipe harness. No SSH, no persistence, no GUI yet.
-2. **russh client:** connect + agent/fallback auth + exec, pump the channel — tested against a
-   local sshd running `potty-session`.
+2. **russh client:** connect + auth + exec, pump the channel.
+   - *Step 1 (done):* connect, **publickey** auth, exec `potty-session`, bidirectional frame pump
+     (`src/remote.rs`). Host key accepted blindly. Tested over a throwaway localhost sshd
+     (`tests/remote_ssh.rs`): a shell command run on the "remote" round-trips its output as frames.
+   - *Step 2 (next):* the auth ladder — agent (`$SSH_AUTH_SOCK` / Windows named pipe) → key files
+     (passphrase dialog) → keyboard-interactive/password — with host-key verification.
 3. **GUI wiring:** a remote pane rendered natively; input/resize back; `+`/menu connect flow.
 4. **Persistence:** daemonize + reattach-repaint; the pane/tab tree server-side.
 5. **Later:** auto-reattach, bootstrapping, ProxyJump, agent forwarding, Windows `potty attach` IPC.

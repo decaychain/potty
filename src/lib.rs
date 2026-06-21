@@ -6,3 +6,4 @@
 
 pub mod notify;
 pub mod proto;
+pub mod remote;
