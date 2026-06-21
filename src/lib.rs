@@ -5,3 +5,4 @@
 //! sender can never drift out of sync.
 
 pub mod notify;
+pub mod proto;
