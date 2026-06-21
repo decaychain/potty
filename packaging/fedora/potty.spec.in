@@ -44,6 +44,9 @@ cargo build --release
 
 %install
 install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
+# The attention-feed helper: agentic CLIs invoke it from a notification hook (see
+# docs/attention-feed.md). Must be on PATH for hooks to find it.
+install -Dm755 target/release/%{name}-notify %{buildroot}%{_bindir}/%{name}-notify
 install -Dm644 packaging/fedora/io.github.decaychain.potty.desktop \
   %{buildroot}%{_datadir}/applications/io.github.decaychain.potty.desktop
 # Scalable source plus a few raster sizes for the hicolor icon theme.
@@ -57,6 +60,7 @@ done
 %files
 %license LICENSE
 %{_bindir}/%{name}
+%{_bindir}/%{name}-notify
 %{_datadir}/applications/io.github.decaychain.potty.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.github.decaychain.potty.svg
 %{_datadir}/icons/hicolor/*/apps/io.github.decaychain.potty.png

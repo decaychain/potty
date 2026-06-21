@@ -54,6 +54,9 @@ use winit::window::Window;
 
 use gridr::GridRenderer;
 use workspace::{PaneId, Split, Workspace, GAP};
+// The attention-feed wire contract lives in the lib crate (shared with the `potty-notify` bin).
+// Aliased to avoid clashing with the `notify` file-watcher crate used below.
+use potty::notify as feed;
 
 const FONT_PX: f32 = 15.0;
 const LINE_PX: f32 = 18.0;
@@ -91,6 +94,8 @@ enum UserEvent {
     ResetTitle(PaneId),
     /// A pane's shell exited (reader hit EOF) — close the pane.
     PaneExited(PaneId),
+    /// An attention note arrived on the notify socket (from `potty-notify`).
+    Notify(feed::Note),
 }
 
 /// Terminal event listener for one pane: forwards the events we care about to the main loop,
@@ -203,6 +208,42 @@ enum Action {
     SetFontFamily(Option<String>),
     SetFontSize(f32),
     ShowFontSettings,
+    /// Jump to (focus) a pane from the attention feed — selects its tab too.
+    JumpToPane(PaneId),
+    /// Dismiss an attention-feed entry, keyed by (host, session).
+    DismissNote(String, String),
+    /// Show or hide the attention-feed overlay (bell toggle / overlay close button).
+    ShowFeed(bool),
+    /// Dismiss the feed entirely: un-latch the tab bar (so it disappears again with a lone tab).
+    /// Triggered by clicking the bell when nothing is waiting.
+    DismissFeed,
+}
+
+/// A session currently waiting for the user, as tracked by the attention feed. Keyed in `App`
+/// by `(host, session)`; a `raise` note inserts/refreshes it, a `clear` (or the user landing on
+/// its pane) removes it.
+struct Pending {
+    tool: feed::Tool,
+    message: String,
+    host: String,
+    cwd: String,
+    /// The owning potty pane, for exact jump-to-focus (local sessions only).
+    pane: Option<PaneId>,
+    zellij: Option<feed::ZellijLoc>,
+    /// When it was last raised — drives newest-first ordering and the age label.
+    since: Instant,
+}
+
+/// A flattened, display-ready attention-feed row handed to the chrome.
+struct FeedItem {
+    key: (String, String),
+    tool: feed::Tool,
+    /// Pre-formatted "where": host (if remote) + cwd basename + Zellij hint.
+    label: String,
+    message: String,
+    /// Pre-formatted age, e.g. "12s", "4m", "2h".
+    age: String,
+    pane: Option<PaneId>,
 }
 
 /// Apply a workspace (tab/pane) action. Font actions are routed separately (they touch App).
@@ -215,7 +256,14 @@ fn apply(ws: &mut Workspace, action: Action) {
         Action::CloseTab(i) => ws.close_tab(i),
         Action::Focus(id) => ws.focus(id),
         Action::SetRatio(id, ratio) => ws.set_ratio(id, ratio),
-        Action::SetFontFamily(_) | Action::SetFontSize(_) | Action::ShowFontSettings => {}
+        // Handled in the redraw action loop (they touch App, not just the workspace).
+        Action::SetFontFamily(_)
+        | Action::SetFontSize(_)
+        | Action::ShowFontSettings
+        | Action::JumpToPane(_)
+        | Action::DismissNote(..)
+        | Action::ShowFeed(_)
+        | Action::DismissFeed => {}
     }
 }
 
@@ -231,6 +279,37 @@ fn elide(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// "Where" label for a feed row: host (only when remote) + cwd basename + Zellij session hint.
+fn feed_label(host: &str, cwd: &str, zellij: Option<&feed::ZellijLoc>) -> String {
+    let dir = cwd
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cwd);
+    let mut s = if host.is_empty() || host == "localhost" {
+        dir.to_string()
+    } else {
+        format!("{host}:{dir}")
+    };
+    if let Some(sess) = zellij.and_then(|z| z.session.as_deref()).filter(|s| !s.is_empty()) {
+        s.push_str(&format!(" · zellij:{sess}"));
+    }
+    s
+}
+
+/// Compact age label: seconds under a minute, then minutes, then hours.
+fn human_age(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 /// The one pane/tab menu, used by both the ☰ button (`for_pane` = None → acts on the focused
@@ -327,10 +406,16 @@ fn build_ui(
     actions: &mut Vec<Action>,
     leaves: &mut Vec<(PaneId, egui::Rect)>,
     dividers: &mut Vec<egui::Rect>,
+    pending: &[FeedItem],
+    feed_active: &mut bool,
+    chrome_latched: bool,
+    feed_open: bool,
 ) {
-    // The tab bar only earns its space with more than one tab; otherwise the menu lives on the
-    // pane's right-click (shift-right-click when an app has grabbed the mouse).
-    if ws.tabs.len() > 1 {
+    // The tab bar earns its space with more than one tab, or once the attention feed has latched
+    // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
+    // (shift-right-click when an app has grabbed the mouse).
+    let show_chrome = ws.tabs.len() > 1 || chrome_latched;
+    if show_chrome {
         egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for (i, _tab) in ws.tabs.iter().enumerate() {
@@ -352,6 +437,30 @@ fn build_ui(
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.menu_button("☰", |ui| full_menu(ui, actions, None));
+                    // Attention-feed bell — present once the feed has latched the bar on. Shows
+                    // the waiting count; toggles the overlay.
+                    if chrome_latched {
+                        let empty = pending.is_empty();
+                        let label = if empty {
+                            "\u{1F514}".to_string() // 🔔
+                        } else {
+                            format!("\u{1F514} {}", pending.len())
+                        };
+                        let hover = if empty {
+                            "Nothing waiting — click to dismiss"
+                        } else {
+                            "Sessions waiting for you"
+                        };
+                        if ui.selectable_label(feed_open, label).on_hover_text(hover).clicked() {
+                            // With nothing waiting, the bell is a dismiss: un-latch the bar.
+                            // Otherwise it toggles the overlay.
+                            actions.push(if empty {
+                                Action::DismissFeed
+                            } else {
+                                Action::ShowFeed(!feed_open)
+                            });
+                        }
+                    }
                 });
             });
         });
@@ -431,6 +540,75 @@ fn build_ui(
                 }
             }
         });
+
+    // Attention feed — a floating list of sessions waiting for you, drawn as an Area so it
+    // overlays the terminal without affecting pane sizing. Shown when the user has it open
+    // (auto-opened on a fresh wave; toggled by the bell; hidden by its × button).
+    *feed_active = false;
+    if feed_open {
+        let top = if show_chrome { TOPBAR + 6.0 } else { 8.0 };
+        let r = egui::Area::new(egui::Id::new("attention-feed"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    // egui labels are drag-selectable by default; that just produces stray text
+                    // highlights in a read-only overlay, so turn it off here.
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.set_max_width(360.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{} waiting", pending.len())).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new("×").frame(false))
+                                .on_hover_text("Hide (reopen from the bell)")
+                                .clicked()
+                            {
+                                actions.push(Action::ShowFeed(false));
+                            }
+                        });
+                    });
+                    for item in pending {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(egui::Button::new(egui::RichText::new("×").weak()).frame(false))
+                                .on_hover_text("Dismiss")
+                                .clicked()
+                            {
+                                actions.push(Action::DismissNote(
+                                    item.key.0.clone(),
+                                    item.key.1.clone(),
+                                ));
+                            }
+                            let tool = match item.tool {
+                                feed::Tool::Claude => "claude",
+                                feed::Tool::Codex => "codex",
+                                feed::Tool::Other => "tool",
+                            };
+                            let head = format!("{tool} · {} · {}", item.label, item.age);
+                            let jump = item.pane.is_some();
+                            let resp = ui.add(egui::Label::new(head).sense(egui::Sense::click()));
+                            let resp = if jump {
+                                resp.on_hover_text("Jump to this pane")
+                            } else {
+                                resp
+                            };
+                            if jump && resp.clicked() {
+                                if let Some(p) = item.pane {
+                                    actions.push(Action::JumpToPane(p));
+                                }
+                            }
+                        });
+                        if !item.message.is_empty() {
+                            ui.label(egui::RichText::new(elide(&item.message, 64)).weak());
+                        }
+                    }
+                });
+            });
+        // Suppress our terminal mouse handling while the pointer is over the feed (it gates on
+        // geometry, not egui consumption — see the CentralPanel comment).
+        *feed_active = r.response.contains_pointer();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +875,16 @@ struct App {
     /// while the focused pane's cursor blinks and is idle — see `about_to_wait`.
     blink_on: bool,
     blink_next: Option<Instant>,
+
+    /// Attention feed: sessions waiting for the user, keyed by `(host, session)`. Fed by the
+    /// notify socket (`UserEvent::Notify`); rendered as a floating overlay in the chrome.
+    pending: HashMap<(String, String), Pending>,
+    /// Whether the feed overlay is currently shown. Auto-opens on a fresh wave of notes, toggled
+    /// by the tab-bar bell, hidden by the overlay's close button.
+    feed_open: bool,
+    /// Once a note has ever arrived, keep the tab bar visible (it hosts the bell) for the rest of
+    /// the session — so the content doesn't jump as notifications come and go.
+    chrome_latched: bool,
 }
 
 impl App {
@@ -736,6 +924,9 @@ impl App {
             divider_px: Vec::new(),
             blink_on: true,
             blink_next: None,
+            pending: HashMap::new(),
+            feed_open: false,
+            chrome_latched: false,
         }
     }
 
@@ -753,6 +944,88 @@ impl App {
     fn reset_blink(&mut self) {
         self.blink_on = true;
         self.blink_next = None;
+    }
+
+    /// Fold an attention note into the feed: a `raise` inserts/refreshes the session, a `clear`
+    /// removes it. Keyed by `(host, session)` so re-raises update in place rather than pile up.
+    fn on_note(&mut self, note: feed::Note) {
+        let key = (note.host.clone(), note.session.clone());
+        match note.kind {
+            feed::Kind::Raise => {
+                // A fresh wave (nothing was waiting) pops the feed open; mid-wave re-raises don't
+                // re-pop it if the user has hidden it. Either way the tab bar latches on.
+                let was_empty = self.pending.is_empty();
+                self.pending.insert(
+                    key,
+                    Pending {
+                        tool: note.tool,
+                        message: note.message,
+                        host: note.host,
+                        cwd: note.cwd,
+                        pane: note.pane,
+                        zellij: note.zellij,
+                        since: Instant::now(),
+                    },
+                );
+                self.chrome_latched = true;
+                if was_empty {
+                    self.feed_open = true;
+                }
+            }
+            feed::Kind::Clear => {
+                self.pending.remove(&key);
+                if self.pending.is_empty() {
+                    self.feed_open = false;
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Drop any feed entries owned by `pane` (the user landed on it, so it no longer needs
+    /// flagging). Returns whether anything was removed.
+    fn clear_pending_for_pane(&mut self, pane: PaneId) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|_, p| p.pane != Some(pane));
+        let changed = self.pending.len() != before;
+        if changed && self.pending.is_empty() {
+            self.feed_open = false;
+        }
+        changed
+    }
+
+    /// Build the display-ready feed rows for the chrome, newest first.
+    fn feed_items(&self) -> Vec<FeedItem> {
+        let now = Instant::now();
+        let mut rows: Vec<(Instant, FeedItem)> = self
+            .pending
+            .iter()
+            .map(|((h, s), p)| {
+                (
+                    p.since,
+                    FeedItem {
+                        key: (h.clone(), s.clone()),
+                        tool: p.tool,
+                        label: feed_label(&p.host, &p.cwd, p.zellij.as_ref()),
+                        message: p.message.clone(),
+                        age: human_age(now.saturating_duration_since(p.since)),
+                        pane: p.pane,
+                    },
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+        rows.into_iter().map(|(_, it)| it).collect()
+    }
+
+    /// Focus a pane from the feed: select its tab, focus it, and clear its note.
+    fn jump_to_pane(&mut self, pane: PaneId) {
+        if let Some(i) = self.workspace.tab_of(pane) {
+            self.workspace.active = i;
+            self.workspace.tabs[i].focus = pane;
+            self.clear_pending_for_pane(pane);
+            self.request_redraw();
+        }
     }
 
     /// Flag a pane's render as stale, and ask for a redraw if that pane is on screen.
@@ -810,6 +1083,13 @@ impl App {
         // Declare what we actually emulate so terminfo-driven apps (mc, ncurses) agree with
         // the escape sequences we send (e.g. application cursor keys).
         cmd.env("TERM", "xterm-256color");
+        // Attention feed: tell child tools where to send notes (`potty-notify` connects here) and
+        // which pane they live in (for exact jump-to-focus). Unix-only — the listener is a UDS.
+        #[cfg(unix)]
+        {
+            cmd.env(feed::ENV_SOCK, feed::default_socket_path());
+            cmd.env(feed::ENV_PANE, id.to_string());
+        }
         let mut child = pair.slave.spawn_command(cmd).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
         let writer = pair.master.take_writer().unwrap();
@@ -1201,6 +1481,10 @@ impl App {
         // Typing keeps the cursor solid and restarts the blink cycle.
         self.reset_blink();
         let focus = self.focus();
+        // Engaging with a pane (a keystroke) clears any attention note it raised.
+        if self.clear_pending_for_pane(focus) {
+            self.request_redraw();
+        }
         // On Windows AltGr is reported as Ctrl+Alt; excluding Alt keeps AltGr symbols
         // (`@ { [ ] } \\ | ~ €` on the German layout) out of the Ctrl-shortcut / control-code path.
         let ctrl = self.mods.state().control_key() && !self.mods.state().alt_key();
@@ -1373,6 +1657,10 @@ impl App {
         let b = self.config.border();
         let border_color = egui::Color32::from_rgb(b.r, b.g, b.b);
         let pane_padding = self.config.pane_padding;
+        let feed_items = self.feed_items();
+        let mut feed_active = false;
+        let chrome_latched = self.chrome_latched;
+        let feed_open = self.feed_open;
         let full = {
             let ws = &self.workspace;
             let families = &self.font_families;
@@ -1382,18 +1670,38 @@ impl App {
                 build_ui(
                     ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
                     pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
+                    &feed_items, &mut feed_active, chrome_latched, feed_open,
                 )
             })
         };
         self.show_font_settings = show_font;
         // Remember whether a popup/menu is open so the next frame's clicks don't leak through
         // the menu into the terminal underneath.
-        self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open());
+        // The feed overlay isn't a popup, so OR in whether the pointer is over it — otherwise a
+        // click on the feed would also start a selection in the terminal beneath it.
+        self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open()) || feed_active;
         for a in actions {
             match a {
                 Action::SetFontFamily(f) => self.set_font_family(f),
                 Action::SetFontSize(s) => self.set_font_size(s),
                 Action::ShowFontSettings => self.show_font_settings = true,
+                Action::JumpToPane(p) => self.jump_to_pane(p),
+                Action::DismissNote(host, session) => {
+                    self.pending.remove(&(host, session));
+                    if self.pending.is_empty() {
+                        self.feed_open = false;
+                    }
+                    self.request_redraw();
+                }
+                Action::ShowFeed(open) => {
+                    self.feed_open = open;
+                    self.request_redraw();
+                }
+                Action::DismissFeed => {
+                    self.feed_open = false;
+                    self.chrome_latched = false;
+                    self.request_redraw();
+                }
                 a => apply(&mut self.workspace, a),
             }
         }
@@ -1690,6 +1998,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                 }
             }
+            // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
+            UserEvent::Notify(note) => self.on_note(note),
         }
     }
 
@@ -1852,9 +2162,52 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// Listen on the attention-feed socket and forward each note into the event loop. One note per
+/// connection, newline-terminated. Best-effort: if the socket can't be bound (e.g. another potty
+/// already owns it), the feature is simply off this run. Unix-only — the transport is a UDS.
+#[cfg(unix)]
+fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>) {
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::net::UnixListener;
+
+    let path = feed::default_socket_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // A stale socket from a previous run would make bind() fail with "address in use".
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("potty: attention feed disabled (socket {}: {e})", path.display());
+            return;
+        }
+    };
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            // Cap the read so a rogue client can't make us allocate unbounded.
+            let mut line = String::new();
+            if BufReader::new(stream.take(64 * 1024)).read_line(&mut line).is_err() {
+                continue;
+            }
+            if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim()) {
+                if note.v == feed::SCHEMA_VERSION {
+                    let _ = proxy.send_event(UserEvent::Notify(note));
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_notify_listener(_proxy: EventLoopProxy<UserEvent>) {}
+
 fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
+    spawn_notify_listener(proxy.clone());
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
 }

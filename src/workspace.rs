@@ -211,6 +211,11 @@ impl Workspace {
         &self.tabs[self.active]
     }
 
+    /// Index of the tab containing `pane`, if any — used to jump focus to a pane in another tab.
+    pub fn tab_of(&self, pane: PaneId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.layout.contains(pane))
+    }
+
     pub fn leaf_rects(&self, area: Rect) -> Vec<(PaneId, Rect)> {
         let mut out = Vec::new();
         self.active_tab().layout.leaf_rects(area, &mut out);

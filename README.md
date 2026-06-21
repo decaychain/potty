@@ -58,6 +58,40 @@ Or [build from source](#build--run).
 - **Keyboard** — layout-resolved text (German/US, no IME needed) with an IME-commit safety net,
   DECCKM-aware cursor / navigation / function keys (so `mc` and ncurses apps work), and AltGr
   handling on Windows.
+- **Attention feed** *(Linux)* — a floating list of agentic-CLI sessions (Claude Code, Codex)
+  waiting on you, gathered out-of-band over a socket rather than scraped from the screen, so a
+  session in a **background pane** still surfaces. Click an entry to jump to its pane. See
+  [Attention feed](#attention-feed) and [the design doc](docs/attention-feed.md).
+
+## Attention feed
+
+When you run several agentic CLIs at once they spend a lot of time *blocked on you* — a permission
+prompt, a plan to approve. potty collects those into one floating list (top-right) so you never
+babysit a pane to check "is it waiting yet?". The signal comes from the tool's own notification
+hook via a tiny helper (`potty-notify`) over a Unix socket — **not** by watching the terminal
+output — so a session in an unfocused pane still shows up. Click an entry to jump straight to it.
+
+Wire it up once (the `potty` package installs `potty-notify` on `PATH`):
+
+**Claude Code** — `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Notification":     [{ "hooks": [{ "type": "command", "command": "potty-notify --tool claude" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "potty-notify --tool claude --clear" }] }]
+  }
+}
+```
+
+**Codex** — `~/.codex/config.toml`:
+
+```toml
+notify = ["potty-notify", "--tool", "codex"]
+```
+
+A session outside potty (or on a host without the socket) just no-ops — the hook is harmless.
+SSH and Zellij-tab correlation are [planned next](docs/attention-feed.md#phasing).
 
 ## Platforms
 
