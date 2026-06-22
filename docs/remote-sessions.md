@@ -135,5 +135,15 @@ attention-feed passthrough are added once the spike proves the round trip and fe
    - *Known gap:* a busy ssh-agent can exhaust the server's `MaxAuthTries` before the ladder reaches
      a working method (seen as "Channel send error"). The ladder should cap/triage agent identities
      or handle the disconnect.
-4. **Persistence:** daemonize + reattach-repaint; the pane/tab tree server-side.
+4. **Persistence.**
+   - *Step 4a (done):* daemonization. `potty-session` is now two roles — a short-lived **attach**
+     relay (what ssh execs: a byte pipe between the SSH channel and the daemon's Unix socket) and a
+     detached **daemon** (`--daemon`, own process group) that owns the PTYs and survives client
+     disconnects. The attach starts the daemon if absent and exits on disconnect, leaving it; the
+     daemon idle-exits when it has no panes and no client. `POTTY_SESSION_NODAEMON=1` keeps the
+     old inline mode for the transport tests. Verified: a shell's process survives the client
+     disconnecting (`tests/remote_persist.rs`).
+   - *Step 4b (next):* reattach — on a new client, the daemon announces its existing panes and
+     replays each one's current screen so the client repaints; the client adopts them (needs a
+     pane-id mapping, since the daemon now owns ids across reconnects).
 5. **Later:** auto-reattach, bootstrapping, ProxyJump, agent forwarding, Windows `potty attach` IPC.

@@ -118,6 +118,12 @@ fn user() -> Option<String> {
     std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok()
 }
 
+/// The remote command: run potty-session inline (no daemon) so these transport tests don't leave
+/// a persistent daemon behind. The remote shell applies the env prefix.
+fn session_cmd() -> String {
+    format!("POTTY_SESSION_NODAEMON=1 {}", env!("CARGO_BIN_EXE_potty-session"))
+}
+
 fn config(sshd: &Sshd, user: &str, keys: Vec<PathBuf>, use_agent: bool, agent_sock: Option<PathBuf>) -> SshConfig {
     SshConfig {
         host: "127.0.0.1".into(),
@@ -166,7 +172,7 @@ async fn publickey_round_trip_to_potty_session() {
 
     let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
     let (session, rx) =
-        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), env!("CARGO_BIN_EXE_potty-session"))
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &session_cmd())
             .await
             .expect("connect/auth/exec over ssh");
     assert_echo_round_trip(session, rx).await;
@@ -180,7 +186,7 @@ async fn rejected_host_key_aborts_connect() {
     // The host key is unknown (fresh known_hosts) and the authenticator refuses it.
     let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
     let result =
-        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(false)), env!("CARGO_BIN_EXE_potty-session")).await;
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(false)), &session_cmd()).await;
     assert!(result.is_err(), "connect should fail when the host key is rejected");
 }
 
@@ -231,7 +237,7 @@ async fn agent_auth_round_trip() {
     // Authenticate via the agent only — no key files.
     let cfg = config(&sshd, &user, vec![], true, Some(sock));
     let (session, rx) =
-        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), env!("CARGO_BIN_EXE_potty-session"))
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &session_cmd())
             .await
             .expect("agent auth over ssh");
     assert_echo_round_trip(session, rx).await;

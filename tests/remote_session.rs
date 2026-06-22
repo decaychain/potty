@@ -36,6 +36,7 @@ struct Session {
 impl Session {
     fn start() -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_potty-session"))
+            .env("POTTY_SESSION_NODAEMON", "1") // multiplex inline, no daemon
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

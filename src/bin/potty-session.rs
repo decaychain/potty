@@ -1,22 +1,31 @@
-//! `potty-session` — the headless remote half of potty's multiplexer. It owns the PTYs for one
-//! host and multiplexes them over a single byte stream: it reads the wire protocol from stdin and
-//! writes it to stdout. In production the `potty` client execs this over an SSH channel (russh);
-//! for the spike it's driven over a plain stdio pipe.
+//! `potty-session` — the remote multiplexer. It has two roles:
 //!
-//! This is the spike surface (`docs/remote-sessions.md`): panes on demand, multiplexed, no
-//! persistence and no pane *tree* yet — just enough to prove the protocol and the round trip.
+//!  * **attach** (the default; what the potty client execs over SSH): a dumb byte relay between
+//!    this process's stdin/stdout (the SSH channel) and the persistent daemon's Unix socket. It
+//!    starts the daemon if it isn't already running, and exits when the client disconnects —
+//!    leaving the daemon (and its shells) alive.
+//!  * **daemon** (`--daemon <sock>`, forked + detached): owns the PTYs and speaks the wire
+//!    protocol over the socket, surviving client disconnects so remote programs keep running. One
+//!    per user (per host, implicitly). See `docs/remote-sessions.md`, step 4.
+//!
+//! `POTTY_SESSION_NODAEMON=1` runs the multiplexer inline over stdin/stdout (no daemon, no
+//! persistence) — used by the protocol/transport tests.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::io::{BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
 use potty::proto::{Control, Frame, PaneId, PROTOCOL_VERSION};
 
-/// stdout is written from many threads (each pane's reader, plus control replies); a frame must go
-/// out atomically, so all writers share this lock.
-type Sink = Arc<Mutex<std::io::Stdout>>;
+/// The daemon's socket, remembered so threads can remove it on exit.
+static SOCK: OnceLock<PathBuf> = OnceLock::new();
 
 struct Pane {
     writer: Box<dyn Write + Send>,
@@ -26,83 +35,101 @@ struct Pane {
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
-fn send(sink: &Sink, frame: Frame) {
-    let mut out = sink.lock().unwrap();
-    let _ = frame.write(&mut *out);
+/// Shared session state. `panes` outlive any single client connection (that's the persistence);
+/// `client` is the currently-attached client's write half, or `None` while detached.
+struct Session {
+    panes: Mutex<HashMap<PaneId, Pane>>,
+    client: Mutex<Option<Box<dyn Write + Send>>>,
 }
 
 fn shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
 }
 
-/// Spawn a shell in a fresh PTY and wire it up: PTY output → `Data` frames, child exit → `Exited`.
-fn open_pane(pane: PaneId, cols: u16, rows: u16, sink: &Sink) -> std::io::Result<Pane> {
-    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
-    let pair = portable_pty::native_pty_system().openpty(size).map_err(std::io::Error::other)?;
+/// Write a frame to the attached client, if any (dropped while detached). Frames must go out
+/// atomically, so the whole write happens under the lock.
+fn send_frame(session: &Session, frame: Frame) {
+    let mut guard = session.client.lock().unwrap();
+    if let Some(client) = guard.as_mut() {
+        let _ = frame.write(client);
+    }
+}
 
+/// Spawn a shell in a fresh PTY: output → `Data` frames to whoever's attached; exit → `Exited`
+/// (and, if nothing's left and nobody's attached, the daemon exits).
+fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16) {
+    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+    let pair = match portable_pty::native_pty_system().openpty(size) {
+        Ok(p) => p,
+        Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+    };
     let mut cmd = CommandBuilder::new(shell());
     cmd.env("TERM", "xterm-256color");
-    let mut child = pair.slave.spawn_command(cmd).map_err(std::io::Error::other)?;
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+    };
     let killer = child.clone_killer();
-    let mut reader = pair.master.try_clone_reader().map_err(std::io::Error::other)?;
-    let writer = pair.master.take_writer().map_err(std::io::Error::other)?;
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+    };
+    let writer = match pair.master.take_writer() {
+        Ok(w) => w,
+        Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+    };
 
-    // Pump PTY output to the client.
-    let out_sink = sink.clone();
+    // PTY output → client. Keeps reading (and dropping output) while detached, so the shell never
+    // blocks on a full PTY buffer.
+    let out = session.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => send(&out_sink, Frame::Data { pane, bytes: buf[..n].to_vec() }),
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
             }
+            send_frame(&out, Frame::Data { pane, bytes: buf[..n].to_vec() });
         }
     });
 
-    // Report the shell exiting (ConPTY can keep the reader open after exit, so wait on the child).
-    let exit_sink = sink.clone();
+    // Shell exit → Exited, drop the pane, and shut the daemon down if it's now idle.
+    let wait = session.clone();
     thread::spawn(move || {
         let _ = child.wait();
-        send(&exit_sink, Frame::Control(Control::Exited { pane }));
+        send_frame(&wait, Frame::Control(Control::Exited { pane }));
+        wait.panes.lock().unwrap().remove(&pane);
+        let idle = wait.panes.lock().unwrap().is_empty() && wait.client.lock().unwrap().is_none();
+        if idle {
+            cleanup_and_exit();
+        }
     });
 
-    Ok(Pane { writer, master: pair.master, killer })
+    session.panes.lock().unwrap().insert(pane, Pane { writer, master: pair.master, killer });
+    send_frame(session, Frame::Control(Control::Opened { pane }));
 }
 
-fn main() {
-    let sink: Sink = Arc::new(Mutex::new(std::io::stdout()));
-    let mut panes: HashMap<PaneId, Pane> = HashMap::new();
-    let mut stdin = std::io::stdin().lock();
-
-    // Reads until clean EOF (client detached) or a protocol error — either way we're done. (When
-    // persistence lands, detach will keep panes alive instead of exiting.)
-    while let Ok(Some(frame)) = Frame::read(&mut stdin) {
+/// Serve one client connection: apply its frames to the session until it disconnects (EOF).
+fn serve(session: &Arc<Session>, reader: impl Read) {
+    let mut reader = BufReader::new(reader);
+    while let Ok(Some(frame)) = Frame::read(&mut reader) {
         match frame {
             Frame::Control(Control::Hello { .. }) => {
-                send(&sink, Frame::Control(Control::Welcome { version: PROTOCOL_VERSION }));
+                send_frame(session, Frame::Control(Control::Welcome { version: PROTOCOL_VERSION }));
             }
-            Frame::Control(Control::Open { pane, cols, rows }) => match open_pane(pane, cols, rows, &sink) {
-                Ok(p) => {
-                    panes.insert(pane, p);
-                    send(&sink, Frame::Control(Control::Opened { pane }));
-                }
-                Err(_) => send(&sink, Frame::Control(Control::Exited { pane })),
-            },
+            Frame::Control(Control::Open { pane, cols, rows }) => open_pane(session, pane, cols, rows),
             Frame::Control(Control::Resize { pane, cols, rows }) => {
-                if let Some(p) = panes.get(&pane) {
-                    let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+                let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+                if let Some(p) = session.panes.lock().unwrap().get(&pane) {
                     let _ = p.master.resize(size);
                 }
             }
-            // Kill the shell; the wait thread then emits `Exited`. (Dropping the pane alone is
-            // unreliable — the reader thread keeps a cloned master fd open.)
             Frame::Control(Control::Close { pane }) => {
-                if let Some(mut p) = panes.remove(&pane) {
+                if let Some(mut p) = session.panes.lock().unwrap().remove(&pane) {
                     let _ = p.killer.kill();
                 }
             }
             Frame::Data { pane, bytes } => {
-                if let Some(p) = panes.get_mut(&pane) {
+                if let Some(p) = session.panes.lock().unwrap().get_mut(&pane) {
                     let _ = p.writer.write_all(&bytes);
                     let _ = p.writer.flush();
                 }
@@ -110,5 +137,113 @@ fn main() {
             // Server→client controls (Welcome/Opened/Exited) never arrive from the client.
             Frame::Control(_) => {}
         }
+    }
+}
+
+fn cleanup_and_exit() -> ! {
+    if let Some(sock) = SOCK.get() {
+        let _ = std::fs::remove_file(sock);
+    }
+    std::process::exit(0);
+}
+
+/// `$POTTY_SESSION_SOCK`, else `$XDG_RUNTIME_DIR/potty-session.sock`, else a per-user temp path.
+fn socket_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("POTTY_SESSION_SOCK") {
+        return PathBuf::from(p);
+    }
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(rt).join("potty-session.sock");
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+    std::env::temp_dir().join(format!("potty-session-{user}.sock"))
+}
+
+/// Connect to the daemon, starting (and detaching) one if it isn't running.
+fn ensure_daemon(sock: &Path) -> Option<UnixStream> {
+    if let Ok(s) = UnixStream::connect(sock) {
+        return Some(s);
+    }
+    if let Some(dir) = sock.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // A new process group detaches it from the SSH session, so it survives the channel closing.
+        let _ = std::process::Command::new(exe)
+            .arg("--daemon")
+            .arg(sock)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+    }
+    for _ in 0..300 {
+        if let Ok(s) = UnixStream::connect(sock) {
+            return Some(s);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+/// Attach role: relay stdin/stdout (the SSH channel) to/from the daemon socket. Exits on client
+/// disconnect, leaving the daemon.
+fn attach(sock: PathBuf) {
+    let Some(stream) = ensure_daemon(&sock) else {
+        eprintln!("potty-session: could not reach the session daemon");
+        std::process::exit(1);
+    };
+    let mut to_daemon = stream.try_clone().expect("clone socket");
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let _ = std::io::copy(&mut stdin, &mut to_daemon);
+        // The SSH channel closed → exit, dropping the socket so the daemon detaches but lives on.
+        std::process::exit(0);
+    });
+    let mut from_daemon = stream;
+    let mut stdout = std::io::stdout().lock();
+    let _ = std::io::copy(&mut from_daemon, &mut stdout);
+}
+
+/// Daemon role: own the PTYs, serve one attached client at a time, persist across detaches.
+fn run_daemon(sock: PathBuf) {
+    let _ = std::fs::remove_file(&sock);
+    let Ok(listener) = UnixListener::bind(&sock) else {
+        return; // another daemon won the race to bind
+    };
+    let _ = SOCK.set(sock);
+    let session = Arc::new(Session {
+        panes: Mutex::new(HashMap::new()),
+        client: Mutex::new(None),
+    });
+    for conn in listener.incoming() {
+        let Ok(conn) = conn else { continue };
+        let Ok(write) = conn.try_clone() else { continue };
+        *session.client.lock().unwrap() = Some(Box::new(write));
+        serve(&session, conn);
+        *session.client.lock().unwrap() = None;
+        // Detached. If nothing's left to persist, shut down.
+        if session.panes.lock().unwrap().is_empty() {
+            cleanup_and_exit();
+        }
+    }
+}
+
+/// Inline role (tests): multiplex directly over stdin/stdout, no daemon.
+fn run_inline() {
+    let session = Arc::new(Session {
+        panes: Mutex::new(HashMap::new()),
+        client: Mutex::new(Some(Box::new(std::io::stdout()))),
+    });
+    serve(&session, std::io::stdin().lock());
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("--daemon") => run_daemon(args.next().map(PathBuf::from).unwrap_or_else(socket_path)),
+        _ if std::env::var_os("POTTY_SESSION_NODAEMON").is_some() => run_inline(),
+        _ => attach(socket_path()),
     }
 }
