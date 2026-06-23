@@ -43,6 +43,12 @@ pub enum Control {
     Close { pane: PaneId },
     /// S→C: a pane's shell exited.
     Exited { pane: PaneId },
+    /// S→C (on attach): a pane that already exists in the daemon; the client should adopt it. The
+    /// pane's current screen follows as `Data` frames (replay).
+    Restore { pane: PaneId },
+    /// S→C (on attach): the end of the restore burst. If nothing was restored, the client opens a
+    /// fresh pane; otherwise it has adopted the daemon's panes.
+    Ready,
 }
 
 /// A decoded frame.

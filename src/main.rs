@@ -98,11 +98,11 @@ enum UserEvent {
     PaneExited(PaneId),
     /// An attention note arrived on the notify socket (from `potty-notify`).
     Notify(feed::Note),
-    /// A remote SSH session authenticated and exec'd `potty-session`; carries the host (for the tab
-    /// label) and the channel to send it input/resize/close frames.
-    RemoteConnected { host: String, outbound: tokio::sync::mpsc::Sender<potty::proto::Frame> },
-    /// A wire-protocol frame arrived from a remote session.
-    RemoteFrame(potty::proto::Frame),
+    /// A remote SSH session authenticated and exec'd `potty-session`; carries the connection id,
+    /// the host (for the tab label), and the channel to send it input/resize/close frames.
+    RemoteConnected { conn: ConnId, host: String, outbound: tokio::sync::mpsc::Sender<potty::proto::Frame> },
+    /// A wire-protocol frame arrived from a remote session (tagged with its connection).
+    RemoteFrame(ConnId, potty::proto::Frame),
     /// A remote connection attempt failed (auth, network, host key, …).
     RemoteError(String),
     /// A remote connection's auth ladder needs the user (host-key approval, …).
@@ -263,6 +263,19 @@ impl GuiAuth {
     }
 }
 
+/// Identifies one SSH connection (a russh client thread). Frames are tagged with it so the client
+/// can route by `(conn, remote_id)` — the daemon's pane ids aren't unique across connections.
+type ConnId = u64;
+
+/// Per-connection client state: how to talk to it, the next daemon pane id to request, and the
+/// map from the daemon's pane ids to local `PaneId`s (they diverge after a reattach).
+struct Connection {
+    host: String,
+    outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
+    next_remote_id: u64,
+    routes: HashMap<u64, PaneId>,
+}
+
 /// A pane's I/O backend: a local PTY, or a pane on a remote `potty-session` reached over the wire
 /// protocol. The renderer and the `Term` grid don't care which — only input and resize differ.
 enum Backend {
@@ -271,6 +284,11 @@ enum Backend {
         master: Box<dyn portable_pty::MasterPty + Send>,
     },
     Remote {
+        /// Which connection this pane belongs to (frames are tagged with it for routing).
+        conn: ConnId,
+        /// The pane's id in the *daemon's* namespace — used on the wire. Differs from the local
+        /// `PaneId` after a reattach, since the daemon owns ids across reconnects.
+        remote_id: u64,
         /// The host this pane lives on — prefixed onto the tab label so remote tabs are
         /// distinguishable even after the remote shell sets its own title.
         host: String,
@@ -1158,6 +1176,10 @@ struct App {
     /// Panes whose backend is a remote session — `reconcile_terms` must not spawn a local PTY for
     /// them, and closing them sends a `Close` frame rather than dropping a PTY.
     remote_panes: std::collections::HashSet<PaneId>,
+    /// Live SSH connections, keyed by `ConnId`. Holds the per-connection id map and counter.
+    connections: HashMap<ConnId, Connection>,
+    /// Allocates `ConnId`s.
+    next_conn_id: ConnId,
     /// Pending auth prompts from remote connections, awaiting the user (host-key approval, …).
     /// Each carries a reply channel back to the blocked connection thread.
     auth_prompts: Vec<AuthPrompt>,
@@ -1217,6 +1239,8 @@ impl App {
             feed_open: false,
             chrome_latched: false,
             remote_panes: std::collections::HashSet::new(),
+            connections: HashMap::new(),
+            next_conn_id: 0,
             auth_prompts: Vec::new(),
             auth_inputs: Vec::new(),
             show_connect: false,
@@ -1453,9 +1477,10 @@ impl App {
             self.terms.keys().copied().filter(|id| !live.contains(id)).collect();
         for id in removed {
             // A remote pane closed via the UI: tell the remote to kill its shell.
-            if let Some(Backend::Remote { outbound, .. }) = self.terms.get(&id).map(|t| &t.backend) {
-                let _ = outbound.try_send(Frame::Control(Control::Close { pane: id }));
+            if let Some(Backend::Remote { outbound, remote_id, .. }) = self.terms.get(&id).map(|t| &t.backend) {
+                let _ = outbound.try_send(Frame::Control(Control::Close { pane: *remote_id }));
             }
+            self.drop_remote_route(id);
             self.terms.remove(&id);
             self.remote_panes.remove(&id);
             self.dirty.remove(&id);
@@ -1469,6 +1494,7 @@ impl App {
     /// Remove a pane (its local shell exited, its remote pane reported `Exited`, or the UI closed
     /// it). Exits the app once no panes remain.
     fn close_pane(&mut self, event_loop: &ActiveEventLoop, id: PaneId) {
+        self.drop_remote_route(id);
         self.terms.remove(&id);
         self.remote_panes.remove(&id);
         self.dirty.remove(&id);
@@ -1487,7 +1513,9 @@ impl App {
     /// success it forwards the remote's frames back to this loop as `UserEvent`s; on failure it
     /// reports `RemoteError`. Per-connection threads mean an auth prompt can block *this*
     /// connection (while the UI keeps rendering the dialog) without stalling anything else.
-    fn connect_remote(&self, cfg: remote::SshConfig, auth: Arc<dyn remote::Authenticator>, command: String) {
+    fn connect_remote(&mut self, cfg: remote::SshConfig, auth: Arc<dyn remote::Authenticator>, command: String) {
+        let conn = self.next_conn_id;
+        self.next_conn_id += 1;
         let proxy = self.proxy.clone();
         thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
@@ -1497,6 +1525,7 @@ impl App {
                 match remote::connect_and_exec(&cfg, auth, &command).await {
                     Ok((session, mut rx)) => {
                         let connected = UserEvent::RemoteConnected {
+                            conn,
                             host: cfg.host.clone(),
                             outbound: session.outbound.clone(),
                         };
@@ -1504,7 +1533,7 @@ impl App {
                             return;
                         }
                         while let Some(frame) = rx.recv().await {
-                            if proxy.send_event(UserEvent::RemoteFrame(frame)).is_err() {
+                            if proxy.send_event(UserEvent::RemoteFrame(conn, frame)).is_err() {
                                 break;
                             }
                         }
@@ -1518,53 +1547,64 @@ impl App {
         });
     }
 
-    /// A remote session connected: greet it, then open a tab with one shell pane backed by it.
-    fn open_remote_pane(&mut self, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
+    /// A connection authenticated: register it and greet the daemon. We then wait for its restore
+    /// burst — `Ready` decides whether to open a fresh pane (see `on_remote_frame`).
+    fn on_remote_connected(&mut self, conn: ConnId, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
         let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
-        self.workspace.new_tab();
-        let id = self.workspace.active_tab().focus;
-        self.create_remote_pane(id, host, outbound);
-        self.request_redraw();
+        self.connections.insert(conn, Connection { host, outbound, next_remote_id: 1, routes: HashMap::new() });
     }
 
-    /// Wire pane `id` to a remote session: a `Term` fed from the wire, input/resize routed to
-    /// `outbound`, and an `Open` sent so the remote spawns its shell.
-    fn create_remote_pane(&mut self, id: PaneId, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
+    /// Wire a local pane `local` to `conn`'s daemon pane `remote_id`. `open` → the daemon doesn't
+    /// have it yet (send `Open`); otherwise we're adopting a restored pane.
+    fn wire_remote_pane(&mut self, conn: ConnId, remote_id: u64, local: PaneId, open: bool) {
+        let (host, outbound) = match self.connections.get_mut(&conn) {
+            Some(c) => {
+                c.routes.insert(remote_id, local);
+                c.next_remote_id = c.next_remote_id.max(remote_id + 1);
+                (c.host.clone(), c.outbound.clone())
+            }
+            None => return,
+        };
         let dims = self.last_dims;
         let term: SharedTerm = Arc::new(Mutex::new(Term::new(
             term_config(&self.config),
             &dims,
-            EventProxy { proxy: self.proxy.clone(), pane: id },
+            EventProxy { proxy: self.proxy.clone(), pane: local },
         )));
         self.terms.insert(
-            id,
+            local,
             Terminal {
                 term,
-                backend: Backend::Remote {
-                    host,
-                    outbound: outbound.clone(),
-                    parser: Processor::new(),
-                },
+                backend: Backend::Remote { conn, remote_id, host, outbound: outbound.clone(), parser: Processor::new() },
                 dims,
                 title: "shell".into(),
                 default_title: "shell".into(),
                 wake_pending: Arc::new(AtomicBool::new(false)),
             },
         );
-        self.remote_panes.insert(id);
-        let _ = outbound.try_send(Frame::Control(Control::Open {
-            pane: id,
-            cols: dims.cols as u16,
-            rows: dims.rows as u16,
-        }));
-        self.dirty.insert(id);
+        self.remote_panes.insert(local);
+        if open {
+            let _ = outbound.try_send(Frame::Control(Control::Open {
+                pane: remote_id,
+                cols: dims.cols as u16,
+                rows: dims.rows as u16,
+            }));
+        }
+        self.dirty.insert(local);
     }
 
-    /// The (host, outbound) of the focused pane, if it's a remote pane — so a split or new tab can
-    /// reuse the same connection.
-    fn focused_remote(&self) -> Option<(String, tokio::sync::mpsc::Sender<Frame>)> {
+    /// Open a new pane on `conn` (allocating a fresh daemon id) at local pane `local`.
+    fn add_remote_pane(&mut self, conn: ConnId, local: PaneId) {
+        let Some(remote_id) = self.connections.get(&conn).map(|c| c.next_remote_id) else {
+            return;
+        };
+        self.wire_remote_pane(conn, remote_id, local, true);
+    }
+
+    /// The connection of the focused pane, if it's remote — so a split or new tab reuses it.
+    fn focused_conn(&self) -> Option<ConnId> {
         match self.terms.get(&self.focus()).map(|t| &t.backend) {
-            Some(Backend::Remote { host, outbound, .. }) => Some((host.clone(), outbound.clone())),
+            Some(Backend::Remote { conn, .. }) => Some(*conn),
             _ => None,
         }
     }
@@ -1572,38 +1612,78 @@ impl App {
     /// Split the focused pane. From a remote pane, the new pane is another shell on the *same*
     /// connection; from a local pane, a normal local split (reconcile spawns its PTY).
     fn split_pane(&mut self, split: Split) {
-        let remote = self.focused_remote();
+        let conn = self.focused_conn();
         self.workspace.split(split);
-        if let Some((host, outbound)) = remote {
+        if let Some(conn) = conn {
             let new_id = self.workspace.active_tab().focus;
-            self.create_remote_pane(new_id, host, outbound);
+            self.add_remote_pane(conn, new_id);
         }
     }
 
     /// New tab. From a remote pane, it's a new tab on the same connection; otherwise a local tab.
     fn new_tab(&mut self) {
-        let remote = self.focused_remote();
+        let conn = self.focused_conn();
         self.workspace.new_tab();
-        if let Some((host, outbound)) = remote {
+        if let Some(conn) = conn {
             let new_id = self.workspace.active_tab().focus;
-            self.create_remote_pane(new_id, host, outbound);
+            self.add_remote_pane(conn, new_id);
         }
     }
 
-    /// Feed a frame from a remote session into the owning pane (output) or handle its lifecycle.
-    fn on_remote_frame(&mut self, event_loop: &ActiveEventLoop, frame: Frame) {
-        match frame {
-            Frame::Data { pane, bytes } => {
-                if let Some(t) = self.terms.get_mut(&pane) {
-                    if let Backend::Remote { parser, .. } = &mut t.backend {
-                        let mut term = t.term.lock().unwrap();
-                        parser.advance(&mut *term, &bytes);
-                    }
-                }
-                self.touch(pane);
+    /// Remove a remote pane's route (and the whole connection once it has no panes left, which
+    /// drops its `outbound` and lets the daemon detach). No-op for local panes.
+    fn drop_remote_route(&mut self, id: PaneId) {
+        let Some(Backend::Remote { conn, remote_id, .. }) = self.terms.get(&id).map(|t| &t.backend) else {
+            return;
+        };
+        let (conn, remote_id) = (*conn, *remote_id);
+        if let Some(c) = self.connections.get_mut(&conn) {
+            c.routes.remove(&remote_id);
+            if c.routes.is_empty() {
+                self.connections.remove(&conn);
             }
-            Frame::Control(Control::Exited { pane }) => self.close_pane(event_loop, pane),
-            // Welcome / Opened: nothing to do yet.
+        }
+    }
+
+    /// Feed a frame from connection `conn` into the owning pane, or handle the reattach handshake.
+    fn on_remote_frame(&mut self, event_loop: &ActiveEventLoop, conn: ConnId, frame: Frame) {
+        match frame {
+            Frame::Data { pane: remote_id, bytes } => {
+                let local = self.connections.get(&conn).and_then(|c| c.routes.get(&remote_id)).copied();
+                if let Some(local) = local {
+                    if let Some(t) = self.terms.get_mut(&local) {
+                        if let Backend::Remote { parser, .. } = &mut t.backend {
+                            let mut term = t.term.lock().unwrap();
+                            parser.advance(&mut *term, &bytes);
+                        }
+                    }
+                    self.touch(local);
+                }
+            }
+            // Adopt an existing daemon pane (its screen replay follows as Data frames).
+            Frame::Control(Control::Restore { pane: remote_id }) => {
+                self.workspace.new_tab();
+                let local = self.workspace.active_tab().focus;
+                self.wire_remote_pane(conn, remote_id, local, false);
+                self.request_redraw();
+            }
+            // Restore burst done: if the daemon had nothing, open a fresh pane.
+            Frame::Control(Control::Ready) => {
+                let empty = self.connections.get(&conn).is_none_or(|c| c.routes.is_empty());
+                if empty {
+                    self.workspace.new_tab();
+                    let local = self.workspace.active_tab().focus;
+                    self.add_remote_pane(conn, local);
+                }
+                self.request_redraw();
+            }
+            Frame::Control(Control::Exited { pane: remote_id }) => {
+                let local = self.connections.get(&conn).and_then(|c| c.routes.get(&remote_id)).copied();
+                if let Some(local) = local {
+                    self.close_pane(event_loop, local);
+                }
+            }
+            // Welcome / Opened: nothing to do.
             Frame::Control(_) => {}
         }
     }
@@ -1660,7 +1740,7 @@ impl App {
 
     /// SPIKE SCAFFOLDING: auto-connect to a host from `$POTTY_TEST_*` env on startup, to exercise
     /// the remote path before the `+`/menu connect flow exists. To be removed once that lands.
-    fn maybe_test_connect(&self) {
+    fn maybe_test_connect(&mut self) {
         let Ok(host) = std::env::var("POTTY_TEST_HOST") else {
             return;
         };
@@ -1732,8 +1812,8 @@ impl App {
                     let _ = writer.write_all(bytes);
                     let _ = writer.flush();
                 }
-                Backend::Remote { outbound, .. } => {
-                    let _ = outbound.try_send(potty::proto::Frame::Data { pane: id, bytes: bytes.to_vec() });
+                Backend::Remote { outbound, remote_id, .. } => {
+                    let _ = outbound.try_send(Frame::Data { pane: *remote_id, bytes: bytes.to_vec() });
                 }
             }
         }
@@ -2124,9 +2204,9 @@ impl App {
                         pixel_height: 0,
                     });
                 }
-                Backend::Remote { outbound, .. } => {
-                    let _ = outbound.try_send(potty::proto::Frame::Control(potty::proto::Control::Resize {
-                        pane: id,
+                Backend::Remote { outbound, remote_id, .. } => {
+                    let _ = outbound.try_send(Frame::Control(Control::Resize {
+                        pane: *remote_id,
                         cols: dims.cols as u16,
                         rows: dims.rows as u16,
                     }));
@@ -2573,9 +2653,9 @@ impl ApplicationHandler<UserEvent> for App {
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_note(note),
             // A remote session connected — give it a tab with one shell pane.
-            UserEvent::RemoteConnected { host, outbound } => self.open_remote_pane(host, outbound),
+            UserEvent::RemoteConnected { conn, host, outbound } => self.on_remote_connected(conn, host, outbound),
             // Output / lifecycle from a remote session.
-            UserEvent::RemoteFrame(frame) => self.on_remote_frame(event_loop, frame),
+            UserEvent::RemoteFrame(conn, frame) => self.on_remote_frame(event_loop, conn, frame),
             UserEvent::RemoteError(msg) => {
                 self.error_msg = Some(msg);
                 self.request_redraw();

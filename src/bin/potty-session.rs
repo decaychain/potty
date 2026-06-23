@@ -27,12 +27,18 @@ use potty::proto::{Control, Frame, PaneId, PROTOCOL_VERSION};
 /// The daemon's socket, remembered so threads can remove it on exit.
 static SOCK: OnceLock<PathBuf> = OnceLock::new();
 
+/// How much recent PTY output to keep per pane for replay on reattach. Enough for the current
+/// screen plus some scrollback; bounded so a chatty pane can't grow without limit.
+const REPLAY_CAP: usize = 256 * 1024;
+
 struct Pane {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     /// Kills the shell on `Close`. The output-reader thread holds a cloned master fd, so just
     /// dropping `master` won't reliably hang the shell up — we signal the process directly.
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Recent raw output (capped at `REPLAY_CAP`), replayed when a client (re)attaches.
+    buffer: Arc<Mutex<Vec<u8>>>,
 }
 
 /// Shared session state. `panes` outlive any single client connection (that's the persistence);
@@ -79,14 +85,26 @@ fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16) {
         Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
     };
 
-    // PTY output → client. Keeps reading (and dropping output) while detached, so the shell never
-    // blocks on a full PTY buffer.
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+
+    // PTY output → the replay buffer and the attached client (if any). Keeps reading (and
+    // buffering) while detached, so the shell never blocks on a full PTY and the screen can be
+    // replayed on reattach.
     let out = session.clone();
+    let out_buf = buffer.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
+            }
+            {
+                let mut b = out_buf.lock().unwrap();
+                b.extend_from_slice(&buf[..n]);
+                if b.len() > REPLAY_CAP {
+                    let excess = b.len() - REPLAY_CAP;
+                    b.drain(..excess);
+                }
             }
             send_frame(&out, Frame::Data { pane, bytes: buf[..n].to_vec() });
         }
@@ -104,7 +122,7 @@ fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16) {
         }
     });
 
-    session.panes.lock().unwrap().insert(pane, Pane { writer, master: pair.master, killer });
+    session.panes.lock().unwrap().insert(pane, Pane { writer, master: pair.master, killer, buffer });
     send_frame(session, Frame::Control(Control::Opened { pane }));
 }
 
@@ -113,10 +131,27 @@ fn serve(session: &Arc<Session>, reader: impl Read) {
     let mut reader = BufReader::new(reader);
     while let Ok(Some(frame)) = Frame::read(&mut reader) {
         match frame {
+            // Attach handshake: greet, replay every existing pane's current screen, then Ready.
             Frame::Control(Control::Hello { .. }) => {
                 send_frame(session, Frame::Control(Control::Welcome { version: PROTOCOL_VERSION }));
+                let restores: Vec<(PaneId, Vec<u8>)> = {
+                    let panes = session.panes.lock().unwrap();
+                    panes.iter().map(|(id, p)| (*id, p.buffer.lock().unwrap().clone())).collect()
+                };
+                for (id, buf) in restores {
+                    send_frame(session, Frame::Control(Control::Restore { pane: id }));
+                    if !buf.is_empty() {
+                        send_frame(session, Frame::Data { pane: id, bytes: buf });
+                    }
+                }
+                send_frame(session, Frame::Control(Control::Ready));
             }
-            Frame::Control(Control::Open { pane, cols, rows }) => open_pane(session, pane, cols, rows),
+            // Ignore an Open for a pane that already exists (e.g. a restored one).
+            Frame::Control(Control::Open { pane, cols, rows }) => {
+                if !session.panes.lock().unwrap().contains_key(&pane) {
+                    open_pane(session, pane, cols, rows);
+                }
+            }
             Frame::Control(Control::Resize { pane, cols, rows }) => {
                 let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
                 if let Some(p) = session.panes.lock().unwrap().get(&pane) {
@@ -201,9 +236,23 @@ fn attach(sock: PathBuf) {
         // The SSH channel closed → exit, dropping the socket so the daemon detaches but lives on.
         std::process::exit(0);
     });
+    // Relay daemon → stdout, flushing every chunk. We can't use `io::copy` into the stdout lock:
+    // it's a LineWriter, and our binary frames rarely contain '\n', so small control frames
+    // (Welcome/Ready) would sit buffered and never reach the client.
     let mut from_daemon = stream;
-    let mut stdout = std::io::stdout().lock();
-    let _ = std::io::copy(&mut from_daemon, &mut stdout);
+    let stdout = std::io::stdout();
+    let mut buf = [0u8; 8192];
+    loop {
+        match from_daemon.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut lock = stdout.lock();
+                if lock.write_all(&buf[..n]).is_err() || lock.flush().is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Daemon role: own the PTYs, serve one attached client at a time, persist across detaches.
