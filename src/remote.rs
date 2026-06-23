@@ -132,18 +132,7 @@ pub async fn connect_and_exec(
     auth: Arc<dyn Authenticator>,
     command: &str,
 ) -> std::io::Result<(RemoteSession, mpsc::Receiver<Frame>)> {
-    let handler = ClientHandler {
-        host: cfg.host.clone(),
-        port: cfg.port,
-        known_hosts: cfg.known_hosts.clone(),
-        auth: auth.clone(),
-    };
-    let config = Arc::new(client::Config::default());
-    let mut session = client::connect(config, (cfg.host.as_str(), cfg.port), handler)
-        .await
-        .map_err(io_err)?;
-
-    authenticate(&mut session, cfg, &auth).await?;
+    let session = authenticate(cfg, &auth).await?;
 
     let channel = session.channel_open_session().await.map_err(io_err)?;
     channel.exec(true, command).await.map_err(io_err)?;
@@ -188,46 +177,71 @@ pub async fn connect_and_exec(
     Ok((RemoteSession { _session: session, outbound: out_tx }, in_rx))
 }
 
-/// Run the auth ladder, returning once a method succeeds.
-async fn authenticate(
-    session: &mut Handle<ClientHandler>,
+/// Open a fresh SSH connection (its own `MaxAuthTries` budget) and verify the host key.
+async fn connect_session(
     cfg: &SshConfig,
     auth: &Arc<dyn Authenticator>,
-) -> std::io::Result<()> {
-    let rsa_hash = session.best_supported_rsa_hash().await.map_err(io_err)?.flatten();
+) -> std::io::Result<Handle<ClientHandler>> {
+    let handler = ClientHandler {
+        host: cfg.host.clone(),
+        port: cfg.port,
+        known_hosts: cfg.known_hosts.clone(),
+        auth: auth.clone(),
+    };
+    let config = Arc::new(client::Config::default());
+    client::connect(config, (cfg.host.as_str(), cfg.port), handler).await.map_err(io_err)
+}
 
-    // 1. ssh-agent.
+/// Authenticate, returning the authenticated session. **Each method group runs on its own fresh
+/// connection** — a server with a low `MaxAuthTries` (e.g. 6) and an agent holding ≥6 keys would
+/// otherwise exhaust the budget on rejected keys and disconnect before the password method is ever
+/// reached. A fresh connection resets that budget, so a working method downstream of a key-heavy
+/// agent is still reachable.
+async fn authenticate(cfg: &SshConfig, auth: &Arc<dyn Authenticator>) -> std::io::Result<Handle<ClientHandler>> {
+    // We connect lazily per group so an early success costs only one connection. The first connect
+    // also records/learns the host key, so later groups don't re-prompt.
+
+    // 1. ssh-agent (may offer many keys — hence its own connection).
     if cfg.use_agent {
         #[cfg(unix)]
         let agent = connect_agent_unix(cfg).await;
         #[cfg(windows)]
         let agent = connect_agent_windows().await;
         if let Some(agent) = agent {
-            match agent_auth(session, &cfg.user, agent, rsa_hash).await {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(Disconnected) => return Err(disconnected_during_auth()),
+            let mut session = connect_session(cfg, auth).await?;
+            let rsa_hash = session.best_supported_rsa_hash().await.map_err(io_err)?.flatten();
+            // Ok(false)/Err both mean "agent didn't get us in" → reconnect for the next group.
+            if let Ok(true) = agent_auth(&mut session, &cfg.user, agent, rsa_hash).await {
+                return Ok(session);
             }
         }
     }
 
     // 2. Key files.
-    for key_path in &cfg.keys {
-        if try_key(session, &cfg.user, key_path, auth, rsa_hash).await {
-            return Ok(());
+    if !cfg.keys.is_empty() {
+        let mut session = connect_session(cfg, auth).await?;
+        let rsa_hash = session.best_supported_rsa_hash().await.map_err(io_err)?.flatten();
+        for key_path in &cfg.keys {
+            if try_key(&mut session, &cfg.user, key_path, auth, rsa_hash).await {
+                return Ok(session);
+            }
         }
     }
 
     // 3. Keyboard-interactive (PAM passwords, OTP, SSSD fallback).
-    if try_keyboard_interactive(session, &cfg.user, auth).await? {
-        return Ok(());
+    {
+        let mut session = connect_session(cfg, auth).await?;
+        if try_keyboard_interactive(&mut session, &cfg.user, auth).await.unwrap_or(false) {
+            return Ok(session);
+        }
     }
 
     // 4. Plain password.
-    if let Some(pw) = auth.password(&cfg.user, &cfg.host)
-        && matches!(session.authenticate_password(&cfg.user, pw).await, Ok(r) if r.success())
-    {
-        return Ok(());
+    if let Some(pw) = auth.password(&cfg.user, &cfg.host) {
+        let mut session = connect_session(cfg, auth).await?;
+        if matches!(session.authenticate_password(&cfg.user, pw).await, Ok(r) if r.success()) {
+            return Ok(session);
+        }
     }
 
     Err(std::io::Error::other("all authentication methods failed"))
@@ -249,16 +263,8 @@ async fn connect_agent_windows() -> Option<AgentClient<russh::keys::agent::clien
 /// The SSH session dropped mid-authentication (the server likely caps attempts).
 struct Disconnected;
 
-/// Build the user-facing error for a mid-auth disconnect.
-fn disconnected_during_auth() -> std::io::Error {
-    std::io::Error::other(
-        "the SSH server closed the connection during authentication — it may limit attempts \
-         (MaxAuthTries). Try `IdentitiesOnly yes` or specifying a single key.",
-    )
-}
-
 /// Try every identity the agent holds, letting the agent do the signing. `Err(Disconnected)` means
-/// the session died (vs `Ok(false)` = all keys rejected) — so the ladder stops hammering a server
+/// the session died (vs `Ok(false)` = all keys rejected) — so the caller stops hammering a server
 /// that caps attempts and reports it clearly instead of failing obscurely later.
 async fn agent_auth<R>(
     session: &mut Handle<ClientHandler>,
