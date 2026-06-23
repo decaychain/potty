@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use potty::proto::{Control, Frame};
+use potty::proto::{Control, Frame, Layout, LayoutNode, LayoutTab};
 
 fn have(bin: &str) -> bool {
     Command::new(bin).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
@@ -156,6 +156,59 @@ fn reattach_restores_and_replays() {
     cleanup(daemon, &sock);
 
     assert!(restored, "reattach did not restore pane 1 with its replayed screen");
+}
+
+#[test]
+fn reattach_replays_layout() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-layout-{tag}.sock"));
+    let daemon = start_daemon(&sock);
+
+    // Client #1: open two panes and push a layout that splits them side by side.
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 1 }));
+    c1.send(Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }));
+    c1.send(Frame::Control(Control::Open { pane: 2, cols: 80, rows: 24 }));
+    assert!(
+        c1.wait(|_, ctrl| ctrl.iter().filter(|m| matches!(m, Control::Opened { .. })).count() >= 2),
+        "panes did not open"
+    );
+    let layout = Layout {
+        tabs: vec![LayoutTab {
+            root: LayoutNode::Split {
+                cols: true,
+                ratio: 0.5,
+                a: Box::new(LayoutNode::Leaf { pane: 1 }),
+                b: Box::new(LayoutNode::Leaf { pane: 2 }),
+            },
+            focus: Some(1),
+        }],
+    };
+    let json = serde_json::to_string(&layout).unwrap();
+    c1.send(Frame::Control(Control::LayoutTree { json }));
+    std::thread::sleep(Duration::from_millis(200)); // let the daemon store it
+    c1.disconnect();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Client #2: reattach. The daemon should replay our layout verbatim.
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 1 }));
+    let got_layout = c2.wait(|_, ctrl| {
+        ctrl.iter().any(|m| matches!(m, Control::LayoutTree { .. }))
+            && ctrl.iter().any(|m| matches!(m, Control::Ready))
+    });
+    let replayed = {
+        let g = c2.collected.lock().unwrap();
+        g.1.iter().find_map(|m| match m {
+            Control::LayoutTree { json } => serde_json::from_str::<Layout>(json).ok(),
+            _ => None,
+        })
+    };
+    c2.disconnect();
+    cleanup(daemon, &sock);
+
+    assert!(got_layout, "reattach did not replay a layout + Ready");
+    assert_eq!(replayed, Some(layout), "replayed layout did not match what was pushed");
 }
 
 /// Kill the daemon and remove its socket.

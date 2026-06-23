@@ -274,6 +274,15 @@ struct Connection {
     outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
     next_remote_id: u64,
     routes: HashMap<u64, PaneId>,
+    /// True once the attach handshake finished (`Ready` seen). We only push layout updates after
+    /// this, so a mid-handshake push can't clobber the daemon's stored layout we're restoring from.
+    ready: bool,
+    /// Panes adopted during the restore burst (remote_id, local), placed into tabs at `Ready`.
+    restore_panes: Vec<(u64, PaneId)>,
+    /// The daemon's replayed layout, applied at `Ready`.
+    restore_layout: Option<proto::Layout>,
+    /// Last layout JSON pushed to the daemon, to avoid redundant sends.
+    pushed_layout: Option<String>,
 }
 
 /// A pane's I/O backend: a local PTY, or a pane on a remote `potty-session` reached over the wire
@@ -1551,7 +1560,19 @@ impl App {
     /// burst — `Ready` decides whether to open a fresh pane (see `on_remote_frame`).
     fn on_remote_connected(&mut self, conn: ConnId, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
         let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
-        self.connections.insert(conn, Connection { host, outbound, next_remote_id: 1, routes: HashMap::new() });
+        self.connections.insert(
+            conn,
+            Connection {
+                host,
+                outbound,
+                next_remote_id: 1,
+                routes: HashMap::new(),
+                ready: false,
+                restore_panes: Vec::new(),
+                restore_layout: None,
+                pushed_layout: None,
+            },
+        );
     }
 
     /// Wire a local pane `local` to `conn`'s daemon pane `remote_id`. `open` → the daemon doesn't
@@ -1660,20 +1681,28 @@ impl App {
                     self.touch(local);
                 }
             }
-            // Adopt an existing daemon pane (its screen replay follows as Data frames).
+            // Adopt an existing daemon pane (its screen replay follows as Data frames). We create
+            // its backend now but defer tab placement to `Ready`, where the layout is applied.
             Frame::Control(Control::Restore { pane: remote_id }) => {
-                self.workspace.new_tab();
-                let local = self.workspace.active_tab().focus;
+                let local = self.workspace.alloc_pane();
                 self.wire_remote_pane(conn, remote_id, local, false);
-                self.request_redraw();
+                if let Some(c) = self.connections.get_mut(&conn) {
+                    c.restore_panes.push((remote_id, local));
+                }
             }
-            // Restore burst done: if the daemon had nothing, open a fresh pane.
+            // The daemon's replayed layout — stash it; applied at `Ready`.
+            Frame::Control(Control::LayoutTree { json }) => {
+                if let Ok(layout) = serde_json::from_str::<proto::Layout>(&json) {
+                    if let Some(c) = self.connections.get_mut(&conn) {
+                        c.restore_layout = Some(layout);
+                    }
+                }
+            }
+            // Restore burst done: place the restored panes (by layout), or open a fresh pane.
             Frame::Control(Control::Ready) => {
-                let empty = self.connections.get(&conn).is_none_or(|c| c.routes.is_empty());
-                if empty {
-                    self.workspace.new_tab();
-                    let local = self.workspace.active_tab().focus;
-                    self.add_remote_pane(conn, local);
+                self.finish_restore(conn);
+                if let Some(c) = self.connections.get_mut(&conn) {
+                    c.ready = true;
                 }
                 self.request_redraw();
             }
@@ -1685,6 +1714,133 @@ impl App {
             }
             // Welcome / Opened: nothing to do.
             Frame::Control(_) => {}
+        }
+    }
+
+    /// Place the panes adopted during the restore burst into tabs: rebuild the original tree from
+    /// the replayed layout, then give any leftover (un-laid-out) pane its own tab. A fresh session
+    /// (no panes) just opens one pane.
+    fn finish_restore(&mut self, conn: ConnId) {
+        let (panes, layout) = match self.connections.get_mut(&conn) {
+            Some(c) => (std::mem::take(&mut c.restore_panes), c.restore_layout.take()),
+            None => return,
+        };
+        if panes.is_empty() {
+            self.workspace.new_tab();
+            let local = self.workspace.active_tab().focus;
+            self.add_remote_pane(conn, local);
+            return;
+        }
+        let host = self.connections.get(&conn).map(|c| c.host.clone()).unwrap_or_default();
+        let map: HashMap<u64, PaneId> = panes.iter().copied().collect();
+        let mut placed: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+        if let Some(layout) = layout {
+            for ltab in &layout.tabs {
+                if let Some(node) = self.build_node(&ltab.root, &map, &mut placed) {
+                    let focus =
+                        ltab.focus.and_then(|r| map.get(&r).copied()).unwrap_or_else(|| node.first_leaf());
+                    self.workspace.push_tab(host.clone(), node, focus);
+                }
+            }
+        }
+        // Any restored pane the layout didn't cover (stale/missing layout) → its own tab.
+        for (_remote, local) in &panes {
+            if !placed.contains(local) {
+                self.workspace.push_tab(host.clone(), workspace::Node::Leaf(*local), *local);
+            }
+        }
+    }
+
+    /// Rebuild a workspace `Node` from a replayed layout node, mapping daemon pane ids to the local
+    /// ids created during restore. Missing leaves (a pane that died while detached) collapse to
+    /// their surviving sibling. Records which locals it placed.
+    fn build_node(
+        &mut self,
+        ln: &proto::LayoutNode,
+        map: &HashMap<u64, PaneId>,
+        placed: &mut std::collections::HashSet<PaneId>,
+    ) -> Option<workspace::Node> {
+        match ln {
+            proto::LayoutNode::Leaf { pane } => map.get(pane).map(|&local| {
+                placed.insert(local);
+                workspace::Node::Leaf(local)
+            }),
+            proto::LayoutNode::Split { cols, ratio, a, b } => {
+                let a = self.build_node(a, map, placed);
+                let b = self.build_node(b, map, placed);
+                match (a, b) {
+                    (Some(a), Some(b)) => Some(workspace::Node::Branch {
+                        id: self.workspace.alloc_pane(),
+                        split: if *cols { Split::Cols } else { Split::Rows },
+                        ratio: *ratio,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                    }),
+                    (Some(n), None) | (None, Some(n)) => Some(n), // collapse to the survivor
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+
+    /// Push each ready connection's current tab/pane tree to its daemon, so a reattach can restore
+    /// it. Deduplicated against the last push. Called after structural changes (see the redraw).
+    fn sync_layouts(&mut self) {
+        let conns: Vec<ConnId> = self.connections.keys().copied().collect();
+        for conn in conns {
+            if !self.connections.get(&conn).is_some_and(|c| c.ready) {
+                continue; // don't clobber the stored layout mid-restore
+            }
+            let json = serde_json::to_string(&self.layout_for(conn)).unwrap_or_default();
+            if let Some(c) = self.connections.get_mut(&conn) {
+                if c.pushed_layout.as_deref() != Some(json.as_str()) {
+                    c.pushed_layout = Some(json.clone());
+                    let _ = c.outbound.try_send(Frame::Control(Control::LayoutTree { json }));
+                }
+            }
+        }
+    }
+
+    /// The serializable layout of `conn`'s tabs (those whose panes are remote on this connection).
+    fn layout_for(&self, conn: ConnId) -> proto::Layout {
+        let mut tabs = Vec::new();
+        for tab in &self.workspace.tabs {
+            // A tab belongs to `conn` if its first leaf is a remote pane on it (all panes in a tab
+            // share a connection).
+            let on_conn = matches!(
+                self.terms.get(&tab.layout.first_leaf()).map(|t| &t.backend),
+                Some(Backend::Remote { conn: c, .. }) if *c == conn
+            );
+            if !on_conn {
+                continue;
+            }
+            if let Some(root) = self.node_to_layout(&tab.layout) {
+                let focus = self.remote_id_of(tab.focus);
+                tabs.push(proto::LayoutTab { root, focus });
+            }
+        }
+        proto::Layout { tabs }
+    }
+
+    /// Convert a workspace `Node` (local pane ids) into a layout node (daemon pane ids). `None` if a
+    /// leaf isn't a remote pane (shouldn't happen within a remote tab).
+    fn node_to_layout(&self, node: &workspace::Node) -> Option<proto::LayoutNode> {
+        match node {
+            workspace::Node::Leaf(local) => self.remote_id_of(*local).map(|pane| proto::LayoutNode::Leaf { pane }),
+            workspace::Node::Branch { split, ratio, a, b, .. } => Some(proto::LayoutNode::Split {
+                cols: matches!(split, Split::Cols),
+                ratio: *ratio,
+                a: Box::new(self.node_to_layout(a)?),
+                b: Box::new(self.node_to_layout(b)?),
+            }),
+        }
+    }
+
+    /// The daemon pane id a local pane maps to, if it's remote.
+    fn remote_id_of(&self, local: PaneId) -> Option<u64> {
+        match self.terms.get(&local).map(|t| &t.backend) {
+            Some(Backend::Remote { remote_id, .. }) => Some(*remote_id),
+            _ => None,
         }
     }
 
@@ -2367,6 +2523,8 @@ impl App {
         // rects reflect the pre-action layout for this frame; egui requests a repaint after the
         // interaction, so the new layout lands next frame.)
         self.reconcile_terms();
+        // Push any changed remote layout to its daemon, so a reattach can restore the tree.
+        self.sync_layouts();
 
         let egui::FullOutput {
             platform_output,

@@ -143,7 +143,13 @@ attention-feed passthrough are added once the spike proves the round trip and fe
      daemon idle-exits when it has no panes and no client. `POTTY_SESSION_NODAEMON=1` keeps the
      old inline mode for the transport tests. Verified: a shell's process survives the client
      disconnecting (`tests/remote_persist.rs`).
-   - *Step 4b (next):* reattach — on a new client, the daemon announces its existing panes and
-     replays each one's current screen so the client repaints; the client adopts them (needs a
-     pane-id mapping, since the daemon now owns ids across reconnects).
+   - *Step 4b (done):* reattach — on a new client's Hello the daemon replays `Restore{pane}` + the
+     buffered screen + `Ready`; the client adopts each pane, keyed by `(ConnId, remote_id)`.
+   - *Step 4c (done):* layout persistence. The client serializes its tab/pane tree (a `proto::Layout`
+     with daemon pane ids at the leaves) and pushes it to the daemon (`LayoutTree`) whenever it
+     changes, after the handshake (`ready` gate avoids clobbering mid-restore). The daemon stores it
+     opaquely and replays it before `Ready`; the client rebuilds the original tabs/splits instead of
+     one-tab-per-pane. A pane that died while detached collapses to its surviving split sibling;
+     panes the layout doesn't cover fall back to their own tab. Verified: the pushed split layout
+     round-trips verbatim through disconnect/reattach (`tests/remote_persist.rs`).
 5. **Later:** auto-reattach, bootstrapping, ProxyJump, agent forwarding, Windows `potty attach` IPC.

@@ -150,7 +150,7 @@ impl Node {
         }
     }
 
-    fn first_leaf(&self) -> PaneId {
+    pub fn first_leaf(&self) -> PaneId {
         match self {
             Node::Leaf(id) => *id,
             Node::Branch { a, .. } => a.first_leaf(),
@@ -205,6 +205,18 @@ impl Workspace {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// Allocate a fresh pane/branch id from the shared id space. Used when rebuilding a restored
+    /// remote layout, where the leaves are wired up before the tab is placed.
+    pub fn alloc_pane(&mut self) -> PaneId {
+        self.alloc()
+    }
+
+    /// Append a tab with a prebuilt layout (a restored remote tree) and make it active.
+    pub fn push_tab(&mut self, title: String, layout: Node, focus: PaneId) {
+        self.tabs.push(Tab { title, layout, focus });
+        self.active = self.tabs.len() - 1;
     }
 
     pub fn active_tab(&self) -> &Tab {

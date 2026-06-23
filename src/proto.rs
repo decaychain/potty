@@ -49,6 +49,35 @@ pub enum Control {
     /// S→C (on attach): the end of the restore burst. If nothing was restored, the client opens a
     /// fresh pane; otherwise it has adopted the daemon's panes.
     Ready,
+    /// The client's tab/pane tree for this session, so the daemon can replay it on reattach.
+    /// C→S whenever the layout changes; S→C once during the attach restore burst (before `Ready`).
+    /// Carries the tree as JSON (`Layout`) — the daemon stores it opaquely.
+    LayoutTree { json: String },
+}
+
+/// A serializable snapshot of the client's tab/pane tree for one session, with daemon pane ids at
+/// the leaves. The daemon stores it opaquely and replays it on reattach so the client can rebuild
+/// the original splits/tabs rather than one-tab-per-pane.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Layout {
+    pub tabs: Vec<LayoutTab>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LayoutTab {
+    pub root: LayoutNode,
+    /// The focused pane's daemon id, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<PaneId>,
+}
+
+/// A node in the layout tree: a pane leaf (by daemon pane id) or a split of two children.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "k", rename_all = "lowercase")]
+pub enum LayoutNode {
+    Leaf { pane: PaneId },
+    /// `cols` = side-by-side (vertical divider); otherwise stacked. `ratio` is the first child's share.
+    Split { cols: bool, ratio: f32, a: Box<LayoutNode>, b: Box<LayoutNode> },
 }
 
 /// A decoded frame.

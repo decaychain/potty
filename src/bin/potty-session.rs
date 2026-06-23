@@ -46,6 +46,8 @@ struct Pane {
 struct Session {
     panes: Mutex<HashMap<PaneId, Pane>>,
     client: Mutex<Option<Box<dyn Write + Send>>>,
+    /// The client's last-pushed tab/pane tree (opaque JSON), replayed on reattach.
+    layout: Mutex<Option<String>>,
 }
 
 fn shell() -> String {
@@ -144,7 +146,15 @@ fn serve(session: &Arc<Session>, reader: impl Read) {
                         send_frame(session, Frame::Data { pane: id, bytes: buf });
                     }
                 }
+                // Replay the stored tab/pane tree (if any) so the client rebuilds the layout.
+                if let Some(json) = session.layout.lock().unwrap().clone() {
+                    send_frame(session, Frame::Control(Control::LayoutTree { json }));
+                }
                 send_frame(session, Frame::Control(Control::Ready));
+            }
+            // The client pushed its current layout — store it for the next reattach.
+            Frame::Control(Control::LayoutTree { json }) => {
+                *session.layout.lock().unwrap() = Some(json);
             }
             // Ignore an Open for a pane that already exists (e.g. a restored one).
             Frame::Control(Control::Open { pane, cols, rows }) => {
@@ -265,6 +275,7 @@ fn run_daemon(sock: PathBuf) {
     let session = Arc::new(Session {
         panes: Mutex::new(HashMap::new()),
         client: Mutex::new(None),
+        layout: Mutex::new(None),
     });
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -284,6 +295,7 @@ fn run_inline() {
     let session = Arc::new(Session {
         panes: Mutex::new(HashMap::new()),
         client: Mutex::new(Some(Box::new(std::io::stdout()))),
+        layout: Mutex::new(None),
     });
     serve(&session, std::io::stdin().lock());
 }
