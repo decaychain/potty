@@ -1532,12 +1532,12 @@ impl App {
             };
             rt.block_on(async move {
                 match remote::connect_and_exec(&cfg, auth, &command).await {
-                    Ok((session, mut rx)) => {
-                        let connected = UserEvent::RemoteConnected {
-                            conn,
-                            host: cfg.host.clone(),
-                            outbound: session.outbound.clone(),
-                        };
+                    Ok((session, outbound, mut rx)) => {
+                        // Hand the sole outbound `Sender` to the UI thread. Once it (and the per-pane
+                        // clones) drop — the connection's last pane closed — the writer signals EOF
+                        // and the remote tears down; this loop then ends as the channel closes.
+                        let connected =
+                            UserEvent::RemoteConnected { conn, host: cfg.host.clone(), outbound };
                         if proxy.send_event(connected).is_err() {
                             return;
                         }

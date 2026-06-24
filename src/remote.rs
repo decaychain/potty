@@ -77,11 +77,13 @@ pub struct SshConfig {
     pub agent_sock: Option<PathBuf>,
 }
 
-/// A live remote session. Send frames on `outbound`; receive the remote's frames from the channel
-/// returned by [`connect_and_exec`]. Keep this alive — dropping it tears the SSH session down.
+/// A live remote session — just the SSH handle. Keep it alive while the session is in use; dropping
+/// it tears the SSH session down. The outbound `Sender` and inbound `Receiver` are returned
+/// alongside it by [`connect_and_exec`]; when every clone of the outbound `Sender` drops, the
+/// writer signals channel EOF (so the remote relay exits and the daemon detaches) — that's how the
+/// client closes a connection after its last pane goes away.
 pub struct RemoteSession {
     _session: Handle<ClientHandler>,
-    pub outbound: mpsc::Sender<Frame>,
 }
 
 fn io_err(e: impl std::fmt::Display) -> std::io::Error {
@@ -126,12 +128,14 @@ impl client::Handler for ClientHandler {
 }
 
 /// Connect, authenticate, exec `command` (e.g. `"potty-session"`), and bridge its stdio to wire
-/// frames. Returns the session and a receiver of frames the remote sends.
+/// frames. Returns the session handle, an outbound `Sender` (frames to the remote), and a
+/// `Receiver` of frames the remote sends. Closing the connection is done by dropping every clone of
+/// the outbound `Sender`: the writer then signals channel EOF and the remote side tears down.
 pub async fn connect_and_exec(
     cfg: &SshConfig,
     auth: Arc<dyn Authenticator>,
     command: &str,
-) -> std::io::Result<(RemoteSession, mpsc::Receiver<Frame>)> {
+) -> std::io::Result<(RemoteSession, mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
     let session = authenticate(cfg, &auth).await?;
 
     let channel = session.channel_open_session().await.map_err(io_err)?;
@@ -164,17 +168,22 @@ pub async fn connect_and_exec(
         }
     });
 
-    // Writer: encode outbound frames onto the channel.
+    // Writer: encode outbound frames onto the channel. When every outbound `Sender` has dropped
+    // (the client closed this connection — e.g. its last pane went away), `recv` returns `None`; we
+    // then signal EOF so the remote relay's stdin closes, it exits, and the daemon detaches (and
+    // idle-exits if nothing's left). This happens *after* any queued frames (like `Close`) are sent,
+    // so the daemon still processes them first.
     tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             let mut bytes = Vec::new();
             if frame.write(&mut bytes).is_err() || write_half.data(&bytes[..]).await.is_err() {
-                break;
+                return;
             }
         }
+        let _ = write_half.eof().await;
     });
 
-    Ok((RemoteSession { _session: session, outbound: out_tx }, in_rx))
+    Ok((RemoteSession { _session: session }, out_tx, in_rx))
 }
 
 /// Open a fresh SSH connection (its own `MaxAuthTries` budget) and verify the host key.

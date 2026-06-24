@@ -211,6 +211,37 @@ fn reattach_replays_layout() {
     assert_eq!(replayed, Some(layout), "replayed layout did not match what was pushed");
 }
 
+#[test]
+fn daemon_exits_after_last_pane_closed() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-close-{tag}.sock"));
+    let mut daemon = start_daemon(&sock);
+
+    // Open a pane, then close it and disconnect — exactly the wire sequence the client emits when
+    // its last remote pane goes away (Close flushed, then channel EOF). The daemon has nothing left
+    // to persist and no client, so it must idle-exit (else it lingers and blocks the next connect).
+    let mut c = Client::connect(&sock);
+    c.send(Frame::Control(Control::Hello { version: 1 }));
+    c.send(Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }));
+    assert!(
+        c.wait(|_, ctrl| ctrl.iter().any(|m| matches!(m, Control::Opened { pane: 1 }))),
+        "pane did not open"
+    );
+    c.send(Frame::Control(Control::Close { pane: 1 }));
+    std::thread::sleep(Duration::from_millis(200)); // let the daemon process Close before EOF
+    c.disconnect();
+
+    let exited = wait_until(Duration::from_secs(5), || {
+        matches!(daemon.try_wait(), Ok(Some(_)))
+    });
+    if !exited {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    let _ = std::fs::remove_file(&sock);
+    assert!(exited, "daemon did not exit after its last pane closed and the client left");
+}
+
 /// Kill the daemon and remove its socket.
 fn cleanup(mut daemon: Child, sock: &Path) {
     let _ = daemon.kill();

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use potty::proto::{Control, Frame};
 use potty::remote::{connect_and_exec, Authenticator, HostKeyStatus, RemoteSession, SshConfig};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 fn which(candidates: &[&str]) -> Option<PathBuf> {
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
@@ -136,15 +136,17 @@ fn config(sshd: &Sshd, user: &str, keys: Vec<PathBuf>, use_agent: bool, agent_so
     }
 }
 
-/// Open a pane, run a marker echo in it, and assert the output round-trips back as frames.
-async fn assert_echo_round_trip(session: RemoteSession, mut rx: Receiver<Frame>) {
+/// Open a pane, run a marker echo in it, and assert the output round-trips back as frames. `session`
+/// is kept alive (it owns the SSH handle) for the duration.
+async fn assert_echo_round_trip(session: RemoteSession, outbound: Sender<Frame>, mut rx: Receiver<Frame>) {
     for f in [
         Frame::Control(Control::Hello { version: 1 }),
         Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }),
         Frame::Data { pane: 1, bytes: b"echo SSH_ROUNDTRIP_OK\r".to_vec() },
     ] {
-        session.outbound.send(f).await.expect("send frame");
+        outbound.send(f).await.expect("send frame");
     }
+    let _keep = session;
 
     let mut out = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -171,11 +173,11 @@ async fn publickey_round_trip_to_potty_session() {
     let Some(user) = user() else { return };
 
     let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
-    let (session, rx) =
+    let (session, outbound, rx) =
         connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &session_cmd())
             .await
             .expect("connect/auth/exec over ssh");
-    assert_echo_round_trip(session, rx).await;
+    assert_echo_round_trip(session, outbound, rx).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -236,10 +238,10 @@ async fn agent_auth_round_trip() {
 
     // Authenticate via the agent only — no key files.
     let cfg = config(&sshd, &user, vec![], true, Some(sock));
-    let (session, rx) =
+    let (session, outbound, rx) =
         connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &session_cmd())
             .await
             .expect("agent auth over ssh");
-    assert_echo_round_trip(session, rx).await;
+    assert_echo_round_trip(session, outbound, rx).await;
     // `_guard` keeps the agent process alive until here.
 }

@@ -145,6 +145,14 @@ attention-feed passthrough are added once the spike proves the round trip and fe
      disconnecting (`tests/remote_persist.rs`).
    - *Step 4b (done):* reattach — on a new client's Hello the daemon replays `Restore{pane}` + the
      buffered screen + `Ready`; the client adopts each pane, keyed by `(ConnId, remote_id)`.
+   - *Step 4b-fix (done):* connection teardown. Closing the last remote pane now actually closes the
+     SSH connection. `connect_and_exec` hands the sole outbound `Sender` to the UI; when it and the
+     per-pane clones all drop (last pane gone), the writer flushes any queued `Close` then signals
+     channel **EOF**, so the remote relay exits and the daemon — now with no panes and no client —
+     idle-exits. Previously the connection thread blocked forever, leaving the daemon attached: it
+     never exited *and*, being single-client, it blocked the next connect (which "did nothing").
+     Tested: the daemon idle-exits given the `Close`-then-EOF the client now emits
+     (`tests/remote_persist.rs::daemon_exits_after_last_pane_closed`).
    - *Step 4c (done):* layout persistence. The client serializes its tab/pane tree (a `proto::Layout`
      with daemon pane ids at the leaves) and pushes it to the daemon (`LayoutTree`) whenever it
      changes, after the handshake (`ready` gate avoids clobbering mid-restore). The daemon stores it
