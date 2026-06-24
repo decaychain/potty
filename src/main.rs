@@ -420,6 +420,35 @@ fn apply(ws: &mut Workspace, action: Action) {
     }
 }
 
+/// The xterm modifier parameter for a key event: `1 + Shift(1) + Alt(2) + Ctrl(4)`. `1` means no
+/// modifiers; anything `> 1` selects the modified key-encoding form.
+fn xterm_modifier(shift: bool, alt: bool, ctrl: bool) -> u8 {
+    1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl)
+}
+
+/// Encode a cursor key (`final_byte` = `A`/`B`/`C`/`D`/`H`/`F`). With a modifier held, xterm always
+/// uses the CSI form `ESC [ 1 ; <mod> <final>` regardless of DECCKM; unmodified it honours
+/// application-cursor mode (`ESC O <final>` vs `ESC [ <final>`).
+fn cursor_key(final_byte: u8, modifier: u8, app_cursor: bool) -> Vec<u8> {
+    if modifier > 1 {
+        format!("\x1b[1;{modifier}{}", final_byte as char).into_bytes()
+    } else if app_cursor {
+        vec![0x1b, b'O', final_byte]
+    } else {
+        vec![0x1b, b'[', final_byte]
+    }
+}
+
+/// Encode a CSI-tilde editing key (`ESC [ <code> ~`, or `ESC [ <code> ; <mod> ~` when modified) —
+/// Insert/Delete/PageUp/PageDown.
+fn csi_tilde(code: u8, modifier: u8) -> Vec<u8> {
+    if modifier > 1 {
+        format!("\x1b[{code};{modifier}~").into_bytes()
+    } else {
+        format!("\x1b[{code}~").into_bytes()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // egui chrome
 // ---------------------------------------------------------------------------
@@ -2301,6 +2330,10 @@ impl App {
         // (`@ { [ ] } \\ | ~ €` on the German layout) out of the Ctrl-shortcut / control-code path.
         let ctrl = self.mods.state().control_key() && !self.mods.state().alt_key();
         let shift = self.mods.state().shift_key();
+        let alt = self.mods.state().alt_key();
+        // xterm modifier for cursor/editing keys, so e.g. Ctrl-Left sends `ESC [ 1 ; 5 D` (word
+        // motion) rather than a bare arrow indistinguishable from an unmodified press.
+        let modifier = xterm_modifier(shift, alt, ctrl);
 
         // Shift+nav scrolls the focused pane's history viewport (and is not sent to the PTY).
         if shift {
@@ -2337,9 +2370,10 @@ impl App {
             Key::Named(NamedKey::Insert) if shift => return self.paste(),
             _ => {}
         }
-        // Cursor keys: `ESC O x` in application mode, else `ESC [ x`. mc (ncurses) relies on
-        // this; vim is lenient and accepts CSI either way — which is why it "worked".
-        let cur = |b: u8| -> Vec<u8> { vec![0x1b, if self.app_cursor(focus) { b'O' } else { b'[' }, b] };
+        // Cursor keys: `ESC O x` in application mode, else `ESC [ x`; with a modifier held, the CSI
+        // `ESC [ 1 ; mod x` form. mc (ncurses) relies on the app-mode form; vim is lenient and
+        // accepts CSI either way — which is why unmodified arrows "worked".
+        let cur = |b: u8| cursor_key(b, modifier, self.app_cursor(focus));
 
         let mut out: Vec<u8> = Vec::new();
         match &ev.logical_key {
@@ -2356,11 +2390,11 @@ impl App {
             Key::Named(NamedKey::Home) => out = cur(b'H'),
             Key::Named(NamedKey::End) => out = cur(b'F'),
 
-            // Editing/paging keys (CSI ~ form, independent of DECCKM).
-            Key::Named(NamedKey::Insert) => out.extend_from_slice(b"\x1b[2~"),
-            Key::Named(NamedKey::Delete) => out.extend_from_slice(b"\x1b[3~"),
-            Key::Named(NamedKey::PageUp) => out.extend_from_slice(b"\x1b[5~"),
-            Key::Named(NamedKey::PageDown) => out.extend_from_slice(b"\x1b[6~"),
+            // Editing/paging keys (CSI ~ form, independent of DECCKM; modifier as `code ; mod ~`).
+            Key::Named(NamedKey::Insert) => out = csi_tilde(2, modifier),
+            Key::Named(NamedKey::Delete) => out = csi_tilde(3, modifier),
+            Key::Named(NamedKey::PageUp) => out = csi_tilde(5, modifier),
+            Key::Named(NamedKey::PageDown) => out = csi_tilde(6, modifier),
 
             // Function keys (xterm encoding, matching xterm-256color terminfo).
             Key::Named(NamedKey::F1) => out.extend_from_slice(b"\x1bOP"),
@@ -3089,4 +3123,41 @@ fn main() {
     spawn_notify_listener(proxy.clone());
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{csi_tilde, cursor_key, xterm_modifier};
+
+    #[test]
+    fn modifier_parameter() {
+        assert_eq!(xterm_modifier(false, false, false), 1); // none
+        assert_eq!(xterm_modifier(true, false, false), 2); // shift
+        assert_eq!(xterm_modifier(false, true, false), 3); // alt
+        assert_eq!(xterm_modifier(false, false, true), 5); // ctrl
+        assert_eq!(xterm_modifier(true, false, true), 6); // ctrl+shift
+        assert_eq!(xterm_modifier(true, true, true), 8); // all
+    }
+
+    #[test]
+    fn unmodified_cursor_keys_honour_app_mode() {
+        assert_eq!(cursor_key(b'A', 1, false), b"\x1b[A"); // normal
+        assert_eq!(cursor_key(b'A', 1, true), b"\x1bOA"); // application-cursor mode
+        assert_eq!(cursor_key(b'D', 1, false), b"\x1b[D");
+    }
+
+    #[test]
+    fn modified_cursor_keys_use_csi_regardless_of_app_mode() {
+        assert_eq!(cursor_key(b'D', 5, false), b"\x1b[1;5D"); // Ctrl-Left = word left
+        assert_eq!(cursor_key(b'C', 5, true), b"\x1b[1;5C"); // app mode ignored when modified
+        assert_eq!(cursor_key(b'A', 2, false), b"\x1b[1;2A"); // Shift-Up
+        assert_eq!(cursor_key(b'F', 3, false), b"\x1b[1;3F"); // Alt-End
+    }
+
+    #[test]
+    fn editing_keys_tilde_form() {
+        assert_eq!(csi_tilde(3, 1), b"\x1b[3~"); // Delete
+        assert_eq!(csi_tilde(3, 5), b"\x1b[3;5~"); // Ctrl-Delete
+        assert_eq!(csi_tilde(5, 6), b"\x1b[5;6~"); // Ctrl-Shift-PageUp
+    }
 }
