@@ -353,6 +353,9 @@ enum Action {
     Connect(String),
     /// Dismiss the connection-error dialog.
     DismissError,
+    /// Detach the focused pane's remote session: drop its local tabs/panes and disconnect, but
+    /// leave the daemon's shells running so it can be reattached later.
+    DetachSession,
 }
 
 /// Display data for the active auth prompt, handed to the chrome (the reply channel stays in
@@ -412,7 +415,8 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::OpenConnect
         | Action::CloseConnect
         | Action::Connect(_)
-        | Action::DismissError => {}
+        | Action::DismissError
+        | Action::DetachSession => {}
     }
 }
 
@@ -500,7 +504,7 @@ fn human_age(d: Duration) -> String {
 ///
 /// NOTE: egui 0.34 is mid-migration to `ui.close`; `ui.close_menu` is deprecated-but-working.
 #[allow(deprecated)]
-fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<PaneId>) {
+fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<PaneId>, is_remote: bool) {
     let focus = |actions: &mut Vec<Action>| {
         if let Some(id) = for_pane {
             actions.push(Action::Focus(id));
@@ -528,6 +532,17 @@ fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<Pane
     }
     if ui.button("Connect to host…").clicked() {
         actions.push(Action::OpenConnect);
+        ui.close_menu();
+    }
+    // Only meaningful on a remote pane: leave the session running on the host and disconnect.
+    if is_remote
+        && ui
+            .button("Detach session")
+            .on_hover_text("Disconnect but keep the remote shells running, to reattach later")
+            .clicked()
+    {
+        focus(actions);
+        actions.push(Action::DetachSession);
         ui.close_menu();
     }
     ui.separator();
@@ -600,6 +615,7 @@ fn build_ui(
     show_connect: bool,
     connect_host: &mut String,
     error: Option<&str>,
+    remote_panes: &std::collections::HashSet<PaneId>,
 ) {
     // The tab bar earns its space with more than one tab, or once the attention feed has latched
     // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
@@ -626,7 +642,8 @@ fn build_ui(
                     actions.push(Action::NewTab);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("☰", |ui| full_menu(ui, actions, None));
+                    let focus_remote = remote_panes.contains(&ws.active_tab().focus);
+                    ui.menu_button("☰", |ui| full_menu(ui, actions, None, focus_remote));
                     // Attention-feed bell — present once the feed has latched the bar on. Shows
                     // the waiting count; toggles the overlay.
                     if chrome_latched {
@@ -678,7 +695,7 @@ fn build_ui(
             let single = rects.len() == 1;
             for (id, rect) in rects {
                 ui.interact(rect, egui::Id::new(("pane", ws.active, id)), egui::Sense::click())
-                    .context_menu(|ui| full_menu(ui, actions, Some(id)));
+                    .context_menu(|ui| full_menu(ui, actions, Some(id), remote_panes.contains(&id)));
                 if single {
                     leaves.push((id, rect));
                     continue;
@@ -1516,6 +1533,41 @@ impl App {
         } else {
             self.request_redraw();
         }
+    }
+
+    /// Detach the focused pane's remote session, if it is one: drop its tabs/panes locally and
+    /// disconnect, but leave the daemon's shells running so the session can be reattached later.
+    fn detach_focused_session(&mut self) {
+        let focus = self.workspace.active_tab().focus;
+        if let Some(Backend::Remote { conn, .. }) = self.terms.get(&focus).map(|t| &t.backend) {
+            let conn = *conn;
+            self.detach_connection(conn);
+        }
+    }
+
+    /// Tear down connection `conn` locally *without* killing its remote shells. Unlike closing
+    /// panes, we remove each pane's `Terminal` directly (so `reconcile_terms` sends no `Close`) and
+    /// drop the `Connection`. With every outbound `Sender` gone, the writer signals channel EOF and
+    /// the daemon detaches with its panes intact — ready to reattach. Keeps potty alive with a
+    /// fresh local tab if this emptied the workspace.
+    fn detach_connection(&mut self, conn: ConnId) {
+        let locals: Vec<PaneId> =
+            self.connections.get(&conn).map(|c| c.routes.values().copied().collect()).unwrap_or_default();
+        for local in locals {
+            self.terms.remove(&local);
+            self.remote_panes.remove(&local);
+            self.dirty.remove(&local);
+            self.last_rect.remove(&local);
+            if let Some(state) = self.state.as_mut() {
+                state.grid.forget_pane(local);
+            }
+            self.workspace.remove_pane(local);
+        }
+        self.connections.remove(&conn); // last Sender drops → writer EOFs → daemon keeps its panes
+        if self.workspace.tabs.is_empty() {
+            self.workspace.new_tab();
+        }
+        self.request_redraw();
     }
 
     /// Spawn the russh client for `cfg` on its own thread (a current-thread tokio runtime). On
@@ -2453,6 +2505,7 @@ impl App {
         let connect_host = &mut self.connect_host;
         let full = {
             let ws = &self.workspace;
+            let remote_panes = &self.remote_panes;
             let families = &self.font_families;
             let cur_family = self.config.font_family.as_deref();
             let cur_size = self.config.font_size;
@@ -2461,7 +2514,7 @@ impl App {
                     ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
                     pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
                     &feed_items, &mut feed_active, chrome_latched, feed_open, auth_view.as_ref(),
-                    auth_inputs, show_connect, connect_host, error.as_deref(),
+                    auth_inputs, show_connect, connect_host, error.as_deref(), remote_panes,
                 )
             })
         };
@@ -2513,6 +2566,7 @@ impl App {
                     self.error_msg = None;
                     self.request_redraw();
                 }
+                Action::DetachSession => self.detach_focused_session(),
                 // Remote-aware: a split/new-tab from a remote pane stays on its connection.
                 Action::Split(s) => self.split_pane(s),
                 Action::NewTab => self.new_tab(),
