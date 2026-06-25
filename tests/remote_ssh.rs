@@ -192,6 +192,33 @@ async fn rejected_host_key_aborts_connect() {
     assert!(result.is_err(), "connect should fail when the host key is rejected");
 }
 
+/// A host without `potty-session`: the SSH exec is accepted, but the shell's "command not found"
+/// closes the channel before any protocol frame. The connection must end without a `Welcome`, and
+/// the captured stderr must be non-empty so the UI can explain the failure (vs. a silent dead tab).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_remote_command_is_reported() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+
+    let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+    let (session, outbound, mut rx) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), "potty-session-DEFINITELY-NOT-INSTALLED")
+            .await
+            .expect("exec request is accepted even though the command is missing");
+
+    // Mimic the client: greet, then drain until the channel closes.
+    outbound.send(Frame::Control(Control::Hello { version: 1 })).await.ok();
+    let mut got_welcome = false;
+    while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        if matches!(frame, Frame::Control(Control::Welcome { .. })) {
+            got_welcome = true;
+        }
+    }
+
+    assert!(!got_welcome, "a host without potty-session should never send Welcome");
+    assert!(!session.stderr().is_empty(), "the remote's error output should have been captured");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_auth_round_trip() {
     let Some(sshd) = start_sshd() else { return };

@@ -104,7 +104,9 @@ enum UserEvent {
     /// A wire-protocol frame arrived from a remote session (tagged with its connection).
     RemoteFrame(ConnId, potty::proto::Frame),
     /// A remote connection attempt failed (auth, network, host key, …).
-    RemoteError(String),
+    /// A connection failed. `conn` is set once the connection was registered (so a phantom entry
+    /// can be cleaned up); `None` for failures before that (auth, host key, …).
+    RemoteError { conn: Option<ConnId>, msg: String },
     /// A remote connection's auth ladder needs the user (host-key approval, …).
     Auth(AuthPrompt),
 }
@@ -1622,15 +1624,36 @@ impl App {
                         if proxy.send_event(connected).is_err() {
                             return;
                         }
+                        // Track whether the remote ever greeted us. If the channel closes before a
+                        // `Welcome`, the remote command never ran the protocol — almost always
+                        // `potty-session` missing on the host — so surface that instead of silently
+                        // leaving a dead, paneless connection.
+                        let mut greeted = false;
                         while let Some(frame) = rx.recv().await {
+                            greeted |= matches!(frame, Frame::Control(Control::Welcome { .. }));
                             if proxy.send_event(UserEvent::RemoteFrame(conn, frame)).is_err() {
                                 break;
                             }
                         }
+                        if !greeted {
+                            let detail = session.stderr();
+                            let msg = if detail.is_empty() {
+                                format!(
+                                    "{}: the session ended before it started — is `potty-session` \
+                                     installed and on PATH on the host? (set `remote_command` in the \
+                                     config to its path if so)",
+                                    cfg.host
+                                )
+                            } else {
+                                format!("{}: could not start the remote session — {detail}", cfg.host)
+                            };
+                            let _ = proxy.send_event(UserEvent::RemoteError { conn: Some(conn), msg });
+                        }
                         drop(session); // keep the SSH session alive until the stream ends
                     }
                     Err(e) => {
-                        let _ = proxy.send_event(UserEvent::RemoteError(e.to_string()));
+                        let _ =
+                            proxy.send_event(UserEvent::RemoteError { conn: None, msg: e.to_string() });
                     }
                 }
             });
@@ -2902,7 +2925,14 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::RemoteConnected { conn, host, outbound } => self.on_remote_connected(conn, host, outbound),
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(conn, frame) => self.on_remote_frame(event_loop, conn, frame),
-            UserEvent::RemoteError(msg) => {
+            UserEvent::RemoteError { conn, msg } => {
+                // Drop a registered-but-paneless connection (a handshake that never completed), so
+                // it doesn't linger in the map.
+                if let Some(conn) = conn
+                    && self.connections.get(&conn).is_some_and(|c| c.routes.is_empty())
+                {
+                    self.connections.remove(&conn);
+                }
                 self.error_msg = Some(msg);
                 self.request_redraw();
             }

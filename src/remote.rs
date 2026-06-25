@@ -10,7 +10,7 @@
 //! remote-deploy build matters, this module should move behind a `client` feature.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::AgentClient;
@@ -84,6 +84,16 @@ pub struct SshConfig {
 /// client closes a connection after its last pane goes away.
 pub struct RemoteSession {
     _session: Handle<ClientHandler>,
+    /// Remote stderr captured from the channel (capped). Lets the caller explain a session that
+    /// closed before speaking the protocol — typically a shell's "potty-session: command not found".
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl RemoteSession {
+    /// A snapshot of the captured remote stderr, trimmed. Empty if the remote said nothing.
+    pub fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().unwrap()).trim().to_string()
+    }
 }
 
 fn io_err(e: impl std::fmt::Display) -> std::io::Error {
@@ -144,26 +154,38 @@ pub async fn connect_and_exec(
 
     let (in_tx, in_rx) = mpsc::channel::<Frame>(256); // remote → us
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256); // us → remote
+    let stderr = Arc::new(Mutex::new(Vec::new()));
 
-    // Reader: reassemble channel data into frames (Data chunks don't respect frame boundaries).
+    // Reader: reassemble channel data into frames (Data chunks don't respect frame boundaries), and
+    // capture stderr so a session that dies before greeting us (e.g. `potty-session` not installed)
+    // can be explained.
+    let stderr_w = stderr.clone();
     tokio::spawn(async move {
+        const STDERR_CAP: usize = 4096;
         let mut buf = Vec::new();
         while let Some(msg) = read_half.wait().await {
-            let ChannelMsg::Data { data } = msg else {
-                continue; // the loop ends when wait() returns None
-            };
-            buf.extend_from_slice(&data);
-            loop {
-                match Frame::try_parse(&buf) {
-                    Ok(Some((frame, used))) => {
-                        buf.drain(..used);
-                        if in_tx.send(frame).await.is_err() {
-                            return;
+            match msg {
+                ChannelMsg::Data { data } => {
+                    buf.extend_from_slice(&data);
+                    loop {
+                        match Frame::try_parse(&buf) {
+                            Ok(Some((frame, used))) => {
+                                buf.drain(..used);
+                                if in_tx.send(frame).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => return, // protocol desync
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => return, // protocol desync
                 }
+                ChannelMsg::ExtendedData { data, .. } => {
+                    let mut s = stderr_w.lock().unwrap();
+                    let room = STDERR_CAP.saturating_sub(s.len());
+                    s.extend_from_slice(&data[..data.len().min(room)]);
+                }
+                _ => {} // the loop ends when wait() returns None
             }
         }
     });
@@ -183,7 +205,7 @@ pub async fn connect_and_exec(
         let _ = write_half.eof().await;
     });
 
-    Ok((RemoteSession { _session: session }, out_tx, in_rx))
+    Ok((RemoteSession { _session: session, stderr }, out_tx, in_rx))
 }
 
 /// Open a fresh SSH connection (its own `MaxAuthTries` budget) and verify the host key.
