@@ -29,6 +29,12 @@ running across disconnects; reconnecting re-attaches to the same session.
 - **Entry points:** the `+` tab button / right-click menu ("Connect to host…"), and a
   `potty attach <host>` convenience that signals the running potty over local IPC. Plain `ssh`
   stays as-is for Windows/throwaway logins.
+- **potty-session is opt-in.** The connect dialog has a "Use potty-session (persistent multiplexing)"
+  checkbox, **off by default** — most hosts don't run `potty-session`. Off → a plain SSH shell
+  (`remote::shell_session`): a client-side coordinator speaks the same wire protocol to the GUI but
+  backs each pane with its own SSH channel (PTY + shell) on the shared session, so panes/splits/tabs
+  work unchanged — just no persistence (closing potty drops the shells). On → exec `potty-session`
+  (the daemon path, with detach/reattach/layout). "Detach session" only shows for the latter.
 - **Deferred:** auto-reattach on launch; bootstrapping `potty-session` onto a remote (scp-on-first-
   connect); `ProxyJump`; agent forwarding; the local-IPC `potty attach` verb on Windows (named
   pipe). The visual connect path needs none of these.

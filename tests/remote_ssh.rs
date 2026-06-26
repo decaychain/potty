@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use potty::proto::{Control, Frame};
-use potty::remote::{connect_and_exec, Authenticator, HostKeyStatus, RemoteSession, SshConfig};
+use potty::remote::{connect_and_exec, shell_session, Authenticator, HostKeyStatus, RemoteSession, SshConfig};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 fn which(candidates: &[&str]) -> Option<PathBuf> {
@@ -217,6 +217,45 @@ async fn missing_remote_command_is_reported() {
 
     assert!(!got_welcome, "a host without potty-session should never send Welcome");
     assert!(!session.stderr().is_empty(), "the remote's error output should have been captured");
+}
+
+/// The no-`potty-session` path: a plain SSH shell, driven through the same protocol. Open a pane
+/// (one channel + PTY + shell), type a command, and assert the output round-trips — proving the
+/// raw-shell coordinator emulates the daemon's Welcome/Opened/Data handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_shell_round_trip() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+
+    let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+    let (session, outbound, mut rx) =
+        shell_session(&cfg, std::sync::Arc::new(AcceptHost(true))).await.expect("plain shell over ssh");
+
+    for f in [
+        Frame::Control(Control::Hello { version: 1 }),
+        Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }),
+        Frame::Data { pane: 1, bytes: b"echo PLAIN_SHELL_OK\r".to_vec() },
+    ] {
+        outbound.send(f).await.expect("send frame");
+    }
+
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ok = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(Frame::Data { pane: 1, bytes })) => out.extend(bytes),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+        if contains(&out, b"PLAIN_SHELL_OK") {
+            ok = true;
+            break;
+        }
+    }
+    let _keep = session; // hold the session open until we're done
+    assert!(ok, "plain shell output did not round-trip");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -100,7 +100,13 @@ enum UserEvent {
     Notify(feed::Note),
     /// A remote SSH session authenticated and exec'd `potty-session`; carries the connection id,
     /// the host (for the tab label), and the channel to send it input/resize/close frames.
-    RemoteConnected { conn: ConnId, host: String, outbound: tokio::sync::mpsc::Sender<potty::proto::Frame> },
+    RemoteConnected {
+        conn: ConnId,
+        host: String,
+        outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
+        /// True for a plain SSH shell (no daemon) — it can't be detached/reattached.
+        ephemeral: bool,
+    },
     /// A wire-protocol frame arrived from a remote session (tagged with its connection).
     RemoteFrame(ConnId, potty::proto::Frame),
     /// A remote connection attempt failed (auth, network, host key, …).
@@ -276,6 +282,8 @@ struct Connection {
     outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
     next_remote_id: u64,
     routes: HashMap<u64, PaneId>,
+    /// A plain SSH shell (no daemon): can't be detached/reattached, and pushes no layout.
+    ephemeral: bool,
     /// True once the attach handshake finished (`Ready` seen). We only push layout updates after
     /// this, so a mid-handshake push can't clobber the daemon's stored layout we're restoring from.
     ready: bool,
@@ -535,7 +543,7 @@ fn human_age(d: Duration) -> String {
 ///
 /// NOTE: egui 0.34 is mid-migration to `ui.close`; `ui.close_menu` is deprecated-but-working.
 #[allow(deprecated)]
-fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<PaneId>, is_remote: bool) {
+fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<PaneId>, can_detach: bool) {
     let focus = |actions: &mut Vec<Action>| {
         if let Some(id) = for_pane {
             actions.push(Action::Focus(id));
@@ -565,8 +573,8 @@ fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<Pane
         actions.push(Action::OpenConnect);
         ui.close_menu();
     }
-    // Only meaningful on a remote pane: leave the session running on the host and disconnect.
-    if is_remote
+    // Only for a persistent (potty-session) remote pane: leave the session running and disconnect.
+    if can_detach
         && ui
             .button("Detach session")
             .on_hover_text("Disconnect but keep the remote shells running, to reattach later")
@@ -645,8 +653,9 @@ fn build_ui(
     auth_inputs: &mut Vec<String>,
     show_connect: bool,
     connect_host: &mut String,
+    connect_use_session: &mut bool,
     error: Option<&str>,
-    remote_panes: &std::collections::HashSet<PaneId>,
+    detachable_panes: &std::collections::HashSet<PaneId>,
 ) {
     // The tab bar earns its space with more than one tab, or once the attention feed has latched
     // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
@@ -673,8 +682,8 @@ fn build_ui(
                     actions.push(Action::NewTab);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let focus_remote = remote_panes.contains(&ws.active_tab().focus);
-                    ui.menu_button("☰", |ui| full_menu(ui, actions, None, focus_remote));
+                    let focus_detachable = detachable_panes.contains(&ws.active_tab().focus);
+                    ui.menu_button("☰", |ui| full_menu(ui, actions, None, focus_detachable));
                     // Attention-feed bell — present once the feed has latched the bar on. Shows
                     // the waiting count; toggles the overlay.
                     if chrome_latched {
@@ -726,7 +735,7 @@ fn build_ui(
             let single = rects.len() == 1;
             for (id, rect) in rects {
                 ui.interact(rect, egui::Id::new(("pane", ws.active, id)), egui::Sense::click())
-                    .context_menu(|ui| full_menu(ui, actions, Some(id), remote_panes.contains(&id)));
+                    .context_menu(|ui| full_menu(ui, actions, Some(id), detachable_panes.contains(&id)));
                 if single {
                     leaves.push((id, rect));
                     continue;
@@ -932,6 +941,12 @@ fn build_ui(
                 if ui.memory(|m| m.focused().is_none()) {
                     resp.request_focus();
                 }
+                ui.add_space(4.0);
+                ui.checkbox(connect_use_session, "Use potty-session (persistent multiplexing)")
+                    .on_hover_text(
+                        "Run potty-session on the host for split panes that survive disconnects \
+                         (it must be installed there). Off = a plain SSH shell.",
+                    );
                 ui.separator();
                 ui.horizontal(|ui| {
                     if (ui.button("Connect").clicked() || enter) && !connect_host.trim().is_empty() {
@@ -1245,6 +1260,9 @@ struct App {
     /// Whether the "Connect to host…" dialog is open, and its host-field buffer.
     show_connect: bool,
     connect_host: String,
+    /// Connect-dialog checkbox: use `potty-session` (persistent multiplexing) vs. a plain SSH shell.
+    /// Off by default — most hosts don't run `potty-session`.
+    connect_use_session: bool,
     /// A connection error to show in a dialog (instead of stderr).
     error_msg: Option<String>,
     /// Whether the feed overlay is currently shown. Auto-opens on a fresh wave of notes, toggled
@@ -1302,6 +1320,7 @@ impl App {
             auth_inputs: Vec::new(),
             show_connect: false,
             connect_host: String::new(),
+            connect_use_session: false,
             error_msg: None,
         }
     }
@@ -1605,7 +1624,15 @@ impl App {
     /// success it forwards the remote's frames back to this loop as `UserEvent`s; on failure it
     /// reports `RemoteError`. Per-connection threads mean an auth prompt can block *this*
     /// connection (while the UI keeps rendering the dialog) without stalling anything else.
-    fn connect_remote(&mut self, cfg: remote::SshConfig, auth: Arc<dyn remote::Authenticator>, command: String) {
+    /// `use_session` → exec `potty-session` (persistent multiplexing); otherwise a plain SSH shell
+    /// (`shell_session`, no persistence). Both speak the same protocol back, so the rest is shared.
+    fn connect_remote(
+        &mut self,
+        cfg: remote::SshConfig,
+        auth: Arc<dyn remote::Authenticator>,
+        command: String,
+        use_session: bool,
+    ) {
         let conn = self.next_conn_id;
         self.next_conn_id += 1;
         let proxy = self.proxy.clone();
@@ -1614,13 +1641,22 @@ impl App {
                 return;
             };
             rt.block_on(async move {
-                match remote::connect_and_exec(&cfg, auth, &command).await {
+                let result = if use_session {
+                    remote::connect_and_exec(&cfg, auth, &command).await
+                } else {
+                    remote::shell_session(&cfg, auth).await
+                };
+                match result {
                     Ok((session, outbound, mut rx)) => {
                         // Hand the sole outbound `Sender` to the UI thread. Once it (and the per-pane
                         // clones) drop — the connection's last pane closed — the writer signals EOF
                         // and the remote tears down; this loop then ends as the channel closes.
-                        let connected =
-                            UserEvent::RemoteConnected { conn, host: cfg.host.clone(), outbound };
+                        let connected = UserEvent::RemoteConnected {
+                            conn,
+                            host: cfg.host.clone(),
+                            outbound,
+                            ephemeral: !use_session,
+                        };
                         if proxy.send_event(connected).is_err() {
                             return;
                         }
@@ -1662,7 +1698,7 @@ impl App {
 
     /// A connection authenticated: register it and greet the daemon. We then wait for its restore
     /// burst — `Ready` decides whether to open a fresh pane (see `on_remote_frame`).
-    fn on_remote_connected(&mut self, conn: ConnId, host: String, outbound: tokio::sync::mpsc::Sender<Frame>) {
+    fn on_remote_connected(&mut self, conn: ConnId, host: String, outbound: tokio::sync::mpsc::Sender<Frame>, ephemeral: bool) {
         let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
         self.connections.insert(
             conn,
@@ -1671,6 +1707,7 @@ impl App {
                 outbound,
                 next_remote_id: 1,
                 routes: HashMap::new(),
+                ephemeral,
                 ready: false,
                 restore_panes: Vec::new(),
                 restore_layout: None,
@@ -1892,8 +1929,8 @@ impl App {
     fn sync_layouts(&mut self) {
         let conns: Vec<ConnId> = self.connections.keys().copied().collect();
         for conn in conns {
-            if !self.connections.get(&conn).is_some_and(|c| c.ready) {
-                continue; // don't clobber the stored layout mid-restore
+            if !self.connections.get(&conn).is_some_and(|c| c.ready && !c.ephemeral) {
+                continue; // not ready (mid-restore), or ephemeral (no daemon to store layout)
             }
             let json = serde_json::to_string(&self.layout_for(conn)).unwrap_or_default();
             if let Some(c) = self.connections.get_mut(&conn) {
@@ -1987,7 +2024,7 @@ impl App {
             agent_sock: None,
         };
         let auth = Arc::new(GuiAuth { proxy: self.proxy.clone() });
-        self.connect_remote(cfg, auth, self.config.remote_command.clone());
+        self.connect_remote(cfg, auth, self.config.remote_command.clone(), self.connect_use_session);
         self.show_connect = false;
         self.connect_host.clear();
     }
@@ -2016,7 +2053,7 @@ impl App {
             agent_sock: None,
         };
         let command = std::env::var("POTTY_TEST_SESSION_BIN").unwrap_or_else(|_| "potty-session".into());
-        self.connect_remote(cfg, Arc::new(GuiAuth { proxy: self.proxy.clone() }), command);
+        self.connect_remote(cfg, Arc::new(GuiAuth { proxy: self.proxy.clone() }), command, true);
     }
 
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
@@ -2558,11 +2595,19 @@ impl App {
         });
         let show_connect = self.show_connect;
         let error = self.error_msg.clone();
+        // Panes whose connection is a persistent (potty-session) remote — the only ones that can be
+        // detached. Computed fresh (owned) so it doesn't tangle with the borrows below.
+        let detachable_panes: std::collections::HashSet<PaneId> = self
+            .connections
+            .values()
+            .filter(|c| !c.ephemeral)
+            .flat_map(|c| c.routes.values().copied())
+            .collect();
         let auth_inputs = &mut self.auth_inputs;
         let connect_host = &mut self.connect_host;
+        let connect_use_session = &mut self.connect_use_session;
         let full = {
             let ws = &self.workspace;
-            let remote_panes = &self.remote_panes;
             let families = &self.font_families;
             let cur_family = self.config.font_family.as_deref();
             let cur_size = self.config.font_size;
@@ -2571,7 +2616,8 @@ impl App {
                     ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
                     pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
                     &feed_items, &mut feed_active, chrome_latched, feed_open, auth_view.as_ref(),
-                    auth_inputs, show_connect, connect_host, error.as_deref(), remote_panes,
+                    auth_inputs, show_connect, connect_host, connect_use_session, error.as_deref(),
+                    &detachable_panes,
                 )
             })
         };
@@ -2922,7 +2968,9 @@ impl ApplicationHandler<UserEvent> for App {
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_note(note),
             // A remote session connected — give it a tab with one shell pane.
-            UserEvent::RemoteConnected { conn, host, outbound } => self.on_remote_connected(conn, host, outbound),
+            UserEvent::RemoteConnected { conn, host, outbound, ephemeral } => {
+                self.on_remote_connected(conn, host, outbound, ephemeral)
+            }
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(conn, frame) => self.on_remote_frame(event_loop, conn, frame),
             UserEvent::RemoteError { conn, msg } => {

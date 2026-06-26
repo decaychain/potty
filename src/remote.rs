@@ -9,6 +9,7 @@
 //! Note: pulling russh in here means the lib (and thus `potty-session`) compiles it; once the
 //! remote-deploy build matters, this module should move behind a `client` feature.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +25,7 @@ use russh::ChannelMsg;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-use crate::proto::Frame;
+use crate::proto::{Control, Frame, PaneId};
 
 /// A server host key is either unrecognised, or differs from a recorded one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +84,9 @@ pub struct SshConfig {
 /// writer signals channel EOF (so the remote relay exits and the daemon detaches) — that's how the
 /// client closes a connection after its last pane goes away.
 pub struct RemoteSession {
-    _session: Handle<ClientHandler>,
+    /// The SSH handle for the `potty-session` path (one channel). `None` for the raw-shell path,
+    /// where the handle lives in the coordinator task that owns the per-pane channels.
+    _session: Option<Handle<ClientHandler>>,
     /// Remote stderr captured from the channel (capped). Lets the caller explain a session that
     /// closed before speaking the protocol — typically a shell's "potty-session: command not found".
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -205,7 +208,105 @@ pub async fn connect_and_exec(
         let _ = write_half.eof().await;
     });
 
-    Ok((RemoteSession { _session: session, stderr }, out_tx, in_rx))
+    Ok((RemoteSession { _session: Some(session), stderr }, out_tx, in_rx))
+}
+
+/// Connect and authenticate, then run a **plain interactive shell** over SSH — no `potty-session`,
+/// no persistence. A coordinator task speaks the same wire protocol to the GUI as `connect_and_exec`
+/// does, but backs each pane with its own SSH channel (PTY + shell) on the shared session, so the
+/// entire GUI (panes, splits, tabs, resize) works unchanged. Closing potty drops the session and the
+/// shells with it. Use this for hosts that don't run `potty-session`.
+pub async fn shell_session(
+    cfg: &SshConfig,
+    auth: Arc<dyn Authenticator>,
+) -> std::io::Result<(RemoteSession, mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
+    let handle = authenticate(cfg, &auth).await?;
+
+    let (in_tx, in_rx) = mpsc::channel::<Frame>(256); // shells → us
+    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256); // us → shells
+
+    // Coordinator: owns the SSH handle and one channel per pane, translating proto ↔ raw SSH.
+    tokio::spawn(async move {
+        // Per-pane channel write halves (input/resize/close); reader tasks own the read halves.
+        let mut panes: HashMap<PaneId, russh::ChannelWriteHalf<client::Msg>> = HashMap::new();
+        while let Some(frame) = out_rx.recv().await {
+            match frame {
+                // Greet exactly like the daemon would, so the GUI's connect flow proceeds: with no
+                // panes to restore it will open a fresh one (an `Open`).
+                Frame::Control(Control::Hello { .. }) => {
+                    let _ = in_tx.send(Frame::Control(Control::Welcome { version: crate::proto::PROTOCOL_VERSION })).await;
+                    let _ = in_tx.send(Frame::Control(Control::Ready)).await;
+                }
+                // A new pane → a new channel running a login shell in a PTY of the requested size.
+                Frame::Control(Control::Open { pane, cols, rows }) => {
+                    match open_shell_channel(&handle, cols, rows).await {
+                        Ok(channel) => {
+                            let (mut read, write) = channel.split();
+                            panes.insert(pane, write);
+                            let _ = in_tx.send(Frame::Control(Control::Opened { pane })).await;
+                            // Reader: raw shell output (incl. stderr) → this pane's Data frames;
+                            // channel close → the shell exited.
+                            let to_gui = in_tx.clone();
+                            tokio::spawn(async move {
+                                while let Some(msg) = read.wait().await {
+                                    let bytes = match msg {
+                                        ChannelMsg::Data { data } => data.to_vec(),
+                                        ChannelMsg::ExtendedData { data, .. } => data.to_vec(),
+                                        _ => continue,
+                                    };
+                                    if to_gui.send(Frame::Data { pane, bytes }).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                let _ = to_gui.send(Frame::Control(Control::Exited { pane })).await;
+                            });
+                        }
+                        Err(_) => {
+                            let _ = in_tx.send(Frame::Control(Control::Exited { pane })).await;
+                        }
+                    }
+                }
+                Frame::Data { pane, bytes } => {
+                    if let Some(w) = panes.get(&pane) {
+                        let _ = w.data(&bytes[..]).await;
+                    }
+                }
+                Frame::Control(Control::Resize { pane, cols, rows }) => {
+                    if let Some(w) = panes.get(&pane) {
+                        let _ = w.window_change(cols as u32, rows as u32, 0, 0).await;
+                    }
+                }
+                Frame::Control(Control::Close { pane }) => {
+                    if let Some(w) = panes.remove(&pane) {
+                        let _ = w.eof().await;
+                        let _ = w.close().await;
+                    }
+                }
+                // No persistence: layout pushes and other controls are irrelevant here.
+                Frame::Control(_) => {}
+            }
+        }
+        // Every outbound `Sender` dropped (connection closed) → drop the handle, ending the session
+        // and all its channels; the reader tasks then finish.
+    });
+
+    let stderr = Arc::new(Mutex::new(Vec::new())); // unused here (raw shells always greet), kept for API parity
+    Ok((RemoteSession { _session: None, stderr }, out_tx, in_rx))
+}
+
+/// Open one SSH channel with a PTY of `cols`×`rows` running a login shell.
+async fn open_shell_channel(
+    handle: &Handle<ClientHandler>,
+    cols: u16,
+    rows: u16,
+) -> std::io::Result<russh::Channel<client::Msg>> {
+    let channel = handle.channel_open_session().await.map_err(io_err)?;
+    channel
+        .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
+        .await
+        .map_err(io_err)?;
+    channel.request_shell(true).await.map_err(io_err)?;
+    Ok(channel)
 }
 
 /// Open a fresh SSH connection (its own `MaxAuthTries` budget) and verify the host key.
