@@ -25,12 +25,28 @@ Requires:       libxkbcommon
 Requires:       vulkan-loader
 # A monospace font for the default family (fontdb scans the system font dirs).
 Requires:       dejavu-sans-mono-fonts
+# The CLI helpers ship in a subpackage so a remote host can install just those
+# (no GUI/Wayland deps); on a desktop they come along by default.
+Recommends:     %{name}-tools = %{version}-%{release}
 
 %description
 potty is a GPU-accelerated terminal emulator in Rust with a deliberately visual,
 pointer-driven take on tabs and panes: click to focus, drag the dividers to
 resize, right-click for the menu. Wayland-native, with a custom per-cell GPU
 renderer and real multiplexing (a PTY per pane).
+
+%package tools
+Summary:        Remote-session and notification helpers for potty
+# Plain CLI tools: rpm's automatic dependency generator captures their (libc-only)
+# needs, and they link none of potty's GUI/Wayland stack — so this installs cleanly
+# on a headless remote host.
+
+%description tools
+Helper programs for potty that carry none of its GUI dependencies, so they can be
+installed on remote hosts:
+ * potty-session — the multiplexer potty drives over SSH for persistent remote
+   sessions (detach/reattach, with splits and tabs that survive disconnects).
+ * potty-notify — the attention-feed helper that agentic CLIs invoke from a hook.
 
 %prep
 %setup -q
@@ -44,8 +60,10 @@ cargo build --release
 
 %install
 install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
-# The attention-feed helper: agentic CLIs invoke it from a notification hook (see
-# docs/attention-feed.md). Must be on PATH for hooks to find it.
+# Helpers (-tools subpackage). potty-session is the remote multiplexer; potty-notify
+# is the attention-feed helper agentic CLIs invoke from a hook (docs/attention-feed.md)
+# — both must be on PATH.
+install -Dm755 target/release/%{name}-session %{buildroot}%{_bindir}/%{name}-session
 install -Dm755 target/release/%{name}-notify %{buildroot}%{_bindir}/%{name}-notify
 install -Dm644 packaging/fedora/io.github.decaychain.potty.desktop \
   %{buildroot}%{_datadir}/applications/io.github.decaychain.potty.desktop
@@ -60,10 +78,14 @@ done
 %files
 %license LICENSE
 %{_bindir}/%{name}
-%{_bindir}/%{name}-notify
 %{_datadir}/applications/io.github.decaychain.potty.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.github.decaychain.potty.svg
 %{_datadir}/icons/hicolor/*/apps/io.github.decaychain.potty.png
+
+%files tools
+%license LICENSE
+%{_bindir}/%{name}-session
+%{_bindir}/%{name}-notify
 
 %changelog
 * Sat Jun 20 2026 Decay Chain <noreply@github.com> - @@VERSION@@-@@RELEASE@@

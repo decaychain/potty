@@ -33,7 +33,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        # Only the GUI binary ships on Windows (the NSIS bundles potty.exe). Building
+        # just it skips the Unix-only potty-session helper, which won't compile here.
+        run: cargo build --release --bin potty
 
       - name: Install NSIS
         run: choco install nsis -y --no-progress
