@@ -337,8 +337,10 @@ async fn authenticate(cfg: &SshConfig, auth: &Arc<dyn Authenticator>) -> std::io
     if cfg.use_agent {
         #[cfg(unix)]
         let agent = connect_agent_unix(cfg).await;
+        // Pageant's stream type comes from an external crate russh doesn't re-export, so we can't
+        // name it — call the constructor inline and let inference carry the type to `agent_auth`.
         #[cfg(windows)]
-        let agent = connect_agent_windows().await;
+        let agent = AgentClient::connect_pageant().await.ok();
         if let Some(agent) = agent {
             let mut session = connect_session(cfg, auth).await?;
             let rsa_hash = session.best_supported_rsa_hash().await.map_err(io_err)?.flatten();
@@ -387,10 +389,6 @@ async fn connect_agent_unix(cfg: &SshConfig) -> Option<AgentClient<tokio::net::U
     }
 }
 
-#[cfg(windows)]
-async fn connect_agent_windows() -> Option<AgentClient<russh::keys::agent::client::pageant::PageantStream>> {
-    AgentClient::connect_pageant().await.ok()
-}
 
 /// The SSH session dropped mid-authentication (the server likely caps attempts).
 struct Disconnected;
