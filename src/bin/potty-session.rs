@@ -5,8 +5,9 @@
 //!    starts the daemon if it isn't already running, and exits when the client disconnects —
 //!    leaving the daemon (and its shells) alive.
 //!  * **daemon** (`--daemon <sock>`, forked + detached): owns the PTYs and speaks the wire
-//!    protocol over the socket, surviving client disconnects so remote programs keep running. One
-//!    per user (per host, implicitly). See `docs/remote-sessions.md`, step 4.
+//!    protocol over the socket, surviving client disconnects so remote programs keep running.
+//!    Newer attaches become the active client if an older attach is still connected. One per user
+//!    (per host, implicitly). See `docs/remote-sessions.md`, step 4.
 //!
 //! `POTTY_SESSION_NODAEMON=1` runs the multiplexer inline over stdin/stdout (no daemon, no
 //! persistence) — used by the protocol/transport tests.
@@ -30,10 +31,12 @@ fn main() {
 mod imp {
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -58,11 +61,18 @@ struct Pane {
     buffer: Arc<Mutex<Vec<u8>>>,
 }
 
+struct Client {
+    id: u64,
+    writer: Box<dyn Write + Send>,
+    shutdown: Option<UnixStream>,
+}
+
 /// Shared session state. `panes` outlive any single client connection (that's the persistence);
 /// `client` is the currently-attached client's write half, or `None` while detached.
 struct Session {
     panes: Mutex<HashMap<PaneId, Pane>>,
-    client: Mutex<Option<Box<dyn Write + Send>>>,
+    client: Mutex<Option<Client>>,
+    next_client: AtomicU64,
     /// The client's last-pushed tab/pane tree (opaque JSON), replayed on reattach.
     layout: Mutex<Option<String>>,
 }
@@ -76,7 +86,22 @@ fn shell() -> String {
 fn send_frame(session: &Session, frame: Frame) {
     let mut guard = session.client.lock().unwrap();
     if let Some(client) = guard.as_mut() {
-        let _ = frame.write(client);
+        if frame.write(&mut client.writer).is_err() {
+            if let Some(stream) = client.shutdown.as_ref() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+fn client_is_current(session: &Session, client_id: u64) -> bool {
+    session.client.lock().unwrap().as_ref().is_some_and(|client| client.id == client_id)
+}
+
+fn clear_client(session: &Session, client_id: u64) {
+    let mut guard = session.client.lock().unwrap();
+    if guard.as_ref().is_some_and(|client| client.id == client_id) {
+        *guard = None;
     }
 }
 
@@ -146,9 +171,12 @@ fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16) {
 }
 
 /// Serve one client connection: apply its frames to the session until it disconnects (EOF).
-fn serve(session: &Arc<Session>, reader: impl Read) {
+fn serve(session: &Arc<Session>, client_id: u64, reader: impl Read) {
     let mut reader = BufReader::new(reader);
     while let Ok(Some(frame)) = Frame::read(&mut reader) {
+        if !client_is_current(session, client_id) {
+            break;
+        }
         match frame {
             // Attach handshake: greet, replay every existing pane's current screen, then Ready.
             Frame::Control(Control::Hello { .. }) => {
@@ -282,28 +310,49 @@ fn attach(sock: PathBuf) {
     }
 }
 
-/// Daemon role: own the PTYs, serve one attached client at a time, persist across detaches.
+/// Daemon role: own the PTYs, keep accepting attaches, and persist across detaches.
 fn run_daemon(sock: PathBuf) {
     let _ = std::fs::remove_file(&sock);
-    let Ok(listener) = UnixListener::bind(&sock) else {
-        return; // another daemon won the race to bind
+    let listener = match UnixListener::bind(&sock) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("potty-session: could not bind {}: {err}", sock.display());
+            return; // another daemon won the race to bind
+        }
     };
     let _ = SOCK.set(sock);
     let session = Arc::new(Session {
         panes: Mutex::new(HashMap::new()),
         client: Mutex::new(None),
+        next_client: AtomicU64::new(1),
         layout: Mutex::new(None),
     });
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let Ok(write) = conn.try_clone() else { continue };
-        *session.client.lock().unwrap() = Some(Box::new(write));
-        serve(&session, conn);
-        *session.client.lock().unwrap() = None;
-        // Detached. If nothing's left to persist, shut down.
-        if session.panes.lock().unwrap().is_empty() {
-            cleanup_and_exit();
+        let shutdown = conn.try_clone().ok();
+        let id = session.next_client.fetch_add(1, Ordering::Relaxed);
+        let old = {
+            let mut client = session.client.lock().unwrap();
+            let old = client.take();
+            *client = Some(Client { id, writer: Box::new(write), shutdown });
+            old
+        };
+        if let Some(stream) = old.and_then(|client| client.shutdown) {
+            let _ = stream.shutdown(Shutdown::Both);
         }
+
+        let serving = session.clone();
+        thread::spawn(move || {
+            serve(&serving, id, conn);
+            clear_client(&serving, id);
+            // Detached. If nothing's left to persist, shut down.
+            let idle = serving.panes.lock().unwrap().is_empty()
+                && serving.client.lock().unwrap().is_none();
+            if idle {
+                cleanup_and_exit();
+            }
+        });
     }
 }
 
@@ -311,10 +360,15 @@ fn run_daemon(sock: PathBuf) {
 fn run_inline() {
     let session = Arc::new(Session {
         panes: Mutex::new(HashMap::new()),
-        client: Mutex::new(Some(Box::new(std::io::stdout()))),
+        client: Mutex::new(Some(Client {
+            id: 0,
+            writer: Box::new(std::io::stdout()),
+            shutdown: None,
+        })),
+        next_client: AtomicU64::new(1),
         layout: Mutex::new(None),
     });
-    serve(&session, std::io::stdin().lock());
+    serve(&session, 0, std::io::stdin().lock());
 }
 
 pub fn main() {

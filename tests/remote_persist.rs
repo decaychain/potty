@@ -159,6 +159,38 @@ fn reattach_restores_and_replays() {
 }
 
 #[test]
+fn reattach_while_client_attached_takes_over() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-steal-{tag}.sock"));
+    let marker = format!("STEAL_REATTACH_MARKER_{tag}");
+    let daemon = start_daemon(&sock);
+
+    // Client #1 is still attached and has a live shell.
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 1 }));
+    c1.send(Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }));
+    c1.send(Frame::Data { pane: 1, bytes: format!("echo {marker}\r").into_bytes() });
+    let echoed = c1.wait(|out, _| out.get(&1).is_some_and(|o| contains(o, marker.as_bytes())));
+    assert!(echoed, "marker never echoed on client #1");
+
+    // Client #2 should not wait behind client #1 forever. It becomes the active attachment and
+    // receives the existing pane plus replayed output.
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 1 }));
+    let restored = c2.wait(|out, ctrl| {
+        ctrl.iter().any(|m| matches!(m, Control::Restore { pane: 1 }))
+            && ctrl.iter().any(|m| matches!(m, Control::Ready))
+            && out.get(&1).is_some_and(|o| contains(o, marker.as_bytes()))
+    });
+
+    c1.disconnect();
+    c2.disconnect();
+    cleanup(daemon, &sock);
+
+    assert!(restored, "a second attach did not take over and restore the live session");
+}
+
+#[test]
 fn reattach_replays_layout() {
     let tag = std::process::id();
     let sock = std::env::temp_dir().join(format!("potty-layout-{tag}.sock"));

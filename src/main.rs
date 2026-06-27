@@ -99,10 +99,10 @@ enum UserEvent {
     /// An attention note arrived on the notify socket (from `potty-notify`).
     Notify(feed::Note),
     /// A remote SSH session authenticated and exec'd `potty-session`; carries the connection id,
-    /// the host (for the tab label), and the channel to send it input/resize/close frames.
+    /// the target (for matching/labels), and the channel to send it input/resize/close frames.
     RemoteConnected {
         conn: ConnId,
-        host: String,
+        target: RemoteTarget,
         outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
         /// True for a plain SSH shell (no daemon) — it can't be detached/reattached.
         ephemeral: bool,
@@ -113,6 +113,8 @@ enum UserEvent {
     /// A connection failed. `conn` is set once the connection was registered (so a phantom entry
     /// can be cleaned up); `None` for failures before that (auth, host key, …).
     RemoteError { conn: Option<ConnId>, msg: String },
+    /// A previously-greeted remote stream ended while its connection is still registered.
+    RemoteDisconnected { conn: ConnId, msg: String },
     /// A remote connection's auth ladder needs the user (host-key approval, …).
     Auth(AuthPrompt),
 }
@@ -275,10 +277,28 @@ impl GuiAuth {
 /// can route by `(conn, remote_id)` — the daemon's pane ids aren't unique across connections.
 type ConnId = u64;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteTarget {
+    user: String,
+    host: String,
+    port: u16,
+    command: String,
+}
+
+impl RemoteTarget {
+    fn label(&self) -> String {
+        if self.port == 22 {
+            format!("{}@{}", self.user, self.host)
+        } else {
+            format!("{}@{}:{}", self.user, self.host, self.port)
+        }
+    }
+}
+
 /// Per-connection client state: how to talk to it, the next daemon pane id to request, and the
 /// map from the daemon's pane ids to local `PaneId`s (they diverge after a reattach).
 struct Connection {
-    host: String,
+    target: RemoteTarget,
     outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
     next_remote_id: u64,
     routes: HashMap<u64, PaneId>,
@@ -1620,6 +1640,35 @@ impl App {
         self.request_redraw();
     }
 
+    fn focus_connection(&mut self, conn: ConnId) -> bool {
+        let locals: Vec<PaneId> =
+            self.connections.get(&conn).map(|c| c.routes.values().copied().collect()).unwrap_or_default();
+        for local in locals {
+            if let Some(tab) = self.workspace.tab_of(local) {
+                self.workspace.active = tab;
+                self.workspace.tabs[tab].focus = local;
+                self.request_redraw();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn focus_existing_persistent_target(&mut self, target: &RemoteTarget) -> bool {
+        let conn = self
+            .connections
+            .iter()
+            .find_map(|(conn, c)| (!c.ephemeral && &c.target == target).then_some(*conn));
+        let Some(conn) = conn else {
+            return false;
+        };
+        if !self.focus_connection(conn) {
+            self.error_msg = Some(format!("Already connecting to {}.", target.label()));
+            self.request_redraw();
+        }
+        true
+    }
+
     /// Spawn the russh client for `cfg` on its own thread (a current-thread tokio runtime). On
     /// success it forwards the remote's frames back to this loop as `UserEvent`s; on failure it
     /// reports `RemoteError`. Per-connection threads mean an auth prompt can block *this*
@@ -1635,6 +1684,12 @@ impl App {
     ) {
         let conn = self.next_conn_id;
         self.next_conn_id += 1;
+        let target = RemoteTarget {
+            user: cfg.user.clone(),
+            host: cfg.host.clone(),
+            port: cfg.port,
+            command: command.clone(),
+        };
         let proxy = self.proxy.clone();
         thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
@@ -1653,7 +1708,7 @@ impl App {
                         // and the remote tears down; this loop then ends as the channel closes.
                         let connected = UserEvent::RemoteConnected {
                             conn,
-                            host: cfg.host.clone(),
+                            target: target.clone(),
                             outbound,
                             ephemeral: !use_session,
                         };
@@ -1684,6 +1739,11 @@ impl App {
                                 format!("{}: could not start the remote session — {detail}", cfg.host)
                             };
                             let _ = proxy.send_event(UserEvent::RemoteError { conn: Some(conn), msg });
+                        } else {
+                            let _ = proxy.send_event(UserEvent::RemoteDisconnected {
+                                conn,
+                                msg: format!("{}: remote session disconnected", cfg.host),
+                            });
                         }
                         drop(session); // keep the SSH session alive until the stream ends
                     }
@@ -1698,12 +1758,18 @@ impl App {
 
     /// A connection authenticated: register it and greet the daemon. We then wait for its restore
     /// burst — `Ready` decides whether to open a fresh pane (see `on_remote_frame`).
-    fn on_remote_connected(&mut self, conn: ConnId, host: String, outbound: tokio::sync::mpsc::Sender<Frame>, ephemeral: bool) {
+    fn on_remote_connected(
+        &mut self,
+        conn: ConnId,
+        target: RemoteTarget,
+        outbound: tokio::sync::mpsc::Sender<Frame>,
+        ephemeral: bool,
+    ) {
         let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
         self.connections.insert(
             conn,
             Connection {
-                host,
+                target,
                 outbound,
                 next_remote_id: 1,
                 routes: HashMap::new(),
@@ -1723,7 +1789,7 @@ impl App {
             Some(c) => {
                 c.routes.insert(remote_id, local);
                 c.next_remote_id = c.next_remote_id.max(remote_id + 1);
-                (c.host.clone(), c.outbound.clone())
+                (c.target.host.clone(), c.outbound.clone())
             }
             None => return,
         };
@@ -1872,7 +1938,7 @@ impl App {
             self.add_remote_pane(conn, local);
             return;
         }
-        let host = self.connections.get(&conn).map(|c| c.host.clone()).unwrap_or_default();
+        let host = self.connections.get(&conn).map(|c| c.target.host.clone()).unwrap_or_default();
         let map: HashMap<u64, PaneId> = panes.iter().copied().collect();
         let mut placed: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
         if let Some(layout) = layout {
@@ -2014,6 +2080,18 @@ impl App {
         if host.is_empty() {
             return;
         }
+        let command = self.config.remote_command.clone();
+        let target = RemoteTarget {
+            user: user.clone(),
+            host: host.clone(),
+            port,
+            command: command.clone(),
+        };
+        if self.connect_use_session && self.focus_existing_persistent_target(&target) {
+            self.show_connect = false;
+            self.connect_host.clear();
+            return;
+        }
         let cfg = remote::SshConfig {
             host,
             port,
@@ -2024,7 +2102,7 @@ impl App {
             agent_sock: None,
         };
         let auth = Arc::new(GuiAuth { proxy: self.proxy.clone() });
-        self.connect_remote(cfg, auth, self.config.remote_command.clone(), self.connect_use_session);
+        self.connect_remote(cfg, auth, command, self.connect_use_session);
         self.show_connect = false;
         self.connect_host.clear();
     }
@@ -2968,11 +3046,18 @@ impl ApplicationHandler<UserEvent> for App {
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_note(note),
             // A remote session connected — give it a tab with one shell pane.
-            UserEvent::RemoteConnected { conn, host, outbound, ephemeral } => {
-                self.on_remote_connected(conn, host, outbound, ephemeral)
+            UserEvent::RemoteConnected { conn, target, outbound, ephemeral } => {
+                self.on_remote_connected(conn, target, outbound, ephemeral)
             }
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(conn, frame) => self.on_remote_frame(event_loop, conn, frame),
+            UserEvent::RemoteDisconnected { conn, msg } => {
+                if self.connections.contains_key(&conn) {
+                    self.detach_connection(conn);
+                    self.error_msg = Some(msg);
+                    self.request_redraw();
+                }
+            }
             UserEvent::RemoteError { conn, msg } => {
                 // Drop a registered-but-paneless connection (a handshake that never completed), so
                 // it doesn't linger in the map.
