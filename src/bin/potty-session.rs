@@ -10,7 +10,24 @@
 //!
 //! `POTTY_SESSION_NODAEMON=1` runs the multiplexer inline over stdin/stdout (no daemon, no
 //! persistence) — used by the protocol/transport tests.
+//!
+//! Unix-only (Unix-domain sockets, process groups, PTYs). On other platforms the implementation is
+//! cfg'd out and `main` is a stub that exits with an error, so a full `cargo build` still succeeds
+//! on Windows even though potty-session isn't shipped there (potty connects with a plain SSH shell).
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("potty-session runs only on Unix.");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
+fn main() {
+    imp::main();
+}
+
+#[cfg(unix)]
+mod imp {
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -300,7 +317,7 @@ fn run_inline() {
     serve(&session, std::io::stdin().lock());
 }
 
-fn main() {
+pub fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--daemon") => run_daemon(args.next().map(PathBuf::from).unwrap_or_else(socket_path)),
@@ -308,3 +325,4 @@ fn main() {
         _ => attach(socket_path()),
     }
 }
+} // mod imp
