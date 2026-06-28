@@ -111,8 +111,8 @@ enum UserEvent {
     /// A wire-protocol frame arrived from a remote session (tagged with its connection).
     RemoteFrame(ConnId, potty::proto::Frame),
     /// A remote connection attempt failed (auth, network, host key, …).
-    /// A connection failed. `conn` is set once the connection was registered (so a phantom entry
-    /// can be cleaned up); `None` for failures before that (auth, host key, …).
+    /// `conn` is set once a visible attempt was allocated; the connection may still not be
+    /// registered yet, but the progress row can be cleared.
     RemoteError {
         conn: Option<ConnId>,
         msg: String,
@@ -476,6 +476,19 @@ struct ConnectProfileView {
     use_potty_session: bool,
 }
 
+struct ConnectProgress {
+    target: RemoteTarget,
+    label: String,
+    detail: String,
+    started: Instant,
+}
+
+struct ConnectProgressView {
+    label: String,
+    detail: String,
+    elapsed: Duration,
+}
+
 /// Apply a workspace (tab/pane) action. Font actions are routed separately (they touch App).
 fn apply(ws: &mut Workspace, action: Action) {
     match action {
@@ -775,6 +788,8 @@ fn build_ui(
     connect_name: &mut String,
     connect_use_session: &mut bool,
     connect_profiles: &[ConnectProfileView],
+    connect_progress: &[ConnectProgressView],
+    connect_progress_active: &mut bool,
     error: Option<&str>,
     detachable_panes: &std::collections::HashSet<PaneId>,
 ) {
@@ -1135,6 +1150,40 @@ fn build_ui(
             });
     }
 
+    // SSH connection progress. This is intentionally a compact, non-modal overlay: users can keep
+    // working in an existing pane while a slow SSH handshake, auth ladder, or session restore runs.
+    *connect_progress_active = false;
+    if !connect_progress.is_empty() {
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let r = egui::Area::new(egui::Id::new("connection-progress"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.set_max_width(340.0);
+                    ui.label(egui::RichText::new("Connecting").strong());
+                    for item in connect_progress {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.vertical(|ui| {
+                                ui.label(elide(&item.label, 36));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} - {}s",
+                                        item.detail,
+                                        item.elapsed.as_secs()
+                                    ))
+                                    .weak(),
+                                );
+                            });
+                        });
+                    }
+                });
+            });
+        *connect_progress_active = r.response.contains_pointer();
+    }
+
     // Connection error, shown instead of printing to stderr.
     if let Some(msg) = error {
         egui::Window::new("Connection failed")
@@ -1469,6 +1518,8 @@ struct App {
     remote_panes: std::collections::HashSet<PaneId>,
     /// Live SSH connections, keyed by `ConnId`. Holds the per-connection id map and counter.
     connections: HashMap<ConnId, Connection>,
+    /// SSH attempts that have been started but have not reached the remote protocol's `Ready`.
+    connect_progress: HashMap<ConnId, ConnectProgress>,
     /// Allocates `ConnId`s.
     next_conn_id: ConnId,
     /// Pending auth prompts from remote connections, awaiting the user (host-key approval, …).
@@ -1535,6 +1586,7 @@ impl App {
             chrome_latched: false,
             remote_panes: std::collections::HashSet::new(),
             connections: HashMap::new(),
+            connect_progress: HashMap::new(),
             next_conn_id: 0,
             auth_prompts: Vec::new(),
             auth_inputs: Vec::new(),
@@ -1662,6 +1714,25 @@ impl App {
             .collect();
         rows.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
         rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    fn connect_progress_views(&self) -> Vec<ConnectProgressView> {
+        let mut rows: Vec<&ConnectProgress> = self.connect_progress.values().collect();
+        rows.sort_by_key(|p| p.started);
+        rows.into_iter()
+            .map(|p| ConnectProgressView {
+                label: p.label.clone(),
+                detail: p.detail.clone(),
+                elapsed: p.started.elapsed(),
+            })
+            .collect()
+    }
+
+    fn set_connect_progress(&mut self, conn: ConnId, detail: impl Into<String>) {
+        if let Some(progress) = self.connect_progress.get_mut(&conn) {
+            progress.detail = detail.into();
+            self.request_redraw();
+        }
     }
 
     fn use_connect_profile(&mut self, index: usize) {
@@ -1936,6 +2007,7 @@ impl App {
             self.workspace.remove_pane(local);
         }
         self.connections.remove(&conn); // last Sender drops → writer EOFs → daemon keeps its panes
+        self.connect_progress.remove(&conn);
         if self.workspace.tabs.is_empty() {
             self.workspace.new_tab();
         }
@@ -1960,6 +2032,15 @@ impl App {
     }
 
     fn focus_existing_persistent_target(&mut self, target: &RemoteTarget) -> bool {
+        if self
+            .connect_progress
+            .values()
+            .any(|progress| &progress.target == target)
+        {
+            self.error_msg = Some(format!("Already connecting to {}.", target.label()));
+            self.request_redraw();
+            return true;
+        }
         let conn = self
             .connections
             .iter()
@@ -1996,13 +2077,31 @@ impl App {
             port: cfg.port,
             command: command.clone(),
         };
+        let target_label = target.label();
+        self.connect_progress.insert(
+            conn,
+            ConnectProgress {
+                target: target.clone(),
+                label: display_name.clone().unwrap_or_else(|| target_label.clone()),
+                detail: format!("Connecting to {target_label} over SSH"),
+                started: Instant::now(),
+            },
+        );
+        self.request_redraw();
         let proxy = self.proxy.clone();
         thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            else {
-                return;
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::RemoteError {
+                        conn: Some(conn),
+                        msg: format!("could not start SSH runtime: {e}"),
+                    });
+                    return;
+                }
             };
             rt.block_on(async move {
                 let result = if use_session {
@@ -2058,8 +2157,10 @@ impl App {
                         drop(session); // keep the SSH session alive until the stream ends
                     }
                     Err(e) => {
-                        let _ =
-                            proxy.send_event(UserEvent::RemoteError { conn: None, msg: e.to_string() });
+                        let _ = proxy.send_event(UserEvent::RemoteError {
+                            conn: Some(conn),
+                            msg: e.to_string(),
+                        });
                     }
                 }
             });
@@ -2079,6 +2180,14 @@ impl App {
         let _ = outbound.try_send(Frame::Control(Control::Hello {
             version: proto::PROTOCOL_VERSION,
         }));
+        self.set_connect_progress(
+            conn,
+            if ephemeral {
+                "Opening remote shell"
+            } else {
+                "Restoring potty-session"
+            },
+        );
         self.connections.insert(
             conn,
             Connection {
@@ -2250,6 +2359,7 @@ impl App {
                 if let Some(c) = self.connections.get_mut(&conn) {
                     c.ready = true;
                 }
+                self.connect_progress.remove(&conn);
                 self.remember_connection_profile(conn);
                 self.ensure_remote_connection_has_tab(conn);
                 self.request_redraw();
@@ -3154,6 +3264,7 @@ impl App {
         let show_connect = self.show_connect;
         let error = self.error_msg.clone();
         let connect_profiles = self.connect_profile_views();
+        let connect_progress = self.connect_progress_views();
         // Panes whose connection is a persistent (potty-session) remote — the only ones that can be
         // detached. Computed fresh (owned) so it doesn't tangle with the borrows below.
         let detachable_panes: std::collections::HashSet<PaneId> = self
@@ -3163,6 +3274,7 @@ impl App {
             .flat_map(|c| c.routes.values().copied())
             .collect();
         let auth_inputs = &mut self.auth_inputs;
+        let mut connect_progress_active = false;
         let connect_host = &mut self.connect_host;
         let connect_name = &mut self.connect_name;
         let connect_use_session = &mut self.connect_use_session;
@@ -3196,6 +3308,8 @@ impl App {
                     connect_name,
                     connect_use_session,
                     &connect_profiles,
+                    &connect_progress,
+                    &mut connect_progress_active,
                     error.as_deref(),
                     &detachable_panes,
                 )
@@ -3209,6 +3323,7 @@ impl App {
         // dialog likewise suppresses terminal mouse handling.
         self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open())
             || feed_active
+            || connect_progress_active
             || auth_view.is_some()
             || self.show_connect
             || self.error_msg.is_some();
@@ -3585,6 +3700,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(conn, frame) => self.on_remote_frame(event_loop, conn, frame),
             UserEvent::RemoteDisconnected { conn, msg } => {
+                self.connect_progress.remove(&conn);
                 if self.connections.contains_key(&conn) {
                     self.detach_connection(conn);
                     self.error_msg = Some(msg);
@@ -3594,6 +3710,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::RemoteError { conn, msg } => {
                 // Drop a registered-but-paneless connection (a handshake that never completed), so
                 // it doesn't linger in the map.
+                if let Some(conn) = conn {
+                    self.connect_progress.remove(&conn);
+                }
                 if let Some(conn) = conn
                     && self
                         .connections
