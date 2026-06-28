@@ -53,7 +53,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
 
 use gridr::GridRenderer;
-use workspace::{PaneId, Split, Workspace, GAP};
+use workspace::{GAP, PaneId, Split, Workspace};
 // The attention-feed wire contract lives in the lib crate (shared with the `potty-notify` bin).
 // Aliased to avoid clashing with the `notify` file-watcher crate used below.
 use potty::notify as feed;
@@ -113,9 +113,15 @@ enum UserEvent {
     /// A remote connection attempt failed (auth, network, host key, …).
     /// A connection failed. `conn` is set once the connection was registered (so a phantom entry
     /// can be cleaned up); `None` for failures before that (auth, host key, …).
-    RemoteError { conn: Option<ConnId>, msg: String },
+    RemoteError {
+        conn: Option<ConnId>,
+        msg: String,
+    },
     /// A previously-greeted remote stream ended while its connection is still registered.
-    RemoteDisconnected { conn: ConnId, msg: String },
+    RemoteDisconnected {
+        conn: ConnId,
+        msg: String,
+    },
     /// A remote connection's auth ladder needs the user (host-key approval, …).
     Auth(AuthPrompt),
 }
@@ -231,7 +237,12 @@ struct GuiAuth {
 }
 
 impl remote::Authenticator for GuiAuth {
-    fn accept_host_key(&self, host: &str, fingerprint: &str, status: remote::HostKeyStatus) -> bool {
+    fn accept_host_key(
+        &self,
+        host: &str,
+        fingerprint: &str,
+        status: remote::HostKeyStatus,
+    ) -> bool {
         let (reply, rx) = std::sync::mpsc::channel();
         let ask = AuthPrompt::HostKey {
             host: host.into(),
@@ -246,17 +257,31 @@ impl remote::Authenticator for GuiAuth {
     }
 
     fn key_passphrase(&self, path: &str) -> Option<String> {
-        self.text_prompt(format!("Passphrase for {path}"), vec![("Passphrase".into(), false)])
-            .map(|mut v| v.pop().unwrap_or_default())
+        self.text_prompt(
+            format!("Passphrase for {path}"),
+            vec![("Passphrase".into(), false)],
+        )
+        .map(|mut v| v.pop().unwrap_or_default())
     }
 
     fn password(&self, user: &str, host: &str) -> Option<String> {
-        self.text_prompt(format!("Password for {user}@{host}"), vec![("Password".into(), false)])
-            .map(|mut v| v.pop().unwrap_or_default())
+        self.text_prompt(
+            format!("Password for {user}@{host}"),
+            vec![("Password".into(), false)],
+        )
+        .map(|mut v| v.pop().unwrap_or_default())
     }
 
-    fn answer(&self, name: &str, instructions: &str, prompts: &[remote::PromptInfo]) -> Option<Vec<String>> {
-        let title = [name, instructions].iter().find(|s| !s.is_empty()).map_or("Authentication", |s| s);
+    fn answer(
+        &self,
+        name: &str,
+        instructions: &str,
+        prompts: &[remote::PromptInfo],
+    ) -> Option<Vec<String>> {
+        let title = [name, instructions]
+            .iter()
+            .find(|s| !s.is_empty())
+            .map_or("Authentication", |s| s);
         let fields = prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect();
         self.text_prompt(title.to_string(), fields)
     }
@@ -266,7 +291,11 @@ impl GuiAuth {
     /// Send a text prompt to the UI and block the connection thread until the user answers.
     fn text_prompt(&self, title: String, fields: Vec<(String, bool)>) -> Option<Vec<String>> {
         let (reply, rx) = std::sync::mpsc::channel();
-        let ask = AuthPrompt::Text { title, fields, reply };
+        let ask = AuthPrompt::Text {
+            title,
+            fields,
+            reply,
+        };
         if self.proxy.send_event(UserEvent::Auth(ask)).is_err() {
             return None;
         }
@@ -288,7 +317,11 @@ struct RemoteTarget {
 
 impl RemoteTarget {
     fn label(&self) -> String {
-        let user = if self.user.is_empty() { String::new() } else { format!("{}@", self.user) };
+        let user = if self.user.is_empty() {
+            String::new()
+        } else {
+            format!("{}@", self.user)
+        };
         if self.port == 22 {
             format!("{user}{}", self.host)
         } else {
@@ -398,8 +431,15 @@ enum Action {
 /// Display data for the active auth prompt, handed to the chrome (the reply channel stays in
 /// `App::auth_prompts`; text answers come back via `App::auth_inputs`).
 enum AuthView {
-    HostKey { host: String, fingerprint: String, status: remote::HostKeyStatus },
-    Text { title: String, fields: Vec<(String, bool)> },
+    HostKey {
+        host: String,
+        fingerprint: String,
+        status: remote::HostKeyStatus,
+    },
+    Text {
+        title: String,
+        fields: Vec<(String, bool)>,
+    },
 }
 
 /// A session currently waiting for the user, as tracked by the attention feed. Keyed in `App`
@@ -521,7 +561,10 @@ fn feed_label(host: &str, cwd: &str, zellij: Option<&feed::ZellijLoc>) -> String
     } else {
         format!("{host}:{dir}")
     };
-    if let Some(sess) = zellij.and_then(|z| z.session.as_deref()).filter(|s| !s.is_empty()) {
+    if let Some(sess) = zellij
+        .and_then(|z| z.session.as_deref())
+        .filter(|s| !s.is_empty())
+    {
         s.push_str(&format!(" · zellij:{sess}"));
     }
     s
@@ -543,7 +586,11 @@ fn parse_host(input: &str) -> (String, String, u16) {
 }
 
 fn profile_target(profile: &ConnectionProfile) -> String {
-    let user = if profile.user.is_empty() { String::new() } else { format!("{}@", profile.user) };
+    let user = if profile.user.is_empty() {
+        String::new()
+    } else {
+        format!("{}@", profile.user)
+    };
     if profile.port == 22 {
         format!("{user}{}", profile.host)
     } else {
@@ -558,11 +605,16 @@ fn clean_profile_name(name: &str) -> Option<String> {
 
 fn unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn default_user() -> String {
-    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default()
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default()
 }
 
 /// The common identity files under `~/.ssh` that exist — tried after the agent.
@@ -597,7 +649,12 @@ fn human_age(d: Duration) -> String {
 ///
 /// NOTE: egui 0.34 is mid-migration to `ui.close`; `ui.close_menu` is deprecated-but-working.
 #[allow(deprecated)]
-fn full_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>, for_pane: Option<PaneId>, can_detach: bool) {
+fn full_menu(
+    ui: &mut egui::Ui,
+    actions: &mut Vec<Action>,
+    for_pane: Option<PaneId>,
+    can_detach: bool,
+) {
     let focus = |actions: &mut Vec<Action>| {
         if let Some(id) = for_pane {
             actions.push(Action::Focus(id));
@@ -672,16 +729,24 @@ fn font_settings_window(
             });
             ui.separator();
             ui.label("Font family");
-            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                if ui.selectable_label(cur_family.is_none(), "(default monospace)").clicked() {
-                    actions.push(Action::SetFontFamily(None));
-                }
-                for fam in families {
-                    if ui.selectable_label(cur_family == Some(fam.as_str()), fam).clicked() {
-                        actions.push(Action::SetFontFamily(Some(fam.clone())));
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    if ui
+                        .selectable_label(cur_family.is_none(), "(default monospace)")
+                        .clicked()
+                    {
+                        actions.push(Action::SetFontFamily(None));
                     }
-                }
-            });
+                    for fam in families {
+                        if ui
+                            .selectable_label(cur_family == Some(fam.as_str()), fam)
+                            .clicked()
+                        {
+                            actions.push(Action::SetFontFamily(Some(fam.clone())));
+                        }
+                    }
+                });
         });
 }
 
@@ -754,7 +819,11 @@ fn build_ui(
                         } else {
                             "Sessions waiting for you"
                         };
-                        if ui.selectable_label(feed_open, label).on_hover_text(hover).clicked() {
+                        if ui
+                            .selectable_label(feed_open, label)
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
                             // With nothing waiting, the bell is a dismiss: un-latch the bar.
                             // Otherwise it toggles the overlay.
                             actions.push(if empty {
@@ -770,7 +839,14 @@ fn build_ui(
     }
 
     if *show_font_settings {
-        font_settings_window(ctx, show_font_settings, families, cur_family, cur_size, actions);
+        font_settings_window(
+            ctx,
+            show_font_settings,
+            families,
+            cur_family,
+            cur_size,
+            actions,
+        );
     }
 
     egui::CentralPanel::default()
@@ -790,8 +866,14 @@ fn build_ui(
             let rects = ws.leaf_rects(area);
             let single = rects.len() == 1;
             for (id, rect) in rects {
-                ui.interact(rect, egui::Id::new(("pane", ws.active, id)), egui::Sense::click())
-                    .context_menu(|ui| full_menu(ui, actions, Some(id), detachable_panes.contains(&id)));
+                ui.interact(
+                    rect,
+                    egui::Id::new(("pane", ws.active, id)),
+                    egui::Sense::click(),
+                )
+                .context_menu(|ui| {
+                    full_menu(ui, actions, Some(id), detachable_panes.contains(&id))
+                });
                 if single {
                     leaves.push((id, rect));
                     continue;
@@ -830,7 +912,8 @@ fn build_ui(
                         Split::Rows => egui::CursorIcon::ResizeVertical,
                     };
                     ui.ctx().set_cursor_icon(cursor);
-                    ui.painter().rect_filled(d.rect, egui::CornerRadius::ZERO, border_color);
+                    ui.painter()
+                        .rect_filled(d.rect, egui::CornerRadius::ZERO, border_color);
                 }
                 if resp.dragged() {
                     if let Some(p) = resp.interact_pointer_pos() {
@@ -859,7 +942,9 @@ fn build_ui(
                     ui.style_mut().interaction.selectable_labels = false;
                     ui.set_max_width(360.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{} waiting", pending.len())).strong());
+                        ui.label(
+                            egui::RichText::new(format!("{} waiting", pending.len())).strong(),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .add(egui::Button::new("×").frame(false))
@@ -874,7 +959,9 @@ fn build_ui(
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui
-                                .add(egui::Button::new(egui::RichText::new("×").weak()).frame(false))
+                                .add(
+                                    egui::Button::new(egui::RichText::new("×").weak()).frame(false),
+                                )
                                 .on_hover_text("Dismiss")
                                 .clicked()
                             {
@@ -915,7 +1002,11 @@ fn build_ui(
 
     // SSH auth prompt, centered. The connection thread is blocked waiting on the answer.
     match auth {
-        Some(AuthView::HostKey { host, fingerprint, status }) => {
+        Some(AuthView::HostKey {
+            host,
+            fingerprint,
+            status,
+        }) => {
             egui::Window::new("SSH host key")
                 .collapsible(false)
                 .resizable(false)
@@ -1001,29 +1092,40 @@ fn build_ui(
                 ui.label("Name");
                 ui.add(egui::TextEdit::singleline(connect_name).hint_text("optional"));
                 ui.add_space(4.0);
-                ui.checkbox(connect_use_session, "Use potty-session (persistent multiplexing)")
-                    .on_hover_text(
-                        "Run potty-session on the host for split panes that survive disconnects \
+                ui.checkbox(
+                    connect_use_session,
+                    "Use potty-session (persistent multiplexing)",
+                )
+                .on_hover_text(
+                    "Run potty-session on the host for split panes that survive disconnects \
                          (it must be installed there). Off = a plain SSH shell.",
-                    );
+                );
                 if !connect_profiles.is_empty() {
                     ui.separator();
-                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                        for profile in connect_profiles {
-                            ui.horizontal(|ui| {
-                                let resp = ui.selectable_label(false, elide(&profile.label, 28));
-                                if resp.on_hover_text(profile.detail.as_str()).clicked() {
-                                    actions.push(Action::UseProfile(profile.index));
-                                }
-                                ui.label(if profile.use_potty_session { "persist" } else { "plain" });
-                            });
-                            ui.label(egui::RichText::new(elide(&profile.detail, 44)).weak());
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for profile in connect_profiles {
+                                ui.horizontal(|ui| {
+                                    let resp =
+                                        ui.selectable_label(false, elide(&profile.label, 28));
+                                    if resp.on_hover_text(profile.detail.as_str()).clicked() {
+                                        actions.push(Action::UseProfile(profile.index));
+                                    }
+                                    ui.label(if profile.use_potty_session {
+                                        "persist"
+                                    } else {
+                                        "plain"
+                                    });
+                                });
+                                ui.label(egui::RichText::new(elide(&profile.detail, 44)).weak());
+                            }
+                        });
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if (ui.button("Connect").clicked() || enter) && !connect_host.trim().is_empty() {
+                    if (ui.button("Connect").clicked() || enter) && !connect_host.trim().is_empty()
+                    {
                         actions.push(Action::Connect(connect_host.clone(), connect_name.clone()));
                     }
                     if ui.button("Cancel").clicked() {
@@ -1064,7 +1166,12 @@ struct WindowState {
     window: Arc<Window>,
 }
 
-const BG_CLEAR: wgpu::Color = wgpu::Color { r: 0.02, g: 0.02, b: 0.025, a: 1.0 };
+const BG_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0.02,
+    g: 0.02,
+    b: 0.025,
+    a: 1.0,
+};
 
 impl WindowState {
     async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Self {
@@ -1099,7 +1206,15 @@ impl WindowState {
 
         let grid = GridRenderer::new(&device, &queue, format, FONT_PX * scale, LINE_PX * scale);
 
-        Self { device, queue, surface, surface_config, instance, grid, window }
+        Self {
+            device,
+            queue,
+            surface,
+            surface_config,
+            instance,
+            grid,
+            window,
+        }
     }
 
     /// Acquire the surface texture, mapping the recoverable error cases to a redraw request.
@@ -1136,7 +1251,14 @@ impl WindowState {
         cursor_thickness: f32,
     ) {
         self.grid.prepare(
-            &self.device, &self.queue, pane, term, origin, screen, show_cursor, cursor_thickness,
+            &self.device,
+            &self.queue,
+            pane,
+            term,
+            origin,
+            screen,
+            show_cursor,
+            cursor_thickness,
         );
     }
 
@@ -1159,16 +1281,25 @@ impl WindowState {
         for (rect, pane) in panes {
             let mut encoder = self
                 .device
-                .create_command_encoder(&CommandEncoderDescriptor { label: Some("terminal") });
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("terminal"),
+                });
             {
-                let load = if first { LoadOp::Clear(BG_CLEAR) } else { LoadOp::Load };
+                let load = if first {
+                    LoadOp::Clear(BG_CLEAR)
+                } else {
+                    LoadOp::Load
+                };
                 let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                     label: Some("terminal"),
                     color_attachments: &[Some(RenderPassColorAttachment {
                         view: &view,
                         depth_slice: None,
                         resolve_target: None,
-                        ops: Operations { load, store: wgpu::StoreOp::Store },
+                        ops: Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -1191,14 +1322,19 @@ impl WindowState {
             // No panes (shouldn't happen) — still clear the surface so egui has a backdrop.
             let mut encoder = self
                 .device
-                .create_command_encoder(&CommandEncoderDescriptor { label: Some("clear") });
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("clear"),
+                });
             encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("clear"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: Operations { load: LoadOp::Clear(BG_CLEAR), store: wgpu::StoreOp::Store },
+                    ops: Operations {
+                        load: LoadOp::Clear(BG_CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -1211,7 +1347,9 @@ impl WindowState {
         // Pass 2: egui chrome on top.
         let mut encoder = self
             .device
-            .create_command_encoder(&CommandEncoderDescriptor { label: Some("egui") });
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("egui"),
+            });
         for (id, delta) in &textures_delta.set {
             egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
         }
@@ -1228,7 +1366,10 @@ impl WindowState {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: Operations { load: LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -1242,7 +1383,11 @@ impl WindowState {
             egui_renderer.free_texture(id);
         }
 
-        self.queue.submit(egui_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        self.queue.submit(
+            egui_cmds
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         frame.present();
     }
 }
@@ -1506,7 +1651,12 @@ impl App {
                     .to_string();
                 (
                     p.last_connected.unwrap_or(0),
-                    ConnectProfileView { index, label, detail, use_potty_session: p.use_potty_session },
+                    ConnectProfileView {
+                        index,
+                        label,
+                        detail,
+                        use_potty_session: p.use_potty_session,
+                    },
                 )
             })
             .collect();
@@ -1557,7 +1707,9 @@ impl App {
                 last_connected: Some(now),
             });
         }
-        self.config.profiles.sort_by_key(|p| std::cmp::Reverse(p.last_connected.unwrap_or(0)));
+        self.config
+            .profiles
+            .sort_by_key(|p| std::cmp::Reverse(p.last_connected.unwrap_or(0)));
         self.config.profiles.truncate(32);
         self.config.save(&self.config_path);
         if let Some(c) = self.connections.get_mut(&conn) {
@@ -1607,7 +1759,10 @@ impl App {
         let term: SharedTerm = Arc::new(Mutex::new(Term::new(
             term_config(&self.config),
             &dims,
-            EventProxy { proxy: self.proxy.clone(), pane: id },
+            EventProxy {
+                proxy: self.proxy.clone(),
+                pane: id,
+            },
         )));
 
         let pty = portable_pty::native_pty_system();
@@ -1680,7 +1835,10 @@ impl App {
             id,
             Terminal {
                 term,
-                backend: Backend::Local { writer, master: pair.master },
+                backend: Backend::Local {
+                    writer,
+                    master: pair.master,
+                },
                 dims,
                 title: default_title.clone(),
                 default_title,
@@ -1701,11 +1859,20 @@ impl App {
                 self.spawn_terminal(*id, self.last_dims);
             }
         }
-        let removed: Vec<PaneId> =
-            self.terms.keys().copied().filter(|id| !live.contains(id)).collect();
+        let removed: Vec<PaneId> = self
+            .terms
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
         for id in removed {
             // A remote pane closed via the UI: tell the remote to kill its shell.
-            if let Some(Backend::Remote { outbound, remote_id, .. }) = self.terms.get(&id).map(|t| &t.backend) {
+            if let Some(Backend::Remote {
+                outbound,
+                remote_id,
+                ..
+            }) = self.terms.get(&id).map(|t| &t.backend)
+            {
                 let _ = outbound.try_send(Frame::Control(Control::Close { pane: *remote_id }));
             }
             self.drop_remote_route(id);
@@ -1753,8 +1920,11 @@ impl App {
     /// the daemon detaches with its panes intact — ready to reattach. Keeps potty alive with a
     /// fresh local tab if this emptied the workspace.
     fn detach_connection(&mut self, conn: ConnId) {
-        let locals: Vec<PaneId> =
-            self.connections.get(&conn).map(|c| c.routes.values().copied().collect()).unwrap_or_default();
+        let locals: Vec<PaneId> = self
+            .connections
+            .get(&conn)
+            .map(|c| c.routes.values().copied().collect())
+            .unwrap_or_default();
         for local in locals {
             self.terms.remove(&local);
             self.remote_panes.remove(&local);
@@ -1773,8 +1943,11 @@ impl App {
     }
 
     fn focus_connection(&mut self, conn: ConnId) -> bool {
-        let locals: Vec<PaneId> =
-            self.connections.get(&conn).map(|c| c.routes.values().copied().collect()).unwrap_or_default();
+        let locals: Vec<PaneId> = self
+            .connections
+            .get(&conn)
+            .map(|c| c.routes.values().copied().collect())
+            .unwrap_or_default();
         for local in locals {
             if let Some(tab) = self.workspace.tab_of(local) {
                 self.workspace.active = tab;
@@ -1825,7 +1998,10 @@ impl App {
         };
         let proxy = self.proxy.clone();
         thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
                 return;
             };
             rt.block_on(async move {
@@ -1900,7 +2076,9 @@ impl App {
         outbound: tokio::sync::mpsc::Sender<Frame>,
         ephemeral: bool,
     ) {
-        let _ = outbound.try_send(Frame::Control(Control::Hello { version: proto::PROTOCOL_VERSION }));
+        let _ = outbound.try_send(Frame::Control(Control::Hello {
+            version: proto::PROTOCOL_VERSION,
+        }));
         self.connections.insert(
             conn,
             Connection {
@@ -1926,7 +2104,12 @@ impl App {
             Some(c) => {
                 c.routes.insert(remote_id, local);
                 c.next_remote_id = c.next_remote_id.max(remote_id + 1);
-                (c.display_name.clone().unwrap_or_else(|| c.target.host.clone()), c.outbound.clone())
+                (
+                    c.display_name
+                        .clone()
+                        .unwrap_or_else(|| c.target.host.clone()),
+                    c.outbound.clone(),
+                )
             }
             None => return,
         };
@@ -1934,13 +2117,22 @@ impl App {
         let term: SharedTerm = Arc::new(Mutex::new(Term::new(
             term_config(&self.config),
             &dims,
-            EventProxy { proxy: self.proxy.clone(), pane: local },
+            EventProxy {
+                proxy: self.proxy.clone(),
+                pane: local,
+            },
         )));
         self.terms.insert(
             local,
             Terminal {
                 term,
-                backend: Backend::Remote { conn, remote_id, label, outbound: outbound.clone(), parser: Processor::new() },
+                backend: Backend::Remote {
+                    conn,
+                    remote_id,
+                    label,
+                    outbound: outbound.clone(),
+                    parser: Processor::new(),
+                },
                 dims,
                 title: "shell".into(),
                 default_title: "shell".into(),
@@ -1998,7 +2190,10 @@ impl App {
     /// Remove a remote pane's route (and the whole connection once it has no panes left, which
     /// drops its `outbound` and lets the daemon detach). No-op for local panes.
     fn drop_remote_route(&mut self, id: PaneId) {
-        let Some(Backend::Remote { conn, remote_id, .. }) = self.terms.get(&id).map(|t| &t.backend) else {
+        let Some(Backend::Remote {
+            conn, remote_id, ..
+        }) = self.terms.get(&id).map(|t| &t.backend)
+        else {
             return;
         };
         let (conn, remote_id) = (*conn, *remote_id);
@@ -2013,8 +2208,15 @@ impl App {
     /// Feed a frame from connection `conn` into the owning pane, or handle the reattach handshake.
     fn on_remote_frame(&mut self, event_loop: &ActiveEventLoop, conn: ConnId, frame: Frame) {
         match frame {
-            Frame::Data { pane: remote_id, bytes } => {
-                let local = self.connections.get(&conn).and_then(|c| c.routes.get(&remote_id)).copied();
+            Frame::Data {
+                pane: remote_id,
+                bytes,
+            } => {
+                let local = self
+                    .connections
+                    .get(&conn)
+                    .and_then(|c| c.routes.get(&remote_id))
+                    .copied();
                 if let Some(local) = local {
                     if let Some(t) = self.terms.get_mut(&local) {
                         if let Backend::Remote { parser, .. } = &mut t.backend {
@@ -2053,7 +2255,11 @@ impl App {
                 self.request_redraw();
             }
             Frame::Control(Control::Exited { pane: remote_id }) => {
-                let local = self.connections.get(&conn).and_then(|c| c.routes.get(&remote_id)).copied();
+                let local = self
+                    .connections
+                    .get(&conn)
+                    .and_then(|c| c.routes.get(&remote_id))
+                    .copied();
                 if let Some(local) = local {
                     self.close_pane(event_loop, local);
                 }
@@ -2068,7 +2274,10 @@ impl App {
     /// session (no panes) is handled by `ensure_remote_connection_has_tab` after Ready.
     fn finish_restore(&mut self, conn: ConnId) {
         let (panes, layout) = match self.connections.get_mut(&conn) {
-            Some(c) => (std::mem::take(&mut c.restore_panes), c.restore_layout.take()),
+            Some(c) => (
+                std::mem::take(&mut c.restore_panes),
+                c.restore_layout.take(),
+            ),
             None => return,
         };
         if panes.is_empty() {
@@ -2077,15 +2286,21 @@ impl App {
         let label = self
             .connections
             .get(&conn)
-            .map(|c| c.display_name.clone().unwrap_or_else(|| c.target.host.clone()))
+            .map(|c| {
+                c.display_name
+                    .clone()
+                    .unwrap_or_else(|| c.target.host.clone())
+            })
             .unwrap_or_default();
         let map: HashMap<u64, PaneId> = panes.iter().copied().collect();
         let mut placed: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
         if let Some(layout) = layout {
             for ltab in &layout.tabs {
                 if let Some(node) = self.build_node(&ltab.root, &map, &mut placed) {
-                    let focus =
-                        ltab.focus.and_then(|r| map.get(&r).copied()).unwrap_or_else(|| node.first_leaf());
+                    let focus = ltab
+                        .focus
+                        .and_then(|r| map.get(&r).copied())
+                        .unwrap_or_else(|| node.first_leaf());
                     self.workspace.push_tab(label.clone(), node, focus);
                 }
             }
@@ -2093,7 +2308,8 @@ impl App {
         // Any restored pane the layout didn't cover (stale/missing layout) → its own tab.
         for (_remote, local) in &panes {
             if !placed.contains(local) {
-                self.workspace.push_tab(label.clone(), workspace::Node::Leaf(*local), *local);
+                self.workspace
+                    .push_tab(label.clone(), workspace::Node::Leaf(*local), *local);
             }
         }
     }
@@ -2159,14 +2375,20 @@ impl App {
     fn sync_layouts(&mut self) {
         let conns: Vec<ConnId> = self.connections.keys().copied().collect();
         for conn in conns {
-            if !self.connections.get(&conn).is_some_and(|c| c.ready && !c.ephemeral) {
+            if !self
+                .connections
+                .get(&conn)
+                .is_some_and(|c| c.ready && !c.ephemeral)
+            {
                 continue; // not ready (mid-restore), or ephemeral (no daemon to store layout)
             }
             let json = serde_json::to_string(&self.layout_for(conn)).unwrap_or_default();
             if let Some(c) = self.connections.get_mut(&conn) {
                 if c.pushed_layout.as_deref() != Some(json.as_str()) {
                     c.pushed_layout = Some(json.clone());
-                    let _ = c.outbound.try_send(Frame::Control(Control::LayoutTree { json }));
+                    let _ = c
+                        .outbound
+                        .try_send(Frame::Control(Control::LayoutTree { json }));
                 }
             }
         }
@@ -2197,8 +2419,12 @@ impl App {
     /// leaf isn't a remote pane (shouldn't happen within a remote tab).
     fn node_to_layout(&self, node: &workspace::Node) -> Option<proto::LayoutNode> {
         match node {
-            workspace::Node::Leaf(local) => self.remote_id_of(*local).map(|pane| proto::LayoutNode::Leaf { pane }),
-            workspace::Node::Branch { split, ratio, a, b, .. } => Some(proto::LayoutNode::Split {
+            workspace::Node::Leaf(local) => self
+                .remote_id_of(*local)
+                .map(|pane| proto::LayoutNode::Leaf { pane }),
+            workspace::Node::Branch {
+                split, ratio, a, b, ..
+            } => Some(proto::LayoutNode::Split {
                 cols: matches!(split, Split::Cols),
                 ratio: *ratio,
                 a: Box::new(self.node_to_layout(a)?),
@@ -2267,7 +2493,9 @@ impl App {
             use_agent: true,
             agent_sock: None,
         };
-        let auth = Arc::new(GuiAuth { proxy: self.proxy.clone() });
+        let auth = Arc::new(GuiAuth {
+            proxy: self.proxy.clone(),
+        });
         self.connect_remote(cfg, auth, command, display_name, self.connect_use_session);
         self.show_connect = false;
         self.connect_host.clear();
@@ -2288,17 +2516,35 @@ impl App {
         };
         let cfg = remote::SshConfig {
             host,
-            port: std::env::var("POTTY_TEST_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22),
+            port: std::env::var("POTTY_TEST_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(22),
             user: std::env::var("POTTY_TEST_USER").unwrap_or_default(),
-            keys: std::env::var("POTTY_TEST_KEY").ok().map(std::path::PathBuf::from).into_iter().collect(),
-            known_hosts: std::env::var("POTTY_TEST_KNOWN_HOSTS").ok().map(std::path::PathBuf::from),
+            keys: std::env::var("POTTY_TEST_KEY")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .collect(),
+            known_hosts: std::env::var("POTTY_TEST_KNOWN_HOSTS")
+                .ok()
+                .map(std::path::PathBuf::from),
             // Off by default for the spike so the test doesn't offer the dev's real agent keys to a
             // throwaway sshd (which can exhaust MaxAuthTries before the test key is tried).
             use_agent: std::env::var("POTTY_TEST_AGENT").is_ok(),
             agent_sock: None,
         };
-        let command = std::env::var("POTTY_TEST_SESSION_BIN").unwrap_or_else(|_| "potty-session".into());
-        self.connect_remote(cfg, Arc::new(GuiAuth { proxy: self.proxy.clone() }), command, None, true);
+        let command =
+            std::env::var("POTTY_TEST_SESSION_BIN").unwrap_or_else(|_| "potty-session".into());
+        self.connect_remote(
+            cfg,
+            Arc::new(GuiAuth {
+                proxy: self.proxy.clone(),
+            }),
+            command,
+            None,
+            true,
+        );
     }
 
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
@@ -2309,11 +2555,18 @@ impl App {
         self.config = new;
         // Hot-reload the OSC 52 clipboard policy on every live terminal.
         for t in self.terms.values() {
-            t.term.lock().unwrap().set_options(term_config(&self.config));
+            t.term
+                .lock()
+                .unwrap()
+                .set_options(term_config(&self.config));
         }
         // Palette / font changes affect every pane's render.
         self.dirty.extend(self.terms.keys().copied());
-        let (family, size, scale) = (self.config.font_family.clone(), self.config.font_size, self.scale);
+        let (family, size, scale) = (
+            self.config.font_family.clone(),
+            self.config.font_size,
+            self.scale,
+        );
         let palette = self.config.palette();
         let line = self.line_px(size);
         if let Some(state) = self.state.as_mut() {
@@ -2354,8 +2607,15 @@ impl App {
                     let _ = writer.write_all(bytes);
                     let _ = writer.flush();
                 }
-                Backend::Remote { outbound, remote_id, .. } => {
-                    let _ = outbound.try_send(Frame::Data { pane: *remote_id, bytes: bytes.to_vec() });
+                Backend::Remote {
+                    outbound,
+                    remote_id,
+                    ..
+                } => {
+                    let _ = outbound.try_send(Frame::Data {
+                        pane: *remote_id,
+                        bytes: bytes.to_vec(),
+                    });
                 }
             }
         }
@@ -2372,7 +2632,10 @@ impl App {
         self.arc(id).map_or((false, false), |t| {
             let guard = t.lock().unwrap();
             let m = guard.mode();
-            (m.contains(TermMode::ALT_SCREEN), m.contains(TermMode::ALTERNATE_SCROLL))
+            (
+                m.contains(TermMode::ALT_SCREEN),
+                m.contains(TermMode::ALTERNATE_SCROLL),
+            )
         })
     }
 
@@ -2395,7 +2658,11 @@ impl App {
         if alt {
             if alt_scroll {
                 let final_byte = if lines > 0 { b'A' } else { b'B' };
-                let seq = [0x1b, if self.app_cursor(id) { b'O' } else { b'[' }, final_byte];
+                let seq = [
+                    0x1b,
+                    if self.app_cursor(id) { b'O' } else { b'[' },
+                    final_byte,
+                ];
                 for _ in 0..lines.unsigned_abs() {
                     self.to_pty(id, &seq);
                 }
@@ -2449,9 +2716,15 @@ impl App {
         let relx = (px as f32 - ox).clamp(0.0, (w - 1.0).max(0.0));
         let rely = (py as f32 - oy).clamp(0.0, (h - 1.0).max(0.0));
         let col = ((relx / self.cell_w) as usize).min(dims.cols.saturating_sub(1));
-        let vis_row = ((rely / self.cell_h) as i32).min(dims.rows as i32 - 1).max(0);
+        let vis_row = ((rely / self.cell_h) as i32)
+            .min(dims.rows as i32 - 1)
+            .max(0);
         let line = vis_row - self.display_offset(id);
-        let side = if (relx / self.cell_w).fract() > 0.5 { Side::Right } else { Side::Left };
+        let side = if (relx / self.cell_w).fract() > 0.5 {
+            Side::Right
+        } else {
+            Side::Left
+        };
         Some((Point::new(Line(line), Column(col)), side))
     }
 
@@ -2475,24 +2748,43 @@ impl App {
         let (ox, oy, w, h) = self.rect_of(id)?;
         let relx = (px as f32 - ox).clamp(0.0, (w - 1.0).max(0.0));
         let rely = (py as f32 - oy).clamp(0.0, (h - 1.0).max(0.0));
-        Some(((relx / self.cell_w) as i64 + 1, (rely / self.cell_h) as i64 + 1))
+        Some((
+            (relx / self.cell_w) as i64 + 1,
+            (rely / self.cell_h) as i64 + 1,
+        ))
     }
 
     /// Encode a mouse event and write it to a pane's PTY (SGR-1006 when negotiated, else X10).
     fn report_mouse(&mut self, id: PaneId, cb: u8, pressed: bool, col: i64, row: i64, sgr: bool) {
         let bytes = if sgr {
-            format!("\x1b[<{};{};{}{}", cb, col, row, if pressed { 'M' } else { 'm' }).into_bytes()
+            format!(
+                "\x1b[<{};{};{}{}",
+                cb,
+                col,
+                row,
+                if pressed { 'M' } else { 'm' }
+            )
+            .into_bytes()
         } else {
             // X10: button+32, coords clamped to 223 and offset by 32; release is button 3.
             let b = if pressed { cb } else { 3 };
-            vec![0x1b, b'[', b'M', 32 + b, (col.min(223) + 32) as u8, (row.min(223) + 32) as u8]
+            vec![
+                0x1b,
+                b'[',
+                b'M',
+                32 + b,
+                (col.min(223) + 32) as u8,
+                (row.min(223) + 32) as u8,
+            ]
         };
         self.to_pty(id, &bytes);
     }
 
     /// Report motion for the held button (or 3 = no button) in pane `id`, deduped to cell changes.
     fn report_motion(&mut self, id: PaneId, cb: u8, sgr: bool) {
-        let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1) else { return };
+        let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1) else {
+            return;
+        };
         if self.last_report_cell == Some((col, row)) {
             return;
         }
@@ -2504,13 +2796,19 @@ impl App {
     fn start_selection(&mut self) {
         let Some(id) = self.mouse_pane else { return };
         let (px, py) = self.mouse_px;
-        let Some((point, side)) = self.point_at(id, px, py) else { return };
+        let Some((point, side)) = self.point_at(id, px, py) else {
+            return;
+        };
 
         let now = Instant::now();
         let recent = self
             .last_click
             .is_some_and(|(t, p)| now.duration_since(t) < Duration::from_millis(350) && p == point);
-        self.click_count = if recent { (self.click_count % 3) + 1 } else { 1 };
+        self.click_count = if recent {
+            (self.click_count % 3) + 1
+        } else {
+            1
+        };
         self.last_click = Some((now, point));
 
         let ty = match self.click_count {
@@ -2529,7 +2827,9 @@ impl App {
     fn update_selection(&mut self) {
         let Some(id) = self.mouse_pane else { return };
         let (px, py) = self.mouse_px;
-        let Some((point, side)) = self.point_at(id, px, py) else { return };
+        let Some((point, side)) = self.point_at(id, px, py) else {
+            return;
+        };
         if let Some(term) = self.arc(id) {
             if let Some(sel) = term.lock().unwrap().selection.as_mut() {
                 sel.update(point, side);
@@ -2751,7 +3051,11 @@ impl App {
                         pixel_height: 0,
                     });
                 }
-                Backend::Remote { outbound, remote_id, .. } => {
+                Backend::Remote {
+                    outbound,
+                    remote_id,
+                    ..
+                } => {
                     let _ = outbound.try_send(Frame::Control(Control::Resize {
                         pane: *remote_id,
                         cols: dims.cols as u16,
@@ -2796,7 +3100,11 @@ impl App {
                 let Some(term) = self.terms.get(&t.focus) else {
                     return t.title.clone();
                 };
-                let title = if term.title.is_empty() { t.title.clone() } else { term.title.clone() };
+                let title = if term.title.is_empty() {
+                    t.title.clone()
+                } else {
+                    term.title.clone()
+                };
                 // Remote tabs carry a host prefix so they're distinguishable at a glance.
                 match &term.backend {
                     Backend::Remote { label, .. } => format!("{label}: {title}"),
@@ -2828,7 +3136,12 @@ impl App {
         let chrome_latched = self.chrome_latched;
         let feed_open = self.feed_open;
         let auth_view = self.auth_prompts.first().map(|p| match p {
-            AuthPrompt::HostKey { host, fingerprint, status, .. } => AuthView::HostKey {
+            AuthPrompt::HostKey {
+                host,
+                fingerprint,
+                status,
+                ..
+            } => AuthView::HostKey {
                 host: host.clone(),
                 fingerprint: fingerprint.clone(),
                 status: *status,
@@ -2860,11 +3173,31 @@ impl App {
             let cur_size = self.config.font_size;
             self.egui_ctx.run(raw, |ctx| {
                 build_ui(
-                    ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
-                    pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
-                    &feed_items, &mut feed_active, chrome_latched, feed_open, auth_view.as_ref(),
-                    auth_inputs, show_connect, connect_host, connect_name, connect_use_session,
-                    &connect_profiles, error.as_deref(), &detachable_panes,
+                    ctx,
+                    ws,
+                    families,
+                    cur_family,
+                    cur_size,
+                    &tab_titles,
+                    border_color,
+                    pane_padding,
+                    &mut show_font,
+                    &mut actions,
+                    &mut leaves,
+                    &mut dividers,
+                    &feed_items,
+                    &mut feed_active,
+                    chrome_latched,
+                    feed_open,
+                    auth_view.as_ref(),
+                    auth_inputs,
+                    show_connect,
+                    connect_host,
+                    connect_name,
+                    connect_use_session,
+                    &connect_profiles,
+                    error.as_deref(),
+                    &detachable_panes,
                 )
             })
         };
@@ -2952,11 +3285,20 @@ impl App {
         }
         self.pane_px = leaves
             .iter()
-            .map(|(id, r)| (*id, r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp))
+            .map(|(id, r)| {
+                (
+                    *id,
+                    r.min.x * ppp,
+                    r.min.y * ppp,
+                    r.width() * ppp,
+                    r.height() * ppp,
+                )
+            })
             .collect();
         // A changed visible set means a split/close/tab-switch rearranged panes — their rects
         // may have moved without a dims change, so rebuild all of them this frame.
-        let new_visible: std::collections::HashSet<PaneId> = leaves.iter().map(|(id, _)| *id).collect();
+        let new_visible: std::collections::HashSet<PaneId> =
+            leaves.iter().map(|(id, _)| *id).collect();
         if new_visible != self.visible {
             self.dirty.extend(new_visible.iter().copied());
         }
@@ -2974,7 +3316,14 @@ impl App {
         // Divider grab regions → physical px, for the mouse handler to yield to egui.
         self.divider_px = dividers
             .iter()
-            .map(|r| (r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp))
+            .map(|r| {
+                (
+                    r.min.x * ppp,
+                    r.min.y * ppp,
+                    r.width() * ppp,
+                    r.height() * ppp,
+                )
+            })
             .collect();
 
         let prims = self.egui_ctx.tessellate(shapes, ppp);
@@ -2983,7 +3332,10 @@ impl App {
         // their cached buffers. We lock each dirty pane just long enough to rebuild it.
         let (sw, sh) = {
             let s = self.state.as_ref().unwrap();
-            (s.surface_config.width as f32, s.surface_config.height as f32)
+            (
+                s.surface_config.width as f32,
+                s.surface_config.height as f32,
+            )
         };
         let focus = self.focus();
         let cursor_thickness = self.config.cursor_thickness;
@@ -2995,7 +3347,12 @@ impl App {
                     let show_cursor = !(*id == focus && !self.blink_on);
                     let guard = term.lock().unwrap();
                     self.state.as_mut().unwrap().prepare_pane(
-                        *id as u64, &guard, origin, (sw, sh), show_cursor, cursor_thickness,
+                        *id as u64,
+                        &guard,
+                        origin,
+                        (sw, sh),
+                        show_cursor,
+                        cursor_thickness,
                     );
                 }
             }
@@ -3055,22 +3412,24 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(dir) = self.config_path.parent().map(|p| p.to_path_buf()) {
             let _ = std::fs::create_dir_all(&dir);
             let proxy = self.proxy.clone();
-            if let Ok(mut w) = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    // Only react to real content changes. Reacting to reads (Access) or
-                    // atime/permission churn (Modify::Metadata) creates a feedback loop —
-                    // ReloadConfig re-reads the file, which trips the watcher again — and two
-                    // instances watching the same dir ping-pong each other's reads to 100% CPU.
-                    let ignore = matches!(
-                        event.kind,
-                        notify::EventKind::Access(_)
-                            | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
-                    );
-                    if !ignore {
-                        let _ = proxy.send_event(UserEvent::ReloadConfig);
+            if let Ok(mut w) =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if let Ok(event) = res {
+                        // Only react to real content changes. Reacting to reads (Access) or
+                        // atime/permission churn (Modify::Metadata) creates a feedback loop —
+                        // ReloadConfig re-reads the file, which trips the watcher again — and two
+                        // instances watching the same dir ping-pong each other's reads to 100% CPU.
+                        let ignore = matches!(
+                            event.kind,
+                            notify::EventKind::Access(_)
+                                | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+                        );
+                        if !ignore {
+                            let _ = proxy.send_event(UserEvent::ReloadConfig);
+                        }
                     }
-                }
-            }) {
+                })
+            {
                 if w.watch(&dir, notify::RecursiveMode::NonRecursive).is_ok() {
                     self._watcher = Some(w);
                 }
@@ -3216,9 +3575,13 @@ impl ApplicationHandler<UserEvent> for App {
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_note(note),
             // A remote session connected — give it a tab with one shell pane.
-            UserEvent::RemoteConnected { conn, target, display_name, outbound, ephemeral } => {
-                self.on_remote_connected(conn, target, display_name, outbound, ephemeral)
-            }
+            UserEvent::RemoteConnected {
+                conn,
+                target,
+                display_name,
+                outbound,
+                ephemeral,
+            } => self.on_remote_connected(conn, target, display_name, outbound, ephemeral),
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(conn, frame) => self.on_remote_frame(event_loop, conn, frame),
             UserEvent::RemoteDisconnected { conn, msg } => {
@@ -3232,7 +3595,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // Drop a registered-but-paneless connection (a handshake that never completed), so
                 // it doesn't linger in the map.
                 if let Some(conn) = conn
-                    && self.connections.get(&conn).is_some_and(|c| c.routes.is_empty())
+                    && self
+                        .connections
+                        .get(&conn)
+                        .is_some_and(|c| c.routes.is_empty())
                 {
                     self.connections.remove(&conn);
                 }
@@ -3319,7 +3685,9 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let shift = self.mods.state().shift_key();
-                let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else { return };
+                let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else {
+                    return;
+                };
                 let (report, sgr, ..) = self.mouse_modes(id);
                 let pressed = state == ElementState::Pressed;
                 let cb = match button {
@@ -3335,7 +3703,8 @@ impl ApplicationHandler<UserEvent> for App {
                         self.workspace.focus(id);
                     }
                     if let Some(cb) = cb {
-                        if let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1) {
+                        if let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1)
+                        {
                             self.mouse_held = if pressed { Some(cb) } else { None };
                             self.mouse_pane = if pressed { Some(id) } else { None };
                             self.last_report_cell = Some((col, row));
@@ -3370,19 +3739,24 @@ impl ApplicationHandler<UserEvent> for App {
                 let focus = self.focus();
                 self.to_pty(focus, text.as_bytes());
             }
-            WindowEvent::MouseWheel { delta, .. } if !self.menu_open && !self.show_font_settings => {
+            WindowEvent::MouseWheel { delta, .. }
+                if !self.menu_open && !self.show_font_settings =>
+            {
                 // Positive = up / into history. 3 lines per wheel notch; touchpad by pixels.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
                     MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h.max(1.0) as f64) as i32,
                 };
                 if lines != 0 {
-                    let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else { return };
+                    let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else {
+                        return;
+                    };
                     let (report, sgr, ..) = self.mouse_modes(id);
                     if report && !self.mods.state().shift_key() {
                         // Forward as wheel buttons (64 = up, 65 = down) so the app scrolls.
                         let cb = if lines > 0 { 64 } else { 65 };
-                        if let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1) {
+                        if let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1)
+                        {
                             for _ in 0..lines.unsigned_abs() {
                                 self.report_mouse(id, cb, true, col, row, sgr);
                             }
@@ -3396,7 +3770,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(state) = &mut self.state {
                     state.surface_config.width = size.width.max(1);
                     state.surface_config.height = size.height.max(1);
-                    state.surface.configure(&state.device, &state.surface_config);
+                    state
+                        .surface
+                        .configure(&state.device, &state.surface_config);
                     state.window.request_redraw();
                 }
                 // Every pane's pixel rect (and the surface uniform) changed — rebuild all.
@@ -3427,7 +3803,10 @@ fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>) {
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("potty: attention feed disabled (socket {}: {e})", path.display());
+            eprintln!(
+                "potty: attention feed disabled (socket {}: {e})",
+                path.display()
+            );
             return;
         }
     };
@@ -3435,7 +3814,10 @@ fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>) {
         for stream in listener.incoming().flatten() {
             // Cap the read so a rogue client can't make us allocate unbounded.
             let mut line = String::new();
-            if BufReader::new(stream.take(64 * 1024)).read_line(&mut line).is_err() {
+            if BufReader::new(stream.take(64 * 1024))
+                .read_line(&mut line)
+                .is_err()
+            {
                 continue;
             }
             if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim()) {

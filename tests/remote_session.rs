@@ -54,7 +54,11 @@ impl Session {
                 }
             }
         });
-        Session { child, stdin, collected }
+        Session {
+            child,
+            stdin,
+            collected,
+        }
     }
 
     fn send(&mut self, f: Frame) {
@@ -83,11 +87,22 @@ fn multiplexes_panes_over_one_stream() {
     let mut s = Session::start();
 
     s.send(Frame::Control(Control::Hello { version: 1 }));
-    assert!(s.wait_until(|c| c.has(|m| matches!(m, Control::Welcome { .. }))), "no Welcome");
+    assert!(
+        s.wait_until(|c| c.has(|m| matches!(m, Control::Welcome { .. }))),
+        "no Welcome"
+    );
 
     // Two panes share one stream.
-    s.send(Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }));
-    s.send(Frame::Control(Control::Open { pane: 2, cols: 80, rows: 24 }));
+    s.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+    }));
+    s.send(Frame::Control(Control::Open {
+        pane: 2,
+        cols: 80,
+        rows: 24,
+    }));
     assert!(
         s.wait_until(|c| c.has(|m| matches!(m, Control::Opened { pane: 1 }))
             && c.has(|m| matches!(m, Control::Opened { pane: 2 }))),
@@ -95,29 +110,55 @@ fn multiplexes_panes_over_one_stream() {
     );
 
     // Input reaches the right shell; output comes back tagged to the right pane.
-    s.send(Frame::Data { pane: 1, bytes: b"echo PANE_ONE_OK\r".to_vec() });
-    s.send(Frame::Data { pane: 2, bytes: b"echo PANE_TWO_OK\r".to_vec() });
+    s.send(Frame::Data {
+        pane: 1,
+        bytes: b"echo PANE_ONE_OK\r".to_vec(),
+    });
+    s.send(Frame::Data {
+        pane: 2,
+        bytes: b"echo PANE_TWO_OK\r".to_vec(),
+    });
     assert!(
-        s.wait_until(|c| contains(&c.output(1), b"PANE_ONE_OK")
-            && contains(&c.output(2), b"PANE_TWO_OK")),
+        s.wait_until(
+            |c| contains(&c.output(1), b"PANE_ONE_OK") && contains(&c.output(2), b"PANE_TWO_OK")
+        ),
         "echo output missing",
     );
 
     // Isolation: a pane's output never leaks into the other's stream.
     {
         let c = s.collected.lock().unwrap();
-        assert!(!contains(&c.output(1), b"PANE_TWO_OK"), "pane 2 leaked into pane 1");
-        assert!(!contains(&c.output(2), b"PANE_ONE_OK"), "pane 1 leaked into pane 2");
+        assert!(
+            !contains(&c.output(1), b"PANE_TWO_OK"),
+            "pane 2 leaked into pane 1"
+        );
+        assert!(
+            !contains(&c.output(2), b"PANE_ONE_OK"),
+            "pane 1 leaked into pane 2"
+        );
     }
 
     // Resize must not disturb the stream.
-    s.send(Frame::Control(Control::Resize { pane: 1, cols: 120, rows: 40 }));
-    s.send(Frame::Data { pane: 1, bytes: b"echo AFTER_RESIZE\r".to_vec() });
-    assert!(s.wait_until(|c| contains(&c.output(1), b"AFTER_RESIZE")), "stream broke after resize");
+    s.send(Frame::Control(Control::Resize {
+        pane: 1,
+        cols: 120,
+        rows: 40,
+    }));
+    s.send(Frame::Data {
+        pane: 1,
+        bytes: b"echo AFTER_RESIZE\r".to_vec(),
+    });
+    assert!(
+        s.wait_until(|c| contains(&c.output(1), b"AFTER_RESIZE")),
+        "stream broke after resize"
+    );
 
     // Closing a pane SIGHUPs its shell.
     s.send(Frame::Control(Control::Close { pane: 1 }));
-    assert!(s.wait_until(|c| c.has(|m| matches!(m, Control::Exited { pane: 1 }))), "no Exited");
+    assert!(
+        s.wait_until(|c| c.has(|m| matches!(m, Control::Exited { pane: 1 }))),
+        "no Exited"
+    );
 
     // Client detach (EOF) → clean shutdown.
     drop(s.stdin);

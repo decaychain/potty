@@ -17,13 +17,19 @@ use alacritty_terminal::event::EventListener;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight};
+use cosmic_text::{
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight,
+};
 use wgpu::util::DeviceExt;
 
 const ATLAS: u32 = 1024;
 
 /// Selection highlight background (could become a palette entry later).
-const SELECTION_BG: Rgb = Rgb { r: 0x33, g: 0x4a, b: 0x6b };
+const SELECTION_BG: Rgb = Rgb {
+    r: 0x33,
+    g: 0x4a,
+    b: 0x6b,
+};
 
 /// Measured monospace cell box, in physical pixels.
 #[derive(Clone, Copy)]
@@ -35,10 +41,22 @@ pub struct CellMetrics {
 
 /// The 16 base ANSI colors (xterm defaults), used as the palette baseline.
 pub const BASE16: [(u8, u8, u8); 16] = [
-    (0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0),
-    (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229),
-    (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0),
-    (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
 ];
 
 pub fn default_ansi() -> [Rgb; 16] {
@@ -58,9 +76,21 @@ pub struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            fg: Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
-            bg: Rgb { r: 0x0d, g: 0x0d, b: 0x10 },
-            cursor: Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
+            fg: Rgb {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xcc,
+            },
+            bg: Rgb {
+                r: 0x0d,
+                g: 0x0d,
+                b: 0x10,
+            },
+            cursor: Rgb {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xcc,
+            },
             selection: SELECTION_BG,
             ansi: default_ansi(),
         }
@@ -185,7 +215,13 @@ fn rgba(c: Rgb, a: f32) -> [f32; 4] {
 }
 
 impl GridRenderer {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, font_px: f32, line_px: f32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        font_px: f32,
+        line_px: f32,
+    ) -> Self {
         let mut font_system = FontSystem::new();
         let swash = SwashCache::new();
         let metrics = measure(&mut font_system, &None, font_px, line_px);
@@ -206,7 +242,11 @@ impl GridRenderer {
         // Atlas texture (single-channel coverage).
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph-atlas"),
-            size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: ATLAS,
+                height: ATLAS,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -267,14 +307,23 @@ impl GridRenderer {
         let common_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("common"),
             layout: &common_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: screen_buf.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: screen_buf.as_entire_binding(),
+            }],
         });
         let atlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas"),
             layout: &atlas_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
 
@@ -316,7 +365,11 @@ impl GridRenderer {
             immediate_size: 0,
         });
 
-        let target = wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL };
+        let target = wgpu::ColorTargetState {
+            format,
+            blend,
+            write_mask: wgpu::ColorWrites::ALL,
+        };
 
         let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("bg"),
@@ -324,11 +377,14 @@ impl GridRenderer {
             vertex: wgpu::VertexState {
                 module: &bg_shader,
                 entry_point: Some("vs"),
-                buffers: &[quad_vb.clone(), wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<BgInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &bg_attrs,
-                }],
+                buffers: &[
+                    quad_vb.clone(),
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<BgInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &bg_attrs,
+                    },
+                ],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -349,11 +405,14 @@ impl GridRenderer {
             vertex: wgpu::VertexState {
                 module: &fg_shader,
                 entry_point: Some("vs"),
-                buffers: &[quad_vb, wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<FgInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &fg_attrs,
-                }],
+                buffers: &[
+                    quad_vb,
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<FgInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &fg_attrs,
+                    },
+                ],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -387,7 +446,12 @@ impl GridRenderer {
             family: None,
             palette: Palette::default(),
             families,
-            atlas: Atlas { texture, x: 0, y: 0, row_h: 0 },
+            atlas: Atlas {
+                texture,
+                x: 0,
+                y: 0,
+                row_h: 0,
+            },
             glyphs: HashMap::new(),
             screen_buf,
             common_bg,
@@ -434,7 +498,10 @@ impl GridRenderer {
     }
 
     fn rasterize(&mut self, queue: &wgpu::Queue, c: char, bold: bool) -> Option<Glyph> {
-        let mut buf = Buffer::new(&mut self.font_system, Metrics::new(self.font_px, self.metrics.h));
+        let mut buf = Buffer::new(
+            &mut self.font_system,
+            Metrics::new(self.font_px, self.metrics.h),
+        );
         let weight = if bold { Weight::BOLD } else { Weight::NORMAL };
         buf.set_text(
             &mut self.font_system,
@@ -449,7 +516,11 @@ impl GridRenderer {
         let key = lg.physical((0.0, 0.0), 1.0).cache_key;
 
         let (placement, data, mask) = match self.swash.get_image(&mut self.font_system, key) {
-            Some(img) => (img.placement, img.data.clone(), matches!(img.content, SwashContent::Mask)),
+            Some(img) => (
+                img.placement,
+                img.data.clone(),
+                matches!(img.content, SwashContent::Mask),
+            ),
             None => return None,
         };
         if !mask || placement.width == 0 || placement.height == 0 {
@@ -469,12 +540,19 @@ impl GridRenderer {
                 bytes_per_row: Some(placement.width),
                 rows_per_image: Some(placement.height),
             },
-            wgpu::Extent3d { width: placement.width, height: placement.height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: placement.width,
+                height: placement.height,
+                depth_or_array_layers: 1,
+            },
         );
         let f = ATLAS as f32;
         Some(Glyph {
             uv0: [ax as f32 / f, ay as f32 / f],
-            uv1: [(ax + placement.width) as f32 / f, (ay + placement.height) as f32 / f],
+            uv1: [
+                (ax + placement.width) as f32 / f,
+                (ay + placement.height) as f32 / f,
+            ],
             size: [placement.width as f32, placement.height as f32],
             offset: [placement.left as f32, placement.top as f32],
         })
@@ -495,7 +573,11 @@ impl GridRenderer {
         // Underline/beam thickness as a fraction of the cell.
         cursor_thickness: f32,
     ) {
-        queue.write_buffer(&self.screen_buf, 0, bytemuck::cast_slice(&[screen.0, screen.1, 0.0, 0.0]));
+        queue.write_buffer(
+            &self.screen_buf,
+            0,
+            bytemuck::cast_slice(&[screen.0, screen.1, 0.0, 0.0]),
+        );
 
         // Detach this pane's vectors (reusing their capacity) so the loop can also borrow
         // `self` mutably for glyph rasterization.
@@ -549,7 +631,11 @@ impl GridRenderer {
             }
 
             if draw_bg {
-                bg.push(BgInstance { pos: [x, y], size: [cw, ch], color: rgba(bg_col, 1.0) });
+                bg.push(BgInstance {
+                    pos: [x, y],
+                    size: [cw, ch],
+                    color: rgba(bg_col, 1.0),
+                });
             }
 
             // Non-block cursors are drawn as bars over the cell's normal bg/glyph. (They land in
@@ -559,26 +645,53 @@ impl GridRenderer {
                 match cursor_shape {
                     CursorShape::Underline => {
                         let th = (ch * cursor_thickness).max(1.0);
-                        bg.push(BgInstance { pos: [x, y + ch - th], size: [cw, th], color: cc });
+                        bg.push(BgInstance {
+                            pos: [x, y + ch - th],
+                            size: [cw, th],
+                            color: cc,
+                        });
                     }
                     CursorShape::Beam => {
                         let th = (cw * cursor_thickness).max(1.0);
-                        bg.push(BgInstance { pos: [x, y], size: [th, ch], color: cc });
+                        bg.push(BgInstance {
+                            pos: [x, y],
+                            size: [th, ch],
+                            color: cc,
+                        });
                     }
                     CursorShape::HollowBlock => {
                         // Outline the cell (e.g. an unfocused-window cursor).
                         let t = (ch * 0.07).max(1.0);
-                        bg.push(BgInstance { pos: [x, y], size: [cw, t], color: cc });
-                        bg.push(BgInstance { pos: [x, y + ch - t], size: [cw, t], color: cc });
-                        bg.push(BgInstance { pos: [x, y], size: [t, ch], color: cc });
-                        bg.push(BgInstance { pos: [x + cw - t, y], size: [t, ch], color: cc });
+                        bg.push(BgInstance {
+                            pos: [x, y],
+                            size: [cw, t],
+                            color: cc,
+                        });
+                        bg.push(BgInstance {
+                            pos: [x, y + ch - t],
+                            size: [cw, t],
+                            color: cc,
+                        });
+                        bg.push(BgInstance {
+                            pos: [x, y],
+                            size: [t, ch],
+                            color: cc,
+                        });
+                        bg.push(BgInstance {
+                            pos: [x + cw - t, y],
+                            size: [t, ch],
+                            color: cc,
+                        });
                     }
                     _ => {}
                 }
             }
 
             let c = cell.c;
-            if c != ' ' && c != '\0' && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN) {
+            if c != ' '
+                && c != '\0'
+                && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN)
+            {
                 if let Some(g) = self.glyph(queue, c, bold) {
                     fg.push(FgInstance {
                         pos: [x + g.offset[0], y + asc - g.offset[1]],
@@ -592,15 +705,34 @@ impl GridRenderer {
         }
 
         // Store the rebuilt vectors back and upload them (growing the GPU buffers if needed).
-        let pb = self.panes.entry(pane).or_insert_with(|| PaneBuffers::new(device));
-        upload(device, queue, &mut pb.bg_buf, &mut pb.bg_cap, &bg, "bg-inst");
-        upload(device, queue, &mut pb.fg_buf, &mut pb.fg_cap, &fg, "fg-inst");
+        let pb = self
+            .panes
+            .entry(pane)
+            .or_insert_with(|| PaneBuffers::new(device));
+        upload(
+            device,
+            queue,
+            &mut pb.bg_buf,
+            &mut pb.bg_cap,
+            &bg,
+            "bg-inst",
+        );
+        upload(
+            device,
+            queue,
+            &mut pb.fg_buf,
+            &mut pb.fg_cap,
+            &fg,
+            "fg-inst",
+        );
         pb.bg = bg;
         pb.fg = fg;
     }
 
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, pane: u64) {
-        let Some(pb) = self.panes.get(&pane) else { return };
+        let Some(pb) = self.panes.get(&pane) else {
+            return;
+        };
         if !pb.bg.is_empty() {
             pass.set_pipeline(&self.bg_pipeline);
             pass.set_bind_group(0, &self.common_bg, &[]);
@@ -626,18 +758,25 @@ impl GridRenderer {
 
 /// Promote one of the 8 standard ANSI colors to its bright variant (for bold text).
 fn brighten(i: u8, bright: bool) -> u8 {
-    if bright && i < 8 {
-        i + 8
-    } else {
-        i
-    }
+    if bright && i < 8 { i + 8 } else { i }
 }
 
 /// Resolve an ANSI cell color against the configured palette. App-set OSC overrides in
 /// `colors` win when present; otherwise the config palette (0–15) / computed cube (16–255)
 /// applies. `bright` (bold text) promotes the 8 base ANSI colors to their bright variants.
-fn resolve(c: AnsiColor, colors: &alacritty_terminal::term::color::Colors, palette: &Palette, bright: bool) -> Rgb {
-    let base = |i: u8| if i < 16 { palette.ansi[i as usize] } else { ansi256(i) };
+fn resolve(
+    c: AnsiColor,
+    colors: &alacritty_terminal::term::color::Colors,
+    palette: &Palette,
+    bright: bool,
+) -> Rgb {
+    let base = |i: u8| {
+        if i < 16 {
+            palette.ansi[i as usize]
+        } else {
+            ansi256(i)
+        }
+    };
     match c {
         AnsiColor::Spec(rgb) => rgb,
         AnsiColor::Indexed(i) => {
@@ -675,7 +814,11 @@ fn ansi256(i: u8) -> Rgb {
     } else if i < 232 {
         let i = i - 16;
         let step = |v: u8| if v == 0 { 0 } else { v * 40 + 55 };
-        Rgb { r: step(i / 36), g: step((i / 6) % 6), b: step(i % 6) }
+        Rgb {
+            r: step(i / 36),
+            g: step((i / 6) % 6),
+            b: step(i % 6),
+        }
     } else {
         let v = (i - 232) * 10 + 8;
         Rgb { r: v, g: v, b: v }
@@ -683,10 +826,21 @@ fn ansi256(i: u8) -> Rgb {
 }
 
 /// Measure the monospace cell box from the active font itself.
-fn measure(fs: &mut FontSystem, family: &Option<String>, font_px: f32, line_px: f32) -> CellMetrics {
+fn measure(
+    fs: &mut FontSystem,
+    family: &Option<String>,
+    font_px: f32,
+    line_px: f32,
+) -> CellMetrics {
     let mut buf = Buffer::new(fs, Metrics::new(font_px, line_px));
     buf.set_size(fs, Some(1000.0), Some(line_px * 2.0));
-    buf.set_text(fs, "M", &mono_attrs(family, Weight::NORMAL), Shaping::Advanced, None);
+    buf.set_text(
+        fs,
+        "M",
+        &mono_attrs(family, Weight::NORMAL),
+        Shaping::Advanced,
+        None,
+    );
     buf.shape_until_scroll(fs, false);
     let (mut w, mut ascent) = (font_px * 0.6, line_px * 0.8);
     if let Some(run) = buf.layout_runs().next() {
@@ -695,7 +849,11 @@ fn measure(fs: &mut FontSystem, family: &Option<String>, font_px: f32, line_px: 
         }
         ascent = run.line_y;
     }
-    CellMetrics { w, h: line_px, ascent }
+    CellMetrics {
+        w,
+        h: line_px,
+        ascent,
+    }
 }
 
 fn inst_buf(device: &wgpu::Device, label: &str, bytes: usize) -> wgpu::Buffer {

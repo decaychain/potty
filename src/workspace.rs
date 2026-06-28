@@ -5,7 +5,7 @@
 //! itself — it just mutates the tree, and the app diffs `all_leaves()` against its live
 //! terminals to keep them in sync.
 
-use egui::{pos2, vec2, Rect};
+use egui::{Rect, pos2, vec2};
 
 pub type PaneId = u64;
 
@@ -69,7 +69,9 @@ impl Node {
     fn leaf_rects(&self, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
         match self {
             Node::Leaf(id) => out.push((*id, area)),
-            Node::Branch { split, ratio, a, b, .. } => {
+            Node::Branch {
+                split, ratio, a, b, ..
+            } => {
                 let (ra, rb) = cut(area, *split, *ratio);
                 a.leaf_rects(ra, out);
                 b.leaf_rects(rb, out);
@@ -79,13 +81,29 @@ impl Node {
 
     /// Collect each branch's divider strip (the gap between its children) and its area.
     fn dividers(&self, area: Rect, out: &mut Vec<Divider>) {
-        if let Node::Branch { id, split, ratio, a, b } = self {
+        if let Node::Branch {
+            id,
+            split,
+            ratio,
+            a,
+            b,
+        } = self
+        {
             let (ra, rb) = cut(area, *split, *ratio);
             let rect = match split {
-                Split::Cols => Rect::from_min_max(pos2(ra.max.x, area.min.y), pos2(rb.min.x, area.max.y)),
-                Split::Rows => Rect::from_min_max(pos2(area.min.x, ra.max.y), pos2(area.max.x, rb.min.y)),
+                Split::Cols => {
+                    Rect::from_min_max(pos2(ra.max.x, area.min.y), pos2(rb.min.x, area.max.y))
+                }
+                Split::Rows => {
+                    Rect::from_min_max(pos2(area.min.x, ra.max.y), pos2(area.max.x, rb.min.y))
+                }
             };
-            out.push(Divider { id: *id, rect, area, split: *split });
+            out.push(Divider {
+                id: *id,
+                rect,
+                area,
+                split: *split,
+            });
             a.dividers(ra, out);
             b.dividers(rb, out);
         }
@@ -95,7 +113,13 @@ impl Node {
     fn set_ratio(&mut self, id: u64, ratio: f32) -> bool {
         match self {
             Node::Leaf(_) => false,
-            Node::Branch { id: bid, ratio: r, a, b, .. } => {
+            Node::Branch {
+                id: bid,
+                ratio: r,
+                a,
+                b,
+                ..
+            } => {
                 if *bid == id {
                     *r = ratio.clamp(0.05, 0.95);
                     true
@@ -134,19 +158,23 @@ impl Node {
         match self {
             Node::Leaf(id) if id == target => None,
             leaf @ Node::Leaf(_) => Some(leaf),
-            Node::Branch { id, split, ratio, a, b } => {
-                match (a.without(target), b.without(target)) {
-                    (Some(a), Some(b)) => Some(Node::Branch {
-                        id,
-                        split,
-                        ratio,
-                        a: Box::new(a),
-                        b: Box::new(b),
-                    }),
-                    (Some(n), None) | (None, Some(n)) => Some(n),
-                    (None, None) => None,
-                }
-            }
+            Node::Branch {
+                id,
+                split,
+                ratio,
+                a,
+                b,
+            } => match (a.without(target), b.without(target)) {
+                (Some(a), Some(b)) => Some(Node::Branch {
+                    id,
+                    split,
+                    ratio,
+                    a: Box::new(a),
+                    b: Box::new(b),
+                }),
+                (Some(n), None) | (None, Some(n)) => Some(n),
+                (None, None) => None,
+            },
         }
     }
 
@@ -215,7 +243,11 @@ impl Workspace {
 
     /// Append a tab with a prebuilt layout (a restored remote tree) and make it active.
     pub fn push_tab(&mut self, title: String, layout: Node, focus: PaneId) {
-        self.tabs.push(Tab { title, layout, focus });
+        self.tabs.push(Tab {
+            title,
+            layout,
+            focus,
+        });
         self.active = self.tabs.len() - 1;
     }
 
@@ -285,7 +317,10 @@ impl Workspace {
         let id = self.alloc();
         let branch = self.alloc();
         let focus = self.tabs[self.active].focus;
-        if self.tabs[self.active].layout.split_leaf(focus, split, id, branch) {
+        if self.tabs[self.active]
+            .layout
+            .split_leaf(focus, split, id, branch)
+        {
             // Focus the new pane so repeated splits chain naturally.
             self.tabs[self.active].focus = id;
         }

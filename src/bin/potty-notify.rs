@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use lexopt::prelude::{Long, Short, Value};
 use potty::notify::{
-    default_socket_path, Kind, Note, Tool, ZellijLoc, ENV_PANE, ENV_SOCK, SCHEMA_VERSION,
+    ENV_PANE, ENV_SOCK, Kind, Note, SCHEMA_VERSION, Tool, ZellijLoc, default_socket_path,
 };
 
 fn main() {
@@ -32,7 +32,12 @@ fn main() {
     loop {
         match parser.next() {
             Ok(Some(Long("tool"))) => {
-                tool = match parser.value().ok().and_then(|v| v.into_string().ok()).as_deref() {
+                tool = match parser
+                    .value()
+                    .ok()
+                    .and_then(|v| v.into_string().ok())
+                    .as_deref()
+                {
                     Some("claude") => Tool::Claude,
                     Some("codex") => Tool::Codex,
                     _ => Tool::Other,
@@ -74,7 +79,9 @@ fn main() {
             "claude" => install_claude(),
             "codex" => install_codex(),
             other => {
-                eprintln!("potty-notify: unknown --install-hook target '{other}' (use claude|codex)");
+                eprintln!(
+                    "potty-notify: unknown --install-hook target '{other}' (use claude|codex)"
+                );
                 std::process::exit(2);
             }
         };
@@ -96,7 +103,9 @@ fn main() {
     let get = |k: &str| v.get(k).and_then(|x| x.as_str());
 
     let host = hostname();
-    let pane = std::env::var(ENV_PANE).ok().and_then(|s| s.parse::<u64>().ok());
+    let pane = std::env::var(ENV_PANE)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
 
     // Field names vary by tool/event; fall back gracefully so a note is always well-formed.
     let session = get("session_id")
@@ -117,7 +126,11 @@ fn main() {
         .to_string();
     let cwd = get("cwd")
         .map(String::from)
-        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
         .unwrap_or_default();
 
     let note = Note {
@@ -163,7 +176,11 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "localhost".into())
 }
@@ -172,14 +189,21 @@ fn hostname() -> String {
 fn zellij_loc() -> Option<ZellijLoc> {
     std::env::var_os("ZELLIJ")?;
     Some(ZellijLoc {
-        session: std::env::var("ZELLIJ_SESSION_NAME").ok().filter(|s| !s.is_empty()),
-        pane: std::env::var("ZELLIJ_PANE_ID").ok().filter(|s| !s.is_empty()),
+        session: std::env::var("ZELLIJ_SESSION_NAME")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        pane: std::env::var("ZELLIJ_PANE_ID")
+            .ok()
+            .filter(|s| !s.is_empty()),
     })
 }
 
 fn unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn print_help() {
@@ -248,7 +272,9 @@ fn print_ssh_wrapper() {
     let remote = "/tmp/potty-notify-$POTTY_PANE.sock";
     println!("# potty attention feed over SSH — add to ~/.bashrc or ~/.zshrc.");
     println!("# Forwards the notify socket on every ssh, with a PER-PANE remote path so two");
-    println!("# sessions to the same host don't collide. Outside potty (no $POTTY_PANE) it's plain ssh.");
+    println!(
+        "# sessions to the same host don't collide. Outside potty (no $POTTY_PANE) it's plain ssh."
+    );
     println!("ssh() {{");
     println!("  if [ -n \"$POTTY_PANE\" ] && [ -S \"$POTTY_NOTIFY\" ]; then");
     println!("    command ssh -R \"{remote}:$POTTY_NOTIFY\" \\");
@@ -286,7 +312,7 @@ fn exe_path() -> String {
 /// Wire the `Notification` (raise) and `UserPromptSubmit` (clear) hooks into Claude's settings,
 /// preserving any existing hooks. Skips an event that already has a potty-notify command.
 fn install_claude() -> std::io::Result<()> {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     let path = home_dir().join(".claude").join("settings.json");
     let exe = exe_path();
@@ -322,7 +348,9 @@ fn install_claude() -> std::io::Result<()> {
         let present = arr.iter().any(|m| {
             m.get("hooks").and_then(Value::as_array).is_some_and(|hs| {
                 hs.iter().any(|h| {
-                    h.get("command").and_then(Value::as_str).is_some_and(|c| c.contains("potty-notify"))
+                    h.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.contains("potty-notify"))
                 })
             })
         });
@@ -352,7 +380,7 @@ fn install_claude() -> std::io::Result<()> {
 /// Set Codex's `notify` to this helper, preserving the rest of config.toml (comments, layout).
 /// Won't clobber an existing `notify` that points elsewhere — it prints what to set instead.
 fn install_codex() -> std::io::Result<()> {
-    use toml_edit::{value, Array, DocumentMut};
+    use toml_edit::{Array, DocumentMut, value};
 
     let path = home_dir().join(".codex").join("config.toml");
     let exe = exe_path();
@@ -388,6 +416,9 @@ fn install_codex() -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&path, doc.to_string())?;
-    println!("Updated {} — notify = [\"{exe}\", \"--tool\", \"codex\"]", path.display());
+    println!(
+        "Updated {} — notify = [\"{exe}\", \"--tool\", \"codex\"]",
+        path.display()
+    );
     Ok(())
 }

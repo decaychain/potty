@@ -13,15 +13,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use russh::ChannelMsg;
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
-use russh::keys::agent::client::AgentClient;
 use russh::keys::agent::AgentIdentity;
+use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::learn_known_hosts;
 use russh::keys::{
-    check_known_hosts, check_known_hosts_path, load_secret_key, HashAlg, PrivateKeyWithHashAlg,
-    PublicKey,
+    HashAlg, PrivateKeyWithHashAlg, PublicKey, check_known_hosts, check_known_hosts_path,
+    load_secret_key,
 };
-use russh::ChannelMsg;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -54,7 +54,12 @@ pub trait Authenticator: Send + Sync {
         None
     }
     /// Answer a keyboard-interactive challenge, one response per prompt (None → abandon method).
-    fn answer(&self, _name: &str, _instructions: &str, _prompts: &[PromptInfo]) -> Option<Vec<String>> {
+    fn answer(
+        &self,
+        _name: &str,
+        _instructions: &str,
+        _prompts: &[PromptInfo],
+    ) -> Option<Vec<String>> {
         None
     }
     /// Password for the plain `password` method (None → skip).
@@ -95,7 +100,9 @@ pub struct RemoteSession {
 impl RemoteSession {
     /// A snapshot of the captured remote stderr, trimmed. Empty if the remote said nothing.
     pub fn stderr(&self) -> String {
-        String::from_utf8_lossy(&self.stderr.lock().unwrap()).trim().to_string()
+        String::from_utf8_lossy(&self.stderr.lock().unwrap())
+            .trim()
+            .to_string()
     }
 }
 
@@ -130,7 +137,9 @@ impl client::Handler for ClientHandler {
         if self.auth.accept_host_key(&self.host, &fingerprint, status) {
             // Record a newly-accepted key so we don't ask again. Best-effort.
             let _ = match &self.known_hosts {
-                Some(p) => russh::keys::known_hosts::learn_known_hosts_path(&self.host, self.port, key, p),
+                Some(p) => {
+                    russh::keys::known_hosts::learn_known_hosts_path(&self.host, self.port, key, p)
+                }
                 None => learn_known_hosts(&self.host, self.port, key),
             };
             Ok(true)
@@ -209,7 +218,14 @@ pub async fn connect_and_exec(
         let _ = write_half.close().await;
     });
 
-    Ok((RemoteSession { _session: Some(session), stderr }, out_tx, in_rx))
+    Ok((
+        RemoteSession {
+            _session: Some(session),
+            stderr,
+        },
+        out_tx,
+        in_rx,
+    ))
 }
 
 /// Connect and authenticate, then run a **plain interactive shell** over SSH — no `potty-session`,
@@ -235,7 +251,11 @@ pub async fn shell_session(
                 // Greet exactly like the daemon would, so the GUI's connect flow proceeds: with no
                 // panes to restore it will open a fresh one (an `Open`).
                 Frame::Control(Control::Hello { .. }) => {
-                    let _ = in_tx.send(Frame::Control(Control::Welcome { version: crate::proto::PROTOCOL_VERSION })).await;
+                    let _ = in_tx
+                        .send(Frame::Control(Control::Welcome {
+                            version: crate::proto::PROTOCOL_VERSION,
+                        }))
+                        .await;
                     let _ = in_tx.send(Frame::Control(Control::Ready)).await;
                 }
                 // A new pane → a new channel running a login shell in a PTY of the requested size.
@@ -292,7 +312,14 @@ pub async fn shell_session(
     });
 
     let stderr = Arc::new(Mutex::new(Vec::new())); // unused here (raw shells always greet), kept for API parity
-    Ok((RemoteSession { _session: None, stderr }, out_tx, in_rx))
+    Ok((
+        RemoteSession {
+            _session: None,
+            stderr,
+        },
+        out_tx,
+        in_rx,
+    ))
 }
 
 /// Open one SSH channel with a PTY of `cols`×`rows` running a login shell.
@@ -322,7 +349,9 @@ async fn connect_session(
         auth: auth.clone(),
     };
     let config = Arc::new(client::Config::default());
-    client::connect(config, (cfg.host.as_str(), cfg.port), handler).await.map_err(io_err)
+    client::connect(config, (cfg.host.as_str(), cfg.port), handler)
+        .await
+        .map_err(io_err)
 }
 
 /// Authenticate, returning the authenticated session. **Each method group runs on its own fresh
@@ -330,7 +359,10 @@ async fn connect_session(
 /// otherwise exhaust the budget on rejected keys and disconnect before the password method is ever
 /// reached. A fresh connection resets that budget, so a working method downstream of a key-heavy
 /// agent is still reachable.
-async fn authenticate(cfg: &SshConfig, auth: &Arc<dyn Authenticator>) -> std::io::Result<Handle<ClientHandler>> {
+async fn authenticate(
+    cfg: &SshConfig,
+    auth: &Arc<dyn Authenticator>,
+) -> std::io::Result<Handle<ClientHandler>> {
     // We connect lazily per group so an early success costs only one connection. The first connect
     // also records/learns the host key, so later groups don't re-prompt.
 
@@ -344,7 +376,11 @@ async fn authenticate(cfg: &SshConfig, auth: &Arc<dyn Authenticator>) -> std::io
         let agent = AgentClient::connect_pageant().await.ok();
         if let Some(agent) = agent {
             let mut session = connect_session(cfg, auth).await?;
-            let rsa_hash = session.best_supported_rsa_hash().await.map_err(io_err)?.flatten();
+            let rsa_hash = session
+                .best_supported_rsa_hash()
+                .await
+                .map_err(io_err)?
+                .flatten();
             // Ok(false)/Err both mean "agent didn't get us in" → reconnect for the next group.
             if let Ok(true) = agent_auth(&mut session, &cfg.user, agent, rsa_hash).await {
                 return Ok(session);
@@ -355,7 +391,11 @@ async fn authenticate(cfg: &SshConfig, auth: &Arc<dyn Authenticator>) -> std::io
     // 2. Key files.
     if !cfg.keys.is_empty() {
         let mut session = connect_session(cfg, auth).await?;
-        let rsa_hash = session.best_supported_rsa_hash().await.map_err(io_err)?.flatten();
+        let rsa_hash = session
+            .best_supported_rsa_hash()
+            .await
+            .map_err(io_err)?
+            .flatten();
         for key_path in &cfg.keys {
             if try_key(&mut session, &cfg.user, key_path, auth, rsa_hash).await {
                 return Ok(session);
@@ -366,7 +406,10 @@ async fn authenticate(cfg: &SshConfig, auth: &Arc<dyn Authenticator>) -> std::io
     // 3. Keyboard-interactive (PAM passwords, OTP, SSSD fallback).
     {
         let mut session = connect_session(cfg, auth).await?;
-        if try_keyboard_interactive(&mut session, &cfg.user, auth).await.unwrap_or(false) {
+        if try_keyboard_interactive(&mut session, &cfg.user, auth)
+            .await
+            .unwrap_or(false)
+        {
             return Ok(session);
         }
     }
@@ -390,7 +433,6 @@ async fn connect_agent_unix(cfg: &SshConfig) -> Option<AgentClient<tokio::net::U
     }
 }
 
-
 /// The SSH session dropped mid-authentication (the server likely caps attempts).
 struct Disconnected;
 
@@ -412,9 +454,12 @@ where
     for id in identities {
         // Certificates are skipped for now; plain keys cover the common case.
         if let AgentIdentity::PublicKey { key, .. } = id {
-            match session.authenticate_publickey_with(user, key, rsa_hash, &mut agent).await {
+            match session
+                .authenticate_publickey_with(user, key, rsa_hash, &mut agent)
+                .await
+            {
                 Ok(result) if result.success() => return Ok(true),
-                Ok(_) => {} // rejected — try the next identity
+                Ok(_) => {}                         // rejected — try the next identity
                 Err(_) => return Err(Disconnected), // transport/session gone
             }
         }
@@ -454,7 +499,9 @@ async fn try_keyboard_interactive(
     user: &str,
     auth: &Arc<dyn Authenticator>,
 ) -> std::io::Result<bool> {
-    let Ok(mut response) = session.authenticate_keyboard_interactive_start(user, None::<String>).await
+    let Ok(mut response) = session
+        .authenticate_keyboard_interactive_start(user, None::<String>)
+        .await
     else {
         return Ok(false); // method unavailable or session gone — let the ladder finish cleanly
     };
@@ -462,10 +509,17 @@ async fn try_keyboard_interactive(
         match response {
             KeyboardInteractiveAuthResponse::Success => return Ok(true),
             KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
-            KeyboardInteractiveAuthResponse::InfoRequest { name, instructions, prompts } => {
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
                 let infos: Vec<PromptInfo> = prompts
                     .into_iter()
-                    .map(|p| PromptInfo { prompt: p.prompt, echo: p.echo })
+                    .map(|p| PromptInfo {
+                        prompt: p.prompt,
+                        echo: p.echo,
+                    })
                     .collect();
                 let Some(answers) = auth.answer(&name, &instructions, &infos) else {
                     return Ok(false);

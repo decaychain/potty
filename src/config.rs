@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use serde::{Deserialize, Serialize};
 
-use crate::gridr::{default_ansi, Palette, BASE16};
+use crate::gridr::{BASE16, Palette, default_ansi};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -116,7 +116,10 @@ impl Default for Colors {
             cursor: "#cccccc".into(),
             selection: "#334a6b".into(),
             border: "#78a0ff".into(),
-            ansi: BASE16.iter().map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}")).collect(),
+            ansi: BASE16
+                .iter()
+                .map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
+                .collect(),
         }
     }
 }
@@ -149,10 +152,26 @@ impl Config {
             }
         }
         Palette {
-            fg: parse_hex(&self.colors.foreground).unwrap_or(Rgb { r: 0xcc, g: 0xcc, b: 0xcc }),
-            bg: parse_hex(&self.colors.background).unwrap_or(Rgb { r: 0x0d, g: 0x0d, b: 0x10 }),
-            cursor: parse_hex(&self.colors.cursor).unwrap_or(Rgb { r: 0xcc, g: 0xcc, b: 0xcc }),
-            selection: parse_hex(&self.colors.selection).unwrap_or(Rgb { r: 0x33, g: 0x4a, b: 0x6b }),
+            fg: parse_hex(&self.colors.foreground).unwrap_or(Rgb {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xcc,
+            }),
+            bg: parse_hex(&self.colors.background).unwrap_or(Rgb {
+                r: 0x0d,
+                g: 0x0d,
+                b: 0x10,
+            }),
+            cursor: parse_hex(&self.colors.cursor).unwrap_or(Rgb {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xcc,
+            }),
+            selection: parse_hex(&self.colors.selection).unwrap_or(Rgb {
+                r: 0x33,
+                g: 0x4a,
+                b: 0x6b,
+            }),
             ansi,
         }
     }
@@ -169,7 +188,11 @@ impl Config {
 
     /// Active pane border colour for the chrome.
     pub fn border(&self) -> Rgb {
-        parse_hex(&self.colors.border).unwrap_or(Rgb { r: 0x78, g: 0xa0, b: 0xff })
+        parse_hex(&self.colors.border).unwrap_or(Rgb {
+            r: 0x78,
+            g: 0xa0,
+            b: 0xff,
+        })
     }
 }
 

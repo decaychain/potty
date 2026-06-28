@@ -75,9 +75,16 @@ pub struct LayoutTab {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "k", rename_all = "lowercase")]
 pub enum LayoutNode {
-    Leaf { pane: PaneId },
+    Leaf {
+        pane: PaneId,
+    },
     /// `cols` = side-by-side (vertical divider); otherwise stacked. `ratio` is the first child's share.
-    Split { cols: bool, ratio: f32, a: Box<LayoutNode>, b: Box<LayoutNode> },
+    Split {
+        cols: bool,
+        ratio: f32,
+        a: Box<LayoutNode>,
+        b: Box<LayoutNode>,
+    },
 }
 
 /// A decoded frame.
@@ -85,7 +92,10 @@ pub enum LayoutNode {
 pub enum Frame {
     Control(Control),
     /// Raw terminal bytes for a pane. S→C = output, C→S = input.
-    Data { pane: PaneId, bytes: Vec<u8> },
+    Data {
+        pane: PaneId,
+        bytes: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -146,12 +156,15 @@ fn checked_len(bytes: [u8; 4]) -> io::Result<usize> {
 
 fn decode_payload(payload: &[u8]) -> io::Result<Frame> {
     match payload.first().copied() {
-        Some(TAG_CONTROL) => {
-            Ok(Frame::Control(serde_json::from_slice(&payload[1..]).map_err(io::Error::other)?))
-        }
+        Some(TAG_CONTROL) => Ok(Frame::Control(
+            serde_json::from_slice(&payload[1..]).map_err(io::Error::other)?,
+        )),
         Some(TAG_DATA) if payload.len() >= 9 => {
             let pane = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            Ok(Frame::Data { pane, bytes: payload[9..].to_vec() })
+            Ok(Frame::Data {
+                pane,
+                bytes: payload[9..].to_vec(),
+            })
         }
         Some(TAG_DATA) => Err(io::Error::other("short data frame")),
         Some(other) => Err(io::Error::other(format!("unknown frame tag {other}"))),
@@ -164,7 +177,13 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
     let mut n = 0;
     while n < buf.len() {
         match r.read(&mut buf[n..]) {
-            Ok(0) => return if n == 0 { Ok(false) } else { Err(io::ErrorKind::UnexpectedEof.into()) },
+            Ok(0) => {
+                return if n == 0 {
+                    Ok(false)
+                } else {
+                    Err(io::ErrorKind::UnexpectedEof.into())
+                };
+            }
             Ok(k) => n += k,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
@@ -185,13 +204,20 @@ mod tests {
 
     #[test]
     fn control_roundtrips() {
-        let f = Frame::Control(Control::Open { pane: 7, cols: 80, rows: 24 });
+        let f = Frame::Control(Control::Open {
+            pane: 7,
+            cols: 80,
+            rows: 24,
+        });
         assert_eq!(roundtrip(&f), f);
     }
 
     #[test]
     fn data_roundtrips_raw_bytes() {
-        let f = Frame::Data { pane: 3, bytes: vec![0, 27, 255, b'x', b'\n'] };
+        let f = Frame::Data {
+            pane: 3,
+            bytes: vec![0, 27, 255, b'x', b'\n'],
+        };
         assert_eq!(roundtrip(&f), f);
     }
 

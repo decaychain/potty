@@ -10,7 +10,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use potty::proto::{Control, Frame};
-use potty::remote::{connect_and_exec, shell_session, Authenticator, HostKeyStatus, RemoteSession, SshConfig};
+use potty::remote::{
+    Authenticator, HostKeyStatus, RemoteSession, SshConfig, connect_and_exec, shell_session,
+};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 fn which(candidates: &[&str]) -> Option<PathBuf> {
@@ -18,7 +20,11 @@ fn which(candidates: &[&str]) -> Option<PathBuf> {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -84,7 +90,11 @@ fn start_sshd() -> Option<Sshd> {
     let sshd = which(&["/usr/sbin/sshd", "/usr/bin/sshd"])?;
     let keygen_bin = which(&["/usr/bin/ssh-keygen", "/bin/ssh-keygen"])?;
 
-    let dir = std::env::temp_dir().join(format!("potty-sshtest-{}-{}", std::process::id(), free_port()));
+    let dir = std::env::temp_dir().join(format!(
+        "potty-sshtest-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
     std::fs::create_dir_all(&dir).ok()?;
     let hostkey = dir.join("hostkey");
     let client_key = dir.join("clientkey");
@@ -128,7 +138,12 @@ fn start_sshd() -> Option<Sshd> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Some(Sshd { child, dir, port, client_key });
+            return Some(Sshd {
+                child,
+                dir,
+                port,
+                client_key,
+            });
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -136,20 +151,35 @@ fn start_sshd() -> Option<Sshd> {
 }
 
 fn user() -> Option<String> {
-    std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok()
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
 }
 
 /// The remote command: run potty-session inline (no daemon) so these transport tests don't leave
 /// a persistent daemon behind. The remote shell applies the env prefix.
 fn session_cmd() -> String {
-    format!("POTTY_SESSION_NODAEMON=1 {}", env!("CARGO_BIN_EXE_potty-session"))
+    format!(
+        "POTTY_SESSION_NODAEMON=1 {}",
+        env!("CARGO_BIN_EXE_potty-session")
+    )
 }
 
 fn persistent_session_cmd(sock: &Path) -> String {
-    format!("POTTY_SESSION_SOCK={} {}", sock.display(), env!("CARGO_BIN_EXE_potty-session"))
+    format!(
+        "POTTY_SESSION_SOCK={} {}",
+        sock.display(),
+        env!("CARGO_BIN_EXE_potty-session")
+    )
 }
 
-fn config(sshd: &Sshd, user: &str, keys: Vec<PathBuf>, use_agent: bool, agent_sock: Option<PathBuf>) -> SshConfig {
+fn config(
+    sshd: &Sshd,
+    user: &str,
+    keys: Vec<PathBuf>,
+    use_agent: bool,
+    agent_sock: Option<PathBuf>,
+) -> SshConfig {
     SshConfig {
         host: "127.0.0.1".into(),
         port: sshd.port,
@@ -163,11 +193,22 @@ fn config(sshd: &Sshd, user: &str, keys: Vec<PathBuf>, use_agent: bool, agent_so
 
 /// Open a pane, run a marker echo in it, and assert the output round-trips back as frames. `session`
 /// is kept alive (it owns the SSH handle) for the duration.
-async fn assert_echo_round_trip(session: RemoteSession, outbound: Sender<Frame>, mut rx: Receiver<Frame>) {
+async fn assert_echo_round_trip(
+    session: RemoteSession,
+    outbound: Sender<Frame>,
+    mut rx: Receiver<Frame>,
+) {
     for f in [
         Frame::Control(Control::Hello { version: 1 }),
-        Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }),
-        Frame::Data { pane: 1, bytes: b"echo SSH_ROUNDTRIP_OK\r".to_vec() },
+        Frame::Control(Control::Open {
+            pane: 1,
+            cols: 80,
+            rows: 24,
+        }),
+        Frame::Data {
+            pane: 1,
+            bytes: b"echo SSH_ROUNDTRIP_OK\r".to_vec(),
+        },
     ] {
         outbound.send(f).await.expect("send frame");
     }
@@ -198,8 +239,16 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
         return;
     }
 
-    let sock = std::env::temp_dir().join(format!("potty-ssh-persist-{}-{}.sock", std::process::id(), sshd.port));
-    let marker = format!("POTTY_SSH_PERSIST_MARKER_{}_{}", std::process::id(), sshd.port);
+    let sock = std::env::temp_dir().join(format!(
+        "potty-ssh-persist-{}-{}.sock",
+        std::process::id(),
+        sshd.port
+    ));
+    let marker = format!(
+        "POTTY_SSH_PERSIST_MARKER_{}_{}",
+        std::process::id(),
+        sshd.port
+    );
     let command = persistent_session_cmd(&sock);
     let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
 
@@ -209,7 +258,11 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
             .expect("connect persistent session over ssh");
     for f in [
         Frame::Control(Control::Hello { version: 1 }),
-        Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }),
+        Frame::Control(Control::Open {
+            pane: 1,
+            cols: 80,
+            rows: 24,
+        }),
         Frame::Data {
             pane: 1,
             bytes: format!("sh -c 'while true; do echo {marker}; sleep 1; done'\r").into_bytes(),
@@ -231,15 +284,24 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
             break;
         }
     }
-    assert!(contains(&out, marker.as_bytes()), "marker never reached first ssh attach");
+    assert!(
+        contains(&out, marker.as_bytes()),
+        "marker never reached first ssh attach"
+    );
     assert!(pgrep(&marker), "marker process never started");
 
     drop(outbound1);
     let detached = wait_until(Duration::from_secs(5), || {
-        matches!(rx1.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected))
+        matches!(
+            rx1.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        )
     });
     drop(session1);
-    assert!(detached, "first ssh attach did not detach after outbound drop");
+    assert!(
+        detached,
+        "first ssh attach did not detach after outbound drop"
+    );
     assert!(pgrep(&marker), "marker process did not survive ssh detach");
 
     let (session2, outbound2, mut rx2) =
@@ -268,7 +330,9 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
         }
     }
 
-    let _ = outbound2.send(Frame::Control(Control::Close { pane: 1 })).await;
+    let _ = outbound2
+        .send(Frame::Control(Control::Close { pane: 1 }))
+        .await;
     drop(outbound2);
     drop(session2);
     let _ = Command::new("pkill").args(["-f", &marker]).status();
@@ -276,7 +340,10 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
 
     assert!(restored, "second ssh attach did not restore pane 1");
     assert!(ready, "second ssh attach did not reach Ready");
-    assert!(contains(&replay, marker.as_bytes()), "reattach did not replay marker output");
+    assert!(
+        contains(&replay, marker.as_bytes()),
+        "reattach did not replay marker output"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -304,7 +371,10 @@ async fn rejected_host_key_aborts_connect() {
     let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
     let result =
         connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(false)), &session_cmd()).await;
-    assert!(result.is_err(), "connect should fail when the host key is rejected");
+    assert!(
+        result.is_err(),
+        "connect should fail when the host key is rejected"
+    );
 }
 
 /// A host without `potty-session`: the SSH exec is accepted, but the shell's "command not found"
@@ -316,13 +386,19 @@ async fn missing_remote_command_is_reported() {
     let Some(user) = user() else { return };
 
     let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
-    let (session, outbound, mut rx) =
-        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), "potty-session-DEFINITELY-NOT-INSTALLED")
-            .await
-            .expect("exec request is accepted even though the command is missing");
+    let (session, outbound, mut rx) = connect_and_exec(
+        &cfg,
+        std::sync::Arc::new(AcceptHost(true)),
+        "potty-session-DEFINITELY-NOT-INSTALLED",
+    )
+    .await
+    .expect("exec request is accepted even though the command is missing");
 
     // Mimic the client: greet, then drain until the channel closes.
-    outbound.send(Frame::Control(Control::Hello { version: 1 })).await.ok();
+    outbound
+        .send(Frame::Control(Control::Hello { version: 1 }))
+        .await
+        .ok();
     let mut got_welcome = false;
     while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
         if matches!(frame, Frame::Control(Control::Welcome { .. })) {
@@ -330,8 +406,14 @@ async fn missing_remote_command_is_reported() {
         }
     }
 
-    assert!(!got_welcome, "a host without potty-session should never send Welcome");
-    assert!(!session.stderr().is_empty(), "the remote's error output should have been captured");
+    assert!(
+        !got_welcome,
+        "a host without potty-session should never send Welcome"
+    );
+    assert!(
+        !session.stderr().is_empty(),
+        "the remote's error output should have been captured"
+    );
 }
 
 /// The no-`potty-session` path: a plain SSH shell, driven through the same protocol. Open a pane
@@ -343,13 +425,21 @@ async fn plain_shell_round_trip() {
     let Some(user) = user() else { return };
 
     let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
-    let (session, outbound, mut rx) =
-        shell_session(&cfg, std::sync::Arc::new(AcceptHost(true))).await.expect("plain shell over ssh");
+    let (session, outbound, mut rx) = shell_session(&cfg, std::sync::Arc::new(AcceptHost(true)))
+        .await
+        .expect("plain shell over ssh");
 
     for f in [
         Frame::Control(Control::Hello { version: 1 }),
-        Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }),
-        Frame::Data { pane: 1, bytes: b"echo PLAIN_SHELL_OK\r".to_vec() },
+        Frame::Control(Control::Open {
+            pane: 1,
+            cols: 80,
+            rows: 24,
+        }),
+        Frame::Data {
+            pane: 1,
+            bytes: b"echo PLAIN_SHELL_OK\r".to_vec(),
+        },
     ] {
         outbound.send(f).await.expect("send frame");
     }
