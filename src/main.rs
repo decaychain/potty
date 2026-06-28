@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use config::Config;
+use config::{Config, ConnectionProfile};
 use notify::Watcher;
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -103,6 +103,7 @@ enum UserEvent {
     RemoteConnected {
         conn: ConnId,
         target: RemoteTarget,
+        display_name: Option<String>,
         outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
         /// True for a plain SSH shell (no daemon) — it can't be detached/reattached.
         ephemeral: bool,
@@ -287,10 +288,11 @@ struct RemoteTarget {
 
 impl RemoteTarget {
     fn label(&self) -> String {
+        let user = if self.user.is_empty() { String::new() } else { format!("{}@", self.user) };
         if self.port == 22 {
-            format!("{}@{}", self.user, self.host)
+            format!("{user}{}", self.host)
         } else {
-            format!("{}@{}:{}", self.user, self.host, self.port)
+            format!("{user}{}:{}", self.host, self.port)
         }
     }
 }
@@ -299,6 +301,7 @@ impl RemoteTarget {
 /// map from the daemon's pane ids to local `PaneId`s (they diverge after a reattach).
 struct Connection {
     target: RemoteTarget,
+    display_name: Option<String>,
     outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
     next_remote_id: u64,
     routes: HashMap<u64, PaneId>,
@@ -313,6 +316,8 @@ struct Connection {
     restore_layout: Option<proto::Layout>,
     /// Last layout JSON pushed to the daemon, to avoid redundant sends.
     pushed_layout: Option<String>,
+    /// True once this connection has been written to `profiles` after a successful handshake.
+    remembered: bool,
 }
 
 /// A pane's I/O backend: a local PTY, or a pane on a remote `potty-session` reached over the wire
@@ -328,9 +333,9 @@ enum Backend {
         /// The pane's id in the *daemon's* namespace — used on the wire. Differs from the local
         /// `PaneId` after a reattach, since the daemon owns ids across reconnects.
         remote_id: u64,
-        /// The host this pane lives on — prefixed onto the tab label so remote tabs are
+        /// Profile display name or host — prefixed onto the tab label so remote tabs are
         /// distinguishable even after the remote shell sets its own title.
-        host: String,
+        label: String,
         /// Input/resize/close frames go here (to the russh writer task).
         outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
         /// Per-pane vte parse state — for a local pane this lives in its reader thread; a remote
@@ -380,7 +385,9 @@ enum Action {
     OpenConnect,
     CloseConnect,
     /// Connect to the given `[user@]host[:port]`.
-    Connect(String),
+    Connect(String, String),
+    /// Fill the connect dialog from a saved profile/recent by index in `Config::profiles`.
+    UseProfile(usize),
     /// Dismiss the connection-error dialog.
     DismissError,
     /// Detach the focused pane's remote session: drop its local tabs/panes and disconnect, but
@@ -422,6 +429,13 @@ struct FeedItem {
     pane: Option<PaneId>,
 }
 
+struct ConnectProfileView {
+    index: usize,
+    label: String,
+    detail: String,
+    use_potty_session: bool,
+}
+
 /// Apply a workspace (tab/pane) action. Font actions are routed separately (they touch App).
 fn apply(ws: &mut Workspace, action: Action) {
     match action {
@@ -444,7 +458,8 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::AuthText(_)
         | Action::OpenConnect
         | Action::CloseConnect
-        | Action::Connect(_)
+        | Action::Connect(..)
+        | Action::UseProfile(_)
         | Action::DismissError
         | Action::DetachSession => {}
     }
@@ -525,6 +540,25 @@ fn parse_host(input: &str) -> (String, String, u16) {
         None => (rest.to_string(), 22),
     };
     (user, host, port)
+}
+
+fn profile_target(profile: &ConnectionProfile) -> String {
+    let user = if profile.user.is_empty() { String::new() } else { format!("{}@", profile.user) };
+    if profile.port == 22 {
+        format!("{user}{}", profile.host)
+    } else {
+        format!("{user}{}:{}", profile.host, profile.port)
+    }
+}
+
+fn clean_profile_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn default_user() -> String {
@@ -673,7 +707,9 @@ fn build_ui(
     auth_inputs: &mut Vec<String>,
     show_connect: bool,
     connect_host: &mut String,
+    connect_name: &mut String,
     connect_use_session: &mut bool,
+    connect_profiles: &[ConnectProfileView],
     error: Option<&str>,
     detachable_panes: &std::collections::HashSet<PaneId>,
 ) {
@@ -962,15 +998,33 @@ fn build_ui(
                     resp.request_focus();
                 }
                 ui.add_space(4.0);
+                ui.label("Name");
+                ui.add(egui::TextEdit::singleline(connect_name).hint_text("optional"));
+                ui.add_space(4.0);
                 ui.checkbox(connect_use_session, "Use potty-session (persistent multiplexing)")
                     .on_hover_text(
                         "Run potty-session on the host for split panes that survive disconnects \
                          (it must be installed there). Off = a plain SSH shell.",
                     );
+                if !connect_profiles.is_empty() {
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        for profile in connect_profiles {
+                            ui.horizontal(|ui| {
+                                let resp = ui.selectable_label(false, elide(&profile.label, 28));
+                                if resp.on_hover_text(profile.detail.as_str()).clicked() {
+                                    actions.push(Action::UseProfile(profile.index));
+                                }
+                                ui.label(if profile.use_potty_session { "persist" } else { "plain" });
+                            });
+                            ui.label(egui::RichText::new(elide(&profile.detail, 44)).weak());
+                        }
+                    });
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     if (ui.button("Connect").clicked() || enter) && !connect_host.trim().is_empty() {
-                        actions.push(Action::Connect(connect_host.clone()));
+                        actions.push(Action::Connect(connect_host.clone(), connect_name.clone()));
                     }
                     if ui.button("Cancel").clicked() {
                         actions.push(Action::CloseConnect);
@@ -1280,6 +1334,7 @@ struct App {
     /// Whether the "Connect to host…" dialog is open, and its host-field buffer.
     show_connect: bool,
     connect_host: String,
+    connect_name: String,
     /// Connect-dialog checkbox: use `potty-session` (persistent multiplexing) vs. a plain SSH shell.
     /// Off by default — most hosts don't run `potty-session`.
     connect_use_session: bool,
@@ -1340,6 +1395,7 @@ impl App {
             auth_inputs: Vec::new(),
             show_connect: false,
             connect_host: String::new(),
+            connect_name: String::new(),
             connect_use_session: false,
             error_msg: None,
         }
@@ -1431,6 +1487,82 @@ impl App {
             .collect();
         rows.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
         rows.into_iter().map(|(_, it)| it).collect()
+    }
+
+    fn connect_profile_views(&self) -> Vec<ConnectProfileView> {
+        let mut rows: Vec<(u64, ConnectProfileView)> = self
+            .config
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.host.trim().is_empty())
+            .map(|(index, p)| {
+                let detail = profile_target(p);
+                let label = p
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(detail.as_str())
+                    .to_string();
+                (
+                    p.last_connected.unwrap_or(0),
+                    ConnectProfileView { index, label, detail, use_potty_session: p.use_potty_session },
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    fn use_connect_profile(&mut self, index: usize) {
+        let Some(profile) = self.config.profiles.get(index) else {
+            return;
+        };
+        self.connect_host = profile_target(profile);
+        self.connect_name = profile.name.clone().unwrap_or_default();
+        self.connect_use_session = profile.use_potty_session;
+        self.request_redraw();
+    }
+
+    fn remember_connection_profile(&mut self, conn: ConnId) {
+        let Some(c) = self.connections.get(&conn) else {
+            return;
+        };
+        if c.remembered {
+            return;
+        }
+        let target = c.target.clone();
+        let name = c.display_name.clone();
+        let use_potty_session = !c.ephemeral;
+        let now = unix_secs();
+
+        if let Some(profile) = self
+            .config
+            .profiles
+            .iter_mut()
+            .find(|p| p.user == target.user && p.host == target.host && p.port == target.port)
+        {
+            if name.is_some() {
+                profile.name = name;
+            }
+            profile.use_potty_session = use_potty_session;
+            profile.last_connected = Some(now);
+        } else {
+            self.config.profiles.push(ConnectionProfile {
+                name,
+                user: target.user,
+                host: target.host,
+                port: target.port,
+                use_potty_session,
+                last_connected: Some(now),
+            });
+        }
+        self.config.profiles.sort_by_key(|p| std::cmp::Reverse(p.last_connected.unwrap_or(0)));
+        self.config.profiles.truncate(32);
+        self.config.save(&self.config_path);
+        if let Some(c) = self.connections.get_mut(&conn) {
+            c.remembered = true;
+        }
     }
 
     /// Focus a pane from the feed: select its tab, focus it, and clear its note.
@@ -1680,6 +1812,7 @@ impl App {
         cfg: remote::SshConfig,
         auth: Arc<dyn remote::Authenticator>,
         command: String,
+        display_name: Option<String>,
         use_session: bool,
     ) {
         let conn = self.next_conn_id;
@@ -1709,6 +1842,7 @@ impl App {
                         let connected = UserEvent::RemoteConnected {
                             conn,
                             target: target.clone(),
+                            display_name: display_name.clone(),
                             outbound,
                             ephemeral: !use_session,
                         };
@@ -1762,6 +1896,7 @@ impl App {
         &mut self,
         conn: ConnId,
         target: RemoteTarget,
+        display_name: Option<String>,
         outbound: tokio::sync::mpsc::Sender<Frame>,
         ephemeral: bool,
     ) {
@@ -1770,6 +1905,7 @@ impl App {
             conn,
             Connection {
                 target,
+                display_name,
                 outbound,
                 next_remote_id: 1,
                 routes: HashMap::new(),
@@ -1778,6 +1914,7 @@ impl App {
                 restore_panes: Vec::new(),
                 restore_layout: None,
                 pushed_layout: None,
+                remembered: false,
             },
         );
     }
@@ -1785,11 +1922,11 @@ impl App {
     /// Wire a local pane `local` to `conn`'s daemon pane `remote_id`. `open` → the daemon doesn't
     /// have it yet (send `Open`); otherwise we're adopting a restored pane.
     fn wire_remote_pane(&mut self, conn: ConnId, remote_id: u64, local: PaneId, open: bool) {
-        let (host, outbound) = match self.connections.get_mut(&conn) {
+        let (label, outbound) = match self.connections.get_mut(&conn) {
             Some(c) => {
                 c.routes.insert(remote_id, local);
                 c.next_remote_id = c.next_remote_id.max(remote_id + 1);
-                (c.target.host.clone(), c.outbound.clone())
+                (c.display_name.clone().unwrap_or_else(|| c.target.host.clone()), c.outbound.clone())
             }
             None => return,
         };
@@ -1803,7 +1940,7 @@ impl App {
             local,
             Terminal {
                 term,
-                backend: Backend::Remote { conn, remote_id, host, outbound: outbound.clone(), parser: Processor::new() },
+                backend: Backend::Remote { conn, remote_id, label, outbound: outbound.clone(), parser: Processor::new() },
                 dims,
                 title: "shell".into(),
                 default_title: "shell".into(),
@@ -1911,6 +2048,7 @@ impl App {
                 if let Some(c) = self.connections.get_mut(&conn) {
                     c.ready = true;
                 }
+                self.remember_connection_profile(conn);
                 self.ensure_remote_connection_has_tab(conn);
                 self.request_redraw();
             }
@@ -1936,7 +2074,11 @@ impl App {
         if panes.is_empty() {
             return;
         }
-        let host = self.connections.get(&conn).map(|c| c.target.host.clone()).unwrap_or_default();
+        let label = self
+            .connections
+            .get(&conn)
+            .map(|c| c.display_name.clone().unwrap_or_else(|| c.target.host.clone()))
+            .unwrap_or_default();
         let map: HashMap<u64, PaneId> = panes.iter().copied().collect();
         let mut placed: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
         if let Some(layout) = layout {
@@ -1944,14 +2086,14 @@ impl App {
                 if let Some(node) = self.build_node(&ltab.root, &map, &mut placed) {
                     let focus =
                         ltab.focus.and_then(|r| map.get(&r).copied()).unwrap_or_else(|| node.first_leaf());
-                    self.workspace.push_tab(host.clone(), node, focus);
+                    self.workspace.push_tab(label.clone(), node, focus);
                 }
             }
         }
         // Any restored pane the layout didn't cover (stale/missing layout) → its own tab.
         for (_remote, local) in &panes {
             if !placed.contains(local) {
-                self.workspace.push_tab(host.clone(), workspace::Node::Leaf(*local), *local);
+                self.workspace.push_tab(label.clone(), workspace::Node::Leaf(*local), *local);
             }
         }
     }
@@ -2097,12 +2239,13 @@ impl App {
     }
 
     /// Start a connection from the "Connect to host…" dialog input (`[user@]host[:port]`).
-    fn start_connect(&mut self, input: &str) {
+    fn start_connect(&mut self, input: &str, name: &str) {
         let (user, host, port) = parse_host(input);
         if host.is_empty() {
             return;
         }
         let command = self.config.remote_command.clone();
+        let display_name = clean_profile_name(name);
         let target = RemoteTarget {
             user: user.clone(),
             host: host.clone(),
@@ -2112,6 +2255,7 @@ impl App {
         if self.connect_use_session && self.focus_existing_persistent_target(&target) {
             self.show_connect = false;
             self.connect_host.clear();
+            self.connect_name.clear();
             return;
         }
         let cfg = remote::SshConfig {
@@ -2124,9 +2268,10 @@ impl App {
             agent_sock: None,
         };
         let auth = Arc::new(GuiAuth { proxy: self.proxy.clone() });
-        self.connect_remote(cfg, auth, command, self.connect_use_session);
+        self.connect_remote(cfg, auth, command, display_name, self.connect_use_session);
         self.show_connect = false;
         self.connect_host.clear();
+        self.connect_name.clear();
     }
 
     /// Whether an egui text field (connect dialog or a text auth prompt) is capturing keyboard —
@@ -2153,7 +2298,7 @@ impl App {
             agent_sock: None,
         };
         let command = std::env::var("POTTY_TEST_SESSION_BIN").unwrap_or_else(|_| "potty-session".into());
-        self.connect_remote(cfg, Arc::new(GuiAuth { proxy: self.proxy.clone() }), command, true);
+        self.connect_remote(cfg, Arc::new(GuiAuth { proxy: self.proxy.clone() }), command, None, true);
     }
 
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
@@ -2654,7 +2799,7 @@ impl App {
                 let title = if term.title.is_empty() { t.title.clone() } else { term.title.clone() };
                 // Remote tabs carry a host prefix so they're distinguishable at a glance.
                 match &term.backend {
-                    Backend::Remote { host, .. } => format!("{host}: {title}"),
+                    Backend::Remote { label, .. } => format!("{label}: {title}"),
                     Backend::Local { .. } => title,
                 }
             })
@@ -2695,6 +2840,7 @@ impl App {
         });
         let show_connect = self.show_connect;
         let error = self.error_msg.clone();
+        let connect_profiles = self.connect_profile_views();
         // Panes whose connection is a persistent (potty-session) remote — the only ones that can be
         // detached. Computed fresh (owned) so it doesn't tangle with the borrows below.
         let detachable_panes: std::collections::HashSet<PaneId> = self
@@ -2705,6 +2851,7 @@ impl App {
             .collect();
         let auth_inputs = &mut self.auth_inputs;
         let connect_host = &mut self.connect_host;
+        let connect_name = &mut self.connect_name;
         let connect_use_session = &mut self.connect_use_session;
         let full = {
             let ws = &self.workspace;
@@ -2716,8 +2863,8 @@ impl App {
                     ctx, ws, families, cur_family, cur_size, &tab_titles, border_color,
                     pane_padding, &mut show_font, &mut actions, &mut leaves, &mut dividers,
                     &feed_items, &mut feed_active, chrome_latched, feed_open, auth_view.as_ref(),
-                    auth_inputs, show_connect, connect_host, connect_use_session, error.as_deref(),
-                    &detachable_panes,
+                    auth_inputs, show_connect, connect_host, connect_name, connect_use_session,
+                    &connect_profiles, error.as_deref(), &detachable_panes,
                 )
             })
         };
@@ -2764,7 +2911,8 @@ impl App {
                     self.show_connect = false;
                     self.request_redraw();
                 }
-                Action::Connect(host) => self.start_connect(&host),
+                Action::Connect(host, name) => self.start_connect(&host, &name),
+                Action::UseProfile(index) => self.use_connect_profile(index),
                 Action::DismissError => {
                     self.error_msg = None;
                     self.request_redraw();
@@ -3068,8 +3216,8 @@ impl ApplicationHandler<UserEvent> for App {
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_note(note),
             // A remote session connected — give it a tab with one shell pane.
-            UserEvent::RemoteConnected { conn, target, outbound, ephemeral } => {
-                self.on_remote_connected(conn, target, outbound, ephemeral)
+            UserEvent::RemoteConnected { conn, target, display_name, outbound, ephemeral } => {
+                self.on_remote_connected(conn, target, display_name, outbound, ephemeral)
             }
             // Output / lifecycle from a remote session.
             UserEvent::RemoteFrame(conn, frame) => self.on_remote_frame(event_loop, conn, frame),

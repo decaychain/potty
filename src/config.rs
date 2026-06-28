@@ -42,7 +42,24 @@ pub struct Config {
     /// Command run on a remote host by "Connect to host…" to start the multiplexer backend. Must
     /// be on the remote's PATH, or an absolute path (until bootstrapping installs it for you).
     pub remote_command: String,
+    /// Saved SSH connection profiles and recents. The canonical target fields identify the
+    /// connection; `name` is only a display label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<ConnectionProfile>,
     pub colors: Colors,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub user: String,
+    pub host: String,
+    pub port: u16,
+    pub use_potty_session: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_connected: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,7 +89,21 @@ impl Default for Config {
             cursor_blink: false,
             cursor_thickness: 0.15,
             remote_command: "potty-session".into(),
+            profiles: Vec::new(),
             colors: Colors::default(),
+        }
+    }
+}
+
+impl Default for ConnectionProfile {
+    fn default() -> Self {
+        Self {
+            name: None,
+            user: String::new(),
+            host: String::new(),
+            port: 22,
+            use_potty_session: false,
+            last_connected: None,
         }
     }
 }
