@@ -258,15 +258,27 @@ fn ensure_daemon(sock: &Path) -> Option<UnixStream> {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(exe) = std::env::current_exe() {
-        // A new process group detaches it from the SSH session, so it survives the channel closing.
-        let _ = std::process::Command::new(exe)
-            .arg("--daemon")
+        // Start in a new session so the daemon is not tied to the SSH exec process's job-control
+        // state. This is stronger than just setpgid(0, 0), which still leaves it in the same
+        // session as the short-lived attach relay.
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--daemon")
             .arg(sock)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn();
+            .stderr(Stdio::null());
+        // SAFETY: this closure runs in the child process after fork and before exec. It only calls
+        // the async-signal-safe setsid(2) and constructs an io::Error if that syscall fails.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let _ = cmd.spawn();
     }
     for _ in 0..300 {
         if let Ok(s) = UnixStream::connect(sock) {

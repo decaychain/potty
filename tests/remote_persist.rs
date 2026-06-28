@@ -6,7 +6,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use potty::proto::{Control, Frame, Layout, LayoutNode, LayoutTab};
@@ -99,6 +99,62 @@ impl Client {
     }
 }
 
+/// A client connected through the real attach relay (the process SSH execs), not directly to the
+/// daemon socket. This covers the production detach path: dropping stdin makes the relay exit and
+/// leaves the daemon behind.
+struct RelayClient {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    collected: std::sync::Arc<std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>>,
+}
+
+impl RelayClient {
+    fn connect(sock: &Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_potty-session"))
+            .env("POTTY_SESSION_SOCK", sock)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn attach relay");
+        let stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let collected: std::sync::Arc<std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>> =
+            std::sync::Arc::new(std::sync::Mutex::new((std::collections::HashMap::new(), Vec::new())));
+        let sink = collected.clone();
+        std::thread::spawn(move || {
+            while let Ok(Some(frame)) = Frame::read(&mut stdout) {
+                let mut g = sink.lock().unwrap();
+                match frame {
+                    Frame::Data { pane, bytes } => g.0.entry(pane).or_default().extend(bytes),
+                    Frame::Control(c) => g.1.push(c),
+                }
+            }
+        });
+        RelayClient { child, stdin: Some(stdin), collected }
+    }
+
+    fn send(&mut self, f: Frame) {
+        f.write(self.stdin.as_mut().expect("relay stdin")).expect("write frame");
+    }
+
+    fn wait(&self, pred: impl Fn(&std::collections::HashMap<u64, Vec<u8>>, &[Control]) -> bool) -> bool {
+        wait_until(Duration::from_secs(10), || {
+            let g = self.collected.lock().unwrap();
+            pred(&g.0, &g.1)
+        })
+    }
+
+    fn disconnect(mut self) {
+        drop(self.stdin.take());
+        let exited = wait_until(Duration::from_secs(5), || matches!(self.child.try_wait(), Ok(Some(_))));
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 #[test]
 fn shell_survives_client_disconnect() {
     if !have("pgrep") {
@@ -125,6 +181,50 @@ fn shell_survives_client_disconnect() {
     cleanup(daemon, &sock);
 
     assert!(survived, "the shell's process did not survive the client disconnect");
+}
+
+#[test]
+fn relay_detach_keeps_foreground_process_and_reattaches() {
+    if !have("pgrep") {
+        eprintln!("skipping: pgrep unavailable");
+        return;
+    }
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-relay-persist-{tag}.sock"));
+    let marker = format!("POTTY_RELAY_MARKER_{tag}");
+    let _ = std::fs::remove_file(&sock);
+
+    let mut c1 = RelayClient::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 1 }));
+    c1.send(Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }));
+    c1.send(Frame::Data {
+        pane: 1,
+        bytes: format!("sh -c 'while true; do echo {marker}; sleep 1; done'\r").into_bytes(),
+    });
+    assert!(wait_until(Duration::from_secs(10), || pgrep(&marker)), "marker process never started");
+    assert!(
+        c1.wait(|out, _| out.get(&1).is_some_and(|o| contains(o, marker.as_bytes()))),
+        "marker never reached relay client #1"
+    );
+    c1.disconnect();
+
+    std::thread::sleep(Duration::from_millis(500));
+    let survived = pgrep(&marker);
+
+    let mut c2 = RelayClient::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 1 }));
+    let restored = c2.wait(|out, ctrl| {
+        ctrl.iter().any(|m| matches!(m, Control::Restore { pane: 1 }))
+            && ctrl.iter().any(|m| matches!(m, Control::Ready))
+            && out.get(&1).is_some_and(|o| contains(o, marker.as_bytes()))
+    });
+    c2.send(Frame::Control(Control::Close { pane: 1 }));
+    c2.disconnect();
+    let _ = Command::new("pkill").args(["-f", &marker]).status();
+    let _ = std::fs::remove_file(&sock);
+
+    assert!(survived, "the foreground process did not survive relay detach");
+    assert!(restored, "relay reattach did not restore the running pane");
 }
 
 #[test]

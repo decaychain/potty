@@ -25,6 +25,27 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn pgrep(needle: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-f", needle])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// An `Authenticator` that accepts (or rejects) host keys; no secrets needed for these tests.
 struct AcceptHost(bool);
 impl Authenticator for AcceptHost {
@@ -124,6 +145,10 @@ fn session_cmd() -> String {
     format!("POTTY_SESSION_NODAEMON=1 {}", env!("CARGO_BIN_EXE_potty-session"))
 }
 
+fn persistent_session_cmd(sock: &Path) -> String {
+    format!("POTTY_SESSION_SOCK={} {}", sock.display(), env!("CARGO_BIN_EXE_potty-session"))
+}
+
 fn config(sshd: &Sshd, user: &str, keys: Vec<PathBuf>, use_agent: bool, agent_sock: Option<PathBuf>) -> SshConfig {
     SshConfig {
         host: "127.0.0.1".into(),
@@ -162,6 +187,96 @@ async fn assert_echo_round_trip(session: RemoteSession, outbound: Sender<Frame>,
         }
     }
     panic!("echo did not round-trip over SSH");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_session_survives_ssh_detach_and_reattaches() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+    if which(&["/usr/bin/pgrep", "/bin/pgrep"]).is_none() {
+        eprintln!("skipping: pgrep unavailable");
+        return;
+    }
+
+    let sock = std::env::temp_dir().join(format!("potty-ssh-persist-{}-{}.sock", std::process::id(), sshd.port));
+    let marker = format!("POTTY_SSH_PERSIST_MARKER_{}_{}", std::process::id(), sshd.port);
+    let command = persistent_session_cmd(&sock);
+    let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+
+    let (session1, outbound1, mut rx1) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &command)
+            .await
+            .expect("connect persistent session over ssh");
+    for f in [
+        Frame::Control(Control::Hello { version: 1 }),
+        Frame::Control(Control::Open { pane: 1, cols: 80, rows: 24 }),
+        Frame::Data {
+            pane: 1,
+            bytes: format!("sh -c 'while true; do echo {marker}; sleep 1; done'\r").into_bytes(),
+        },
+    ] {
+        outbound1.send(f).await.expect("send frame");
+    }
+
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx1.recv()).await {
+            Ok(Some(Frame::Data { pane: 1, bytes })) => out.extend(bytes),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+        if contains(&out, marker.as_bytes()) && pgrep(&marker) {
+            break;
+        }
+    }
+    assert!(contains(&out, marker.as_bytes()), "marker never reached first ssh attach");
+    assert!(pgrep(&marker), "marker process never started");
+
+    drop(outbound1);
+    let detached = wait_until(Duration::from_secs(5), || {
+        matches!(rx1.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected))
+    });
+    drop(session1);
+    assert!(detached, "first ssh attach did not detach after outbound drop");
+    assert!(pgrep(&marker), "marker process did not survive ssh detach");
+
+    let (session2, outbound2, mut rx2) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &command)
+            .await
+            .expect("reattach persistent session over ssh");
+    outbound2
+        .send(Frame::Control(Control::Hello { version: 1 }))
+        .await
+        .expect("send hello");
+    let mut replay = Vec::new();
+    let mut restored = false;
+    let mut ready = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx2.recv()).await {
+            Ok(Some(Frame::Control(Control::Restore { pane: 1 }))) => restored = true,
+            Ok(Some(Frame::Control(Control::Ready))) => ready = true,
+            Ok(Some(Frame::Data { pane: 1, bytes })) => replay.extend(bytes),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+        if restored && ready && contains(&replay, marker.as_bytes()) {
+            break;
+        }
+    }
+
+    let _ = outbound2.send(Frame::Control(Control::Close { pane: 1 })).await;
+    drop(outbound2);
+    drop(session2);
+    let _ = Command::new("pkill").args(["-f", &marker]).status();
+    let _ = std::fs::remove_file(&sock);
+
+    assert!(restored, "second ssh attach did not restore pane 1");
+    assert!(ready, "second ssh attach did not reach Ready");
+    assert!(contains(&replay, marker.as_bytes()), "reattach did not replay marker output");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1911,6 +1911,7 @@ impl App {
                 if let Some(c) = self.connections.get_mut(&conn) {
                     c.ready = true;
                 }
+                self.ensure_remote_connection_has_tab(conn);
                 self.request_redraw();
             }
             Frame::Control(Control::Exited { pane: remote_id }) => {
@@ -1925,17 +1926,14 @@ impl App {
     }
 
     /// Place the panes adopted during the restore burst into tabs: rebuild the original tree from
-    /// the replayed layout, then give any leftover (un-laid-out) pane its own tab. A fresh session
-    /// (no panes) just opens one pane.
+    /// the replayed layout, then give any leftover (un-laid-out) pane its own tab. A fresh/empty
+    /// session (no panes) is handled by `ensure_remote_connection_has_tab` after Ready.
     fn finish_restore(&mut self, conn: ConnId) {
         let (panes, layout) = match self.connections.get_mut(&conn) {
             Some(c) => (std::mem::take(&mut c.restore_panes), c.restore_layout.take()),
             None => return,
         };
         if panes.is_empty() {
-            self.workspace.new_tab();
-            let local = self.workspace.active_tab().focus;
-            self.add_remote_pane(conn, local);
             return;
         }
         let host = self.connections.get(&conn).map(|c| c.target.host.clone()).unwrap_or_default();
@@ -1956,6 +1954,30 @@ impl App {
                 self.workspace.push_tab(host.clone(), workspace::Node::Leaf(*local), *local);
             }
         }
+    }
+
+    /// Defensive invariant for persistent remotes: once the handshake reaches Ready, the connection
+    /// must have at least one local tab. This covers a genuinely fresh daemon, an empty daemon after
+    /// all panes died while detached, and stale/empty replayed layouts.
+    fn ensure_remote_connection_has_tab(&mut self, conn: ConnId) {
+        let Some(c) = self.connections.get(&conn) else {
+            return;
+        };
+        if c.ephemeral || !c.ready {
+            return;
+        }
+        let owns_tab = self.workspace.tabs.iter().any(|tab| {
+            matches!(
+                self.terms.get(&tab.layout.first_leaf()).map(|t| &t.backend),
+                Some(Backend::Remote { conn: c, .. }) if *c == conn
+            )
+        });
+        if owns_tab {
+            return;
+        }
+        self.workspace.new_tab();
+        let local = self.workspace.active_tab().focus;
+        self.add_remote_pane(conn, local);
     }
 
     /// Rebuild a workspace `Node` from a replayed layout node, mapping daemon pane ids to the local

@@ -3038,6 +3038,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "lexopt",
+ "libc",
  "notify",
  "pollster",
  "portable-pty",

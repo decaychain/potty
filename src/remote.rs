@@ -206,6 +206,7 @@ pub async fn connect_and_exec(
             }
         }
         let _ = write_half.eof().await;
+        let _ = write_half.close().await;
     });
 
     Ok((RemoteSession { _session: Some(session), stderr }, out_tx, in_rx))
