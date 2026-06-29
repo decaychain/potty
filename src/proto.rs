@@ -33,8 +33,15 @@ pub enum Control {
     Hello { version: u32 },
     /// S→C: acknowledge the connection.
     Welcome { version: u32 },
-    /// C→S: open a new pane running a shell of the given size.
-    Open { pane: PaneId, cols: u16, rows: u16 },
+    /// C→S: open a new pane running a shell of the given size. `cwd_from`, when present, asks the
+    /// remote daemon to start the new shell in the current directory of an existing pane.
+    Open {
+        pane: PaneId,
+        cols: u16,
+        rows: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_from: Option<PaneId>,
+    },
     /// S→C: the pane is live.
     Opened { pane: PaneId },
     /// C→S: resize a pane.
@@ -212,8 +219,21 @@ mod tests {
             pane: 7,
             cols: 80,
             rows: 24,
+            cwd_from: Some(3),
         });
         assert_eq!(roundtrip(&f), f);
+
+        let c: Control =
+            serde_json::from_str(r#"{"t":"Open","pane":7,"cols":80,"rows":24}"#).unwrap();
+        assert_eq!(
+            c,
+            Control::Open {
+                pane: 7,
+                cols: 80,
+                rows: 24,
+                cwd_from: None,
+            }
+        );
 
         let f = Frame::Control(Control::Notify {
             json: r#"{"v":1,"session":"abc"}"#.into(),

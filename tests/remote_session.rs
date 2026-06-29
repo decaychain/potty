@@ -82,6 +82,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+#[cfg(target_os = "linux")]
+fn test_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    dir
+}
+
 #[test]
 fn multiplexes_panes_over_one_stream() {
     let mut s = Session::start();
@@ -97,11 +104,13 @@ fn multiplexes_panes_over_one_stream() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     s.send(Frame::Control(Control::Open {
         pane: 2,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     assert!(
         s.wait_until(|c| c.has(|m| matches!(m, Control::Opened { pane: 1 }))
@@ -164,4 +173,62 @@ fn multiplexes_panes_over_one_stream() {
     drop(s.stdin);
     let status = s.child.wait().expect("wait for session");
     assert!(status.success(), "session exited non-zero: {status:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn new_pane_inherits_cwd_from_existing_pane() {
+    let dir = test_dir("potty-session-cwd");
+    let mut s = Session::start();
+
+    s.send(Frame::Control(Control::Hello { version: 1 }));
+    assert!(
+        s.wait_until(|c| c.has(|m| matches!(m, Control::Welcome { .. }))),
+        "no Welcome"
+    );
+    s.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    assert!(
+        s.wait_until(|c| c.has(|m| matches!(m, Control::Opened { pane: 1 }))),
+        "pane 1 did not open"
+    );
+
+    s.send(Frame::Data {
+        pane: 1,
+        bytes: format!("cd {}\rprintf 'PANE1_READY\\n'\r", dir.display()).into_bytes(),
+    });
+    assert!(
+        s.wait_until(|c| contains(&c.output(1), b"PANE1_READY\r\n")),
+        "pane 1 did not change directory"
+    );
+
+    s.send(Frame::Control(Control::Open {
+        pane: 2,
+        cols: 80,
+        rows: 24,
+        cwd_from: Some(1),
+    }));
+    assert!(
+        s.wait_until(|c| c.has(|m| matches!(m, Control::Opened { pane: 2 }))),
+        "pane 2 did not open"
+    );
+    s.send(Frame::Data {
+        pane: 2,
+        bytes: b"printf 'PWD=<%s>\\n' \"$PWD\"\r".to_vec(),
+    });
+    let expected = format!("PWD=<{}>", dir.display());
+    assert!(
+        s.wait_until(|c| contains(&c.output(2), expected.as_bytes())),
+        "pane 2 did not inherit pane 1 cwd"
+    );
+
+    s.send(Frame::Control(Control::Close { pane: 1 }));
+    s.send(Frame::Control(Control::Close { pane: 2 }));
+    drop(s.stdin);
+    let _ = s.child.wait();
+    let _ = std::fs::remove_dir_all(dir);
 }

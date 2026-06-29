@@ -79,7 +79,7 @@ payload= [u8 tag][...]
 |---|---|---|
 | `Hello { version }` | C→S | first frame; negotiate version |
 | `Welcome { version }` | S→C | ack |
-| `Open { pane, cols, rows }` | C→S | start a shell pane of this size |
+| `Open { pane, cols, rows, cwd_from? }` | C→S | start a shell pane of this size, optionally inheriting cwd from another daemon pane |
 | `Opened { pane }` | S→C | pane is live |
 | `Resize { pane, cols, rows }` | C→S | resize a pane |
 | `Close { pane }` | C→S | kill a pane's shell |

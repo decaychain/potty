@@ -43,6 +43,8 @@ Or [build from source](#build--run).
   rebuilt; a busy background tab produces zero redraws).
 - **Real multiplexing** — one PTY + `alacritty_terminal` grid **per pane**. A binary split tree
   drives tabs and panes; **drag the dividers to resize**. Background tabs keep running.
+- **Directory inheritance** — new tabs and splits start in the focused pane's current directory;
+  persistent SSH panes do the same on the remote host via `potty-session`.
 - **Visual chrome** (`egui`) — a tab bar that hides itself when there's only one tab, a `☰` /
   right-click pane menu (split, close, new tab), and a floating **Font settings** window. The
   chrome is mouse-only by design.

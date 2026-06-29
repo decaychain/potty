@@ -43,6 +43,13 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
+fn test_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), free_port()));
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    dir
+}
+
 fn pgrep(needle: &str) -> bool {
     Command::new("pgrep")
         .args(["-f", needle])
@@ -224,6 +231,7 @@ async fn assert_remote_output(
             pane: 1,
             cols: 80,
             rows: 24,
+            cwd_from: None,
         }),
         Frame::Data {
             pane: 1,
@@ -282,6 +290,7 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
             pane: 1,
             cols: 80,
             rows: 24,
+            cwd_from: None,
         }),
         Frame::Data {
             pane: 1,
@@ -367,6 +376,107 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn potty_session_inherits_cwd_for_new_panes_over_ssh() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+
+    let dir = test_dir("potty-ssh-cwd");
+    let sock = std::env::temp_dir().join(format!(
+        "potty-ssh-cwd-{}-{}.sock",
+        std::process::id(),
+        sshd.port
+    ));
+    let command = persistent_session_cmd(&sock);
+    let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+
+    let (session, outbound, mut rx) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &command)
+            .await
+            .expect("connect persistent session over ssh");
+    for f in [
+        Frame::Control(Control::Hello { version: 1 }),
+        Frame::Control(Control::Open {
+            pane: 1,
+            cols: 80,
+            rows: 24,
+            cwd_from: None,
+        }),
+        Frame::Data {
+            pane: 1,
+            bytes: format!("cd {}\rprintf 'PANE1_READY\\n'\r", dir.display()).into_bytes(),
+        },
+    ] {
+        outbound.send(f).await.expect("send frame");
+    }
+
+    let mut pane1 = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(Frame::Data { pane: 1, bytes })) => pane1.extend(bytes),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+        if contains(&pane1, b"PANE1_READY\r\n") {
+            break;
+        }
+    }
+    assert!(
+        contains(&pane1, b"PANE1_READY\r\n"),
+        "pane 1 did not change directory over ssh"
+    );
+
+    for f in [
+        Frame::Control(Control::Open {
+            pane: 2,
+            cols: 80,
+            rows: 24,
+            cwd_from: Some(1),
+        }),
+        Frame::Data {
+            pane: 2,
+            bytes: b"printf 'PWD=<%s>\\n' \"$PWD\"\r".to_vec(),
+        },
+    ] {
+        outbound.send(f).await.expect("send frame");
+    }
+
+    let expected = format!("PWD=<{}>", dir.display());
+    let mut pane2 = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(Frame::Data { pane: 2, bytes })) => pane2.extend(bytes),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+        if contains(&pane2, expected.as_bytes()) {
+            break;
+        }
+    }
+
+    let _ = outbound
+        .send(Frame::Control(Control::Close { pane: 1 }))
+        .await;
+    let _ = outbound
+        .send(Frame::Control(Control::Close { pane: 2 }))
+        .await;
+    drop(outbound);
+    drop(session);
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(sock.with_extension("notify.sock"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        contains(&pane2, expected.as_bytes()),
+        "pane 2 did not inherit pane 1 cwd over ssh"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn potty_session_forwards_native_notify_notes_over_ssh() {
     let Some(sshd) = start_sshd() else { return };
@@ -391,6 +501,7 @@ async fn potty_session_forwards_native_notify_notes_over_ssh() {
             pane: 1,
             cols: 80,
             rows: 24,
+            cwd_from: None,
         }),
         Frame::Data {
             pane: 1,
@@ -546,6 +657,7 @@ async fn plain_shell_round_trip() {
             pane: 1,
             cols: 80,
             rows: 24,
+            cwd_from: None,
         }),
         Frame::Data {
             pane: 1,

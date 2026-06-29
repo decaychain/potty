@@ -265,7 +265,9 @@ pub async fn shell_session(
                     let _ = in_tx.send(Frame::Control(Control::Ready)).await;
                 }
                 // A new pane → a new channel running a login shell in a PTY of the requested size.
-                Frame::Control(Control::Open { pane, cols, rows }) => {
+                Frame::Control(Control::Open {
+                    pane, cols, rows, ..
+                }) => {
                     match open_shell_channel(&handle, &env, cols, rows).await {
                         Ok(channel) => {
                             let (mut read, write) = channel.split();

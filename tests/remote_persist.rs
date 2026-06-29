@@ -243,6 +243,7 @@ fn shell_survives_client_disconnect() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     c.send(Frame::Data {
         pane: 1,
@@ -284,6 +285,7 @@ fn relay_detach_keeps_foreground_process_and_reattaches() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     c1.send(Frame::Data {
         pane: 1,
@@ -336,6 +338,7 @@ fn reattach_restores_and_replays() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     c1.send(Frame::Data {
         pane: 1,
@@ -378,6 +381,7 @@ fn reattach_while_client_attached_takes_over() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     c1.send(Frame::Data {
         pane: 1,
@@ -420,11 +424,13 @@ fn reattach_replays_layout() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     c1.send(Frame::Control(Control::Open {
         pane: 2,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     assert!(
         c1.wait(|_, ctrl| ctrl
@@ -491,6 +497,7 @@ fn daemon_exits_after_last_pane_closed() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     assert!(
         c.wait(|_, ctrl| ctrl
@@ -553,6 +560,7 @@ fn notify_socket_replays_pending_notes_on_reattach() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     assert!(c1.wait(|_, ctrl| {
         ctrl.iter()
@@ -590,6 +598,7 @@ fn notify_socket_replays_detached_clear_on_reattach() {
         pane: 1,
         cols: 80,
         rows: 24,
+        cwd_from: None,
     }));
     assert!(c1.wait(|_, ctrl| {
         ctrl.iter()

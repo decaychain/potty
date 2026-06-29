@@ -59,6 +59,8 @@ mod imp {
         /// Kills the shell on `Close`. The output-reader thread holds a cloned master fd, so just
         /// dropping `master` won't reliably hang the shell up — we signal the process directly.
         killer: Box<dyn ChildKiller + Send + Sync>,
+        /// Shell PID fallback for cwd inheritance if the PTY foreground process group is unknown.
+        child_pid: Option<u32>,
         /// Recent raw output (capped at `REPLAY_CAP`), replayed when a client (re)attaches.
         buffer: Arc<Mutex<Vec<u8>>>,
     }
@@ -84,6 +86,33 @@ mod imp {
 
     fn shell() -> String {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    }
+
+    fn process_cwd(pid: u32) -> Option<PathBuf> {
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+        cwd.is_dir().then_some(cwd)
+    }
+
+    fn valid_cwd(path: &Path) -> bool {
+        path.is_absolute() && path.is_dir()
+    }
+
+    fn pane_cwd(pane: &Pane) -> Option<PathBuf> {
+        if let Some(cwd) = pane
+            .master
+            .process_group_leader()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .and_then(process_cwd)
+        {
+            return Some(cwd);
+        }
+
+        pane.child_pid.and_then(process_cwd)
+    }
+
+    fn cwd_from_pane(session: &Session, pane: Option<PaneId>) -> Option<PathBuf> {
+        let pane = pane?;
+        session.panes.lock().unwrap().get(&pane).and_then(pane_cwd)
     }
 
     /// Write a frame to the attached client, if any (dropped while detached). Frames must go out
@@ -217,7 +246,7 @@ mod imp {
 
     /// Spawn a shell in a fresh PTY: output → `Data` frames to whoever's attached; exit → `Exited`
     /// (and, if nothing's left and nobody's attached, the daemon exits).
-    fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16) {
+    fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16, cwd: Option<PathBuf>) {
         let size = PtySize {
             rows,
             cols,
@@ -232,10 +261,15 @@ mod imp {
         cmd.env("TERM", "xterm-256color");
         cmd.env(feed::ENV_SOCK, &session.notify_sock);
         cmd.env(feed::ENV_PANE, pane.to_string());
+        if let Some(cwd) = cwd.as_deref().filter(|path| valid_cwd(path)) {
+            cmd.cwd(cwd.as_os_str());
+            cmd.env("PWD", cwd.as_os_str());
+        }
         let mut child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
             Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
         };
+        let child_pid = child.process_id();
         let killer = child.clone_killer();
         let mut reader = match pair.master.try_clone_reader() {
             Ok(r) => r,
@@ -296,6 +330,7 @@ mod imp {
                 writer,
                 master: pair.master,
                 killer,
+                child_pid,
                 buffer,
             },
         );
@@ -349,9 +384,15 @@ mod imp {
                     *session.layout.lock().unwrap() = Some(json);
                 }
                 // Ignore an Open for a pane that already exists (e.g. a restored one).
-                Frame::Control(Control::Open { pane, cols, rows }) => {
+                Frame::Control(Control::Open {
+                    pane,
+                    cols,
+                    rows,
+                    cwd_from,
+                }) => {
                     if !session.panes.lock().unwrap().contains_key(&pane) {
-                        open_pane(session, pane, cols, rows);
+                        let cwd = cwd_from_pane(session, cwd_from);
+                        open_pane(session, pane, cols, rows, cwd);
                     }
                 }
                 Frame::Control(Control::Resize { pane, cols, rows }) => {

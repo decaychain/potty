@@ -21,7 +21,7 @@ mod workspace;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -202,6 +202,37 @@ fn default_shell(cfg: &Config) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    cwd.is_dir().then_some(cwd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn valid_cwd(path: &Path) -> bool {
+    path.is_absolute() && path.is_dir()
+}
+
+fn pty_cwd(
+    master: &(dyn portable_pty::MasterPty + Send),
+    child_pid: Option<u32>,
+) -> Option<PathBuf> {
+    #[cfg(unix)]
+    if let Some(cwd) = master
+        .process_group_leader()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .and_then(process_cwd)
+    {
+        return Some(cwd);
+    }
+
+    child_pid.and_then(process_cwd)
+}
+
 fn dims_for(width_px: f32, height_px: f32, cell_w: f32, cell_h: f32) -> Dims {
     Dims {
         cols: ((width_px / cell_w).floor() as usize).max(1),
@@ -359,6 +390,7 @@ enum Backend {
     Local {
         writer: Box<dyn Write + Send>,
         master: Box<dyn portable_pty::MasterPty + Send>,
+        child_pid: Option<u32>,
     },
     Remote {
         /// Which connection this pane belongs to (frames are tagged with it for routing).
@@ -1525,6 +1557,8 @@ struct App {
     /// Panes whose backend is a remote session — `reconcile_terms` must not spawn a local PTY for
     /// them, and closing them sends a `Close` frame rather than dropping a PTY.
     remote_panes: std::collections::HashSet<PaneId>,
+    /// One-shot startup directories for local panes created from an existing pane.
+    pending_cwds: HashMap<PaneId, PathBuf>,
     /// Live SSH connections, keyed by `ConnId`. Holds the per-connection id map and counter.
     connections: HashMap<ConnId, Connection>,
     /// SSH attempts that have been started but have not reached the remote protocol's `Ready`.
@@ -1594,6 +1628,7 @@ impl App {
             feed_open: false,
             chrome_latched: false,
             remote_panes: std::collections::HashSet::new(),
+            pending_cwds: HashMap::new(),
             connections: HashMap::new(),
             connect_progress: HashMap::new(),
             next_conn_id: 0,
@@ -1844,8 +1879,18 @@ impl App {
         self.arc(self.focus())
     }
 
+    fn pane_cwd(&self, id: PaneId) -> Option<PathBuf> {
+        match self.terms.get(&id).map(|t| &t.backend) {
+            Some(Backend::Local {
+                master, child_pid, ..
+            }) => pty_cwd(master.as_ref(), *child_pid),
+            _ => None,
+        }
+    }
+
     /// Spawn a PTY + Term + reader thread for a pane, sized at `dims`.
     fn spawn_terminal(&mut self, id: PaneId, dims: Dims) {
+        let cwd = self.pending_cwds.remove(&id).filter(|p| valid_cwd(p));
         let term: SharedTerm = Arc::new(Mutex::new(Term::new(
             term_config(&self.config),
             &dims,
@@ -1882,7 +1927,12 @@ impl App {
             cmd.env(feed::ENV_SOCK, feed::default_socket_path());
             cmd.env(feed::ENV_PANE, id.to_string());
         }
+        if let Some(cwd) = &cwd {
+            cmd.cwd(cwd.as_os_str());
+            cmd.env("PWD", cwd.as_os_str());
+        }
         let mut child = pair.slave.spawn_command(cmd).unwrap();
+        let child_pid = child.process_id();
         let mut reader = pair.master.try_clone_reader().unwrap();
         let writer = pair.master.take_writer().unwrap();
 
@@ -1928,6 +1978,7 @@ impl App {
                 backend: Backend::Local {
                     writer,
                     master: pair.master,
+                    child_pid,
                 },
                 dims,
                 title: default_title.clone(),
@@ -1968,6 +2019,7 @@ impl App {
             self.drop_remote_route(id);
             self.terms.remove(&id);
             self.remote_panes.remove(&id);
+            self.pending_cwds.remove(&id);
             self.dirty.remove(&id);
             self.last_rect.remove(&id);
             if let Some(state) = self.state.as_mut() {
@@ -1982,6 +2034,7 @@ impl App {
         self.drop_remote_route(id);
         self.terms.remove(&id);
         self.remote_panes.remove(&id);
+        self.pending_cwds.remove(&id);
         self.dirty.remove(&id);
         if let Some(state) = self.state.as_mut() {
             state.grid.forget_pane(id);
@@ -2018,6 +2071,7 @@ impl App {
         for local in locals {
             self.terms.remove(&local);
             self.remote_panes.remove(&local);
+            self.pending_cwds.remove(&local);
             self.dirty.remove(&local);
             self.last_rect.remove(&local);
             if let Some(state) = self.state.as_mut() {
@@ -2227,7 +2281,14 @@ impl App {
 
     /// Wire a local pane `local` to `conn`'s daemon pane `remote_id`. `open` → the daemon doesn't
     /// have it yet (send `Open`); otherwise we're adopting a restored pane.
-    fn wire_remote_pane(&mut self, conn: ConnId, remote_id: u64, local: PaneId, open: bool) {
+    fn wire_remote_pane(
+        &mut self,
+        conn: ConnId,
+        remote_id: u64,
+        local: PaneId,
+        open: bool,
+        cwd_from: Option<u64>,
+    ) {
         let (label, outbound) = match self.connections.get_mut(&conn) {
             Some(c) => {
                 c.routes.insert(remote_id, local);
@@ -2273,17 +2334,18 @@ impl App {
                 pane: remote_id,
                 cols: dims.cols as u16,
                 rows: dims.rows as u16,
+                cwd_from,
             }));
         }
         self.dirty.insert(local);
     }
 
     /// Open a new pane on `conn` (allocating a fresh daemon id) at local pane `local`.
-    fn add_remote_pane(&mut self, conn: ConnId, local: PaneId) {
+    fn add_remote_pane(&mut self, conn: ConnId, local: PaneId, cwd_from: Option<u64>) {
         let Some(remote_id) = self.connections.get(&conn).map(|c| c.next_remote_id) else {
             return;
         };
-        self.wire_remote_pane(conn, remote_id, local, true);
+        self.wire_remote_pane(conn, remote_id, local, true, cwd_from);
     }
 
     /// The connection of the focused pane, if it's remote — so a split or new tab reuses it.
@@ -2297,21 +2359,31 @@ impl App {
     /// Split the focused pane. From a remote pane, the new pane is another shell on the *same*
     /// connection; from a local pane, a normal local split (reconcile spawns its PTY).
     fn split_pane(&mut self, split: Split) {
+        let focus = self.focus();
         let conn = self.focused_conn();
+        let cwd = conn.is_none().then(|| self.pane_cwd(focus)).flatten();
+        let cwd_from = conn.and_then(|_| self.remote_id_of(focus));
         self.workspace.split(split);
+        let new_id = self.workspace.active_tab().focus;
         if let Some(conn) = conn {
-            let new_id = self.workspace.active_tab().focus;
-            self.add_remote_pane(conn, new_id);
+            self.add_remote_pane(conn, new_id, cwd_from);
+        } else if let Some(cwd) = cwd {
+            self.pending_cwds.insert(new_id, cwd);
         }
     }
 
     /// New tab. From a remote pane, it's a new tab on the same connection; otherwise a local tab.
     fn new_tab(&mut self) {
+        let focus = self.focus();
         let conn = self.focused_conn();
+        let cwd = conn.is_none().then(|| self.pane_cwd(focus)).flatten();
+        let cwd_from = conn.and_then(|_| self.remote_id_of(focus));
         self.workspace.new_tab();
+        let new_id = self.workspace.active_tab().focus;
         if let Some(conn) = conn {
-            let new_id = self.workspace.active_tab().focus;
-            self.add_remote_pane(conn, new_id);
+            self.add_remote_pane(conn, new_id, cwd_from);
+        } else if let Some(cwd) = cwd {
+            self.pending_cwds.insert(new_id, cwd);
         }
     }
 
@@ -2359,7 +2431,7 @@ impl App {
             // its backend now but defer tab placement to `Ready`, where the layout is applied.
             Frame::Control(Control::Restore { pane: remote_id }) => {
                 let local = self.workspace.alloc_pane();
-                self.wire_remote_pane(conn, remote_id, local, false);
+                self.wire_remote_pane(conn, remote_id, local, false, None);
                 if let Some(c) = self.connections.get_mut(&conn) {
                     c.restore_panes.push((remote_id, local));
                 }
@@ -2482,7 +2554,7 @@ impl App {
         }
         self.workspace.new_tab();
         let local = self.workspace.active_tab().focus;
-        self.add_remote_pane(conn, local);
+        self.add_remote_pane(conn, local, None);
     }
 
     /// Rebuild a workspace `Node` from a replayed layout node, mapping daemon pane ids to the local
