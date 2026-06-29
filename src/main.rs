@@ -2393,6 +2393,24 @@ impl App {
                     self.close_pane(event_loop, local);
                 }
             }
+            Frame::Control(Control::Notify { json }) => {
+                if let Ok(mut note) = serde_json::from_str::<feed::Note>(&json) {
+                    if note.v == feed::SCHEMA_VERSION {
+                        if note.host.is_empty()
+                            && let Some(host) =
+                                self.connections.get(&conn).map(|c| c.target.host.clone())
+                        {
+                            note.host = host;
+                        }
+                        note.pane = note.pane.and_then(|remote_id| {
+                            self.connections
+                                .get(&conn)
+                                .and_then(|c| c.routes.get(&remote_id).copied())
+                        });
+                        self.on_note(note);
+                    }
+                }
+            }
             // Welcome / Opened: nothing to do.
             Frame::Control(_) => {}
         }

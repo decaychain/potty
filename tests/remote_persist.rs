@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use potty::notify::{Kind, Note, SCHEMA_VERSION, Tool};
 use potty::proto::{Control, Frame, Layout, LayoutNode, LayoutTab};
 
 fn have(bin: &str) -> bool {
@@ -45,6 +46,31 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     false
 }
 
+fn notify_socket(sock: &Path) -> std::path::PathBuf {
+    sock.with_extension("notify.sock")
+}
+
+fn send_note(sock: &Path, session: &str, kind: Kind) {
+    let note = Note {
+        v: SCHEMA_VERSION,
+        tool: Tool::Codex,
+        kind,
+        session: session.to_string(),
+        message: "waiting".to_string(),
+        cwd: "/tmp".to_string(),
+        host: "remote-test".to_string(),
+        pid: Some(std::process::id()),
+        pane: Some(1),
+        zellij: None,
+        ts: 1,
+    };
+    let mut stream = UnixStream::connect(notify_socket(sock)).expect("connect notify socket");
+    let mut line = serde_json::to_string(&note).expect("serialize note");
+    line.push('\n');
+    use std::io::Write;
+    stream.write_all(line.as_bytes()).expect("write note");
+}
+
 /// Spawn the daemon directly on `sock` (bypassing the attach relay) and wait until it's listening.
 fn start_daemon(sock: &Path) -> Child {
     let _ = std::fs::remove_file(sock);
@@ -60,6 +86,10 @@ fn start_daemon(sock: &Path) -> Child {
         wait_until(Duration::from_secs(5), || sock.exists()),
         "daemon never bound its socket"
     );
+    assert!(
+        wait_until(Duration::from_secs(5), || notify_socket(sock).exists()),
+        "daemon never bound its notify socket"
+    );
     child
 }
 
@@ -72,7 +102,17 @@ struct Client {
 
 impl Client {
     fn connect(sock: &Path) -> Self {
-        let stream = UnixStream::connect(sock).expect("connect to daemon");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match UnixStream::connect(sock) {
+                Ok(stream) => break stream,
+                Err(err) if Instant::now() < deadline => {
+                    let _ = err;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("connect to daemon: {err}"),
+            }
+        };
         let mut read = stream.try_clone().unwrap();
         let collected: std::sync::Arc<
             std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>,
@@ -470,9 +510,118 @@ fn daemon_exits_after_last_pane_closed() {
         let _ = daemon.wait();
     }
     let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(notify_socket(&sock));
     assert!(
         exited,
         "daemon did not exit after its last pane closed and the client left"
+    );
+}
+
+#[test]
+fn notify_socket_forwards_notes_to_attached_client() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-notify-attached-{tag}.sock"));
+    let daemon = start_daemon(&sock);
+
+    let mut c = Client::connect(&sock);
+    c.send(Frame::Control(Control::Hello { version: 1 }));
+    assert!(c.wait(|_, ctrl| ctrl.iter().any(|m| matches!(m, Control::Ready))));
+
+    send_note(&sock, "native-attached", Kind::Raise);
+    let got_note = c.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Notify { json } if json.contains("native-attached")))
+    });
+
+    c.disconnect();
+    cleanup(daemon, &sock);
+    assert!(
+        got_note,
+        "attached client did not receive native notify note"
+    );
+}
+
+#[test]
+fn notify_socket_replays_pending_notes_on_reattach() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-notify-reattach-{tag}.sock"));
+    let daemon = start_daemon(&sock);
+
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 1 }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+    }));
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Opened { pane: 1 }))
+    }));
+    c1.disconnect();
+
+    send_note(&sock, "native-detached", Kind::Raise);
+
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 1 }));
+    let got_note = c2.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Notify { json } if json.contains("native-detached")))
+            && ctrl.iter().any(|m| matches!(m, Control::Ready))
+    });
+
+    c2.disconnect();
+    cleanup(daemon, &sock);
+    assert!(
+        got_note,
+        "reattach did not replay pending native notify note"
+    );
+}
+
+#[test]
+fn notify_socket_replays_detached_clear_on_reattach() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-notify-clear-{tag}.sock"));
+    let daemon = start_daemon(&sock);
+
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 1 }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+    }));
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Opened { pane: 1 }))
+    }));
+
+    send_note(&sock, "native-clear", Kind::Raise);
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Notify { json } if json.contains("native-clear")))
+    }));
+    c1.disconnect();
+
+    send_note(&sock, "native-clear", Kind::Clear);
+
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 1 }));
+    let got_clear = c2.wait(|_, ctrl| {
+        ctrl.iter().any(|m| {
+            matches!(
+                m,
+                Control::Notify { json }
+                    if json.contains("native-clear") && json.contains("\"kind\":\"clear\"")
+            )
+        }) && ctrl.iter().any(|m| matches!(m, Control::Ready))
+    });
+
+    c2.disconnect();
+    cleanup(daemon, &sock);
+    assert!(
+        got_clear,
+        "reattach did not replay detached native notify clear"
     );
 }
 
@@ -481,4 +630,5 @@ fn cleanup(mut daemon: Child, sock: &Path) {
     let _ = daemon.kill();
     let _ = daemon.wait();
     let _ = std::fs::remove_file(sock);
+    let _ = std::fs::remove_file(notify_socket(sock));
 }

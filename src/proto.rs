@@ -53,6 +53,10 @@ pub enum Control {
     /// C→S whenever the layout changes; S→C once during the attach restore burst (before `Ready`).
     /// Carries the tree as JSON (`Layout`) — the daemon stores it opaquely.
     LayoutTree { json: String },
+    /// S→C: an attention-feed note captured by the remote `potty-session` daemon. The payload is a
+    /// `notify::Note` JSON object; keeping it opaque here avoids coupling the terminal protocol to
+    /// the attention-feed schema.
+    Notify { json: String },
 }
 
 /// A serializable snapshot of the client's tab/pane tree for one session, with daemon pane ids at
@@ -208,6 +212,11 @@ mod tests {
             pane: 7,
             cols: 80,
             rows: 24,
+        });
+        assert_eq!(roundtrip(&f), f);
+
+        let f = Frame::Control(Control::Notify {
+            json: r#"{"v":1,"session":"abc"}"#.into(),
         });
         assert_eq!(roundtrip(&f), f);
     }

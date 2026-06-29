@@ -112,12 +112,22 @@ POTTY_PANE   = <PaneId>                              # which pane this shell liv
 Because `POTTY_PANE` rides the local process tree, a local Claude Code's helper reports its exact
 pane. **Local correlation is exact** — "click to focus" lands on the right pane every time.
 
-**SSH sessions (the hard case — implemented & verified, no core code change).** The helper runs on
-the *remote* host, so it can't see the local socket. We bridge with **SSH remote socket
-forwarding** — the helper connects to a socket on the remote that is tunnelled back over the
-*existing* SSH connection to potty's local listener. The architecture already supports this: the
-helper connects to whatever `$POTTY_NOTIFY` names, and the listener accepts any connection. So SSH
-is pure configuration — `potty-notify --print-ssh-config <host>` emits it:
+**Built-in `potty-session` SSH (native path).** The remote daemon binds its own Unix socket and
+injects that path as `$POTTY_NOTIFY` into every remote pane, alongside `$POTTY_PANE` for the daemon
+pane id. A remote `potty-notify` connects to that socket; the daemon stores the note and forwards it
+to the attached client as a `Notify` control frame over the existing potty protocol. No SSH
+`RemoteForward`, `SendEnv`, or remote `sshd_config` changes are needed. Pending notes raised while
+the client is detached are replayed on the next attach, so a long-running remote tool can still
+surface after reconnect.
+
+The crucial property is unchanged: **this path never touches the terminal byte stream.** The remote
+Claude Code/Codex hook -> `potty-notify` -> remote `potty-session` socket -> potty protocol -> UI.
+**Zellij is bypassed entirely**; it is irrelevant that the tab is inactive or that Zellij muxes the
+output, because the notification was never in the stream Zellij controls.
+
+**Plain/manual SSH fallback.** If you run a normal `ssh` inside a local potty shell rather than
+using built-in `potty-session`, the helper on the remote still cannot see the local socket. That
+path still uses SSH remote socket forwarding. `potty-notify --print-ssh-config <host>` emits:
 
 ```sshconfig
 # ~/.ssh/config
@@ -151,11 +161,6 @@ remote path, which a static ssh config can't express (it can't template `$POTTY_
 `potty-notify --print-ssh-wrapper` emits a shell `ssh` function that forwards
 `/tmp/potty-notify-$POTTY_PANE.sock` instead. Each pane gets its own remote socket, so concurrent
 same-host sessions coexist (verified). Outside potty the wrapper is plain `ssh`.
-
-The crucial property: **this path never touches the terminal byte stream.** The remote Claude
-Code's `Notification` hook → `potty-notify` → forwarded socket → potty. **Zellij is bypassed
-entirely** — it is irrelevant that the tab is inactive or that Zellij muxes the output, because
-the notification was never in the stream Zellij controls.
 
 ### 4. The UI — the attention feed
 
@@ -241,21 +246,22 @@ For reference, what they write:
 notify = ["potty-notify", "--tool", "codex"]
 ```
 
-For SSH: `potty-notify --print-ssh-config <host>` emits the `~/.ssh/config` block (and the remote
-sshd_config lines). Then drop the `potty-notify` binary on the remote's `$PATH` and install the
-same hooks in the remote `~/.claude` / `~/.codex`.
+For built-in `potty-session` SSH: drop the `potty-notify` binary on the remote's `$PATH` and
+install the same hooks in the remote `~/.claude` / `~/.codex`; no SSH forwarding is required.
+For plain/manual `ssh`, `potty-notify --print-ssh-config <host>` still emits the fallback
+`~/.ssh/config` block and remote `sshd_config` lines.
 
 ## Phasing
 
 - **Phase 1 — local, fully robust. ✅ shipped.** Listener thread + `UserEvent` variant + per-pane
   env injection + `potty-notify` bin + the attention-feed UI (overlay, bell, jump, dismiss). Exact
   correlation; covers single-machine multi-session use.
-- **Phase 2 — SSH. ✅ verified, config-only (no core code change).** The helper honours
-  `$POTTY_NOTIFY` and the listener takes any connection, so SSH is just `RemoteForward` + env
-  propagation. `SendEnv POTTY_PANE` makes remote notes jump to the SSH-hosting pane; the helper
-  reports `host` + Zellij context. Ergonomics: `--install-hook`, `--print-ssh-config`. Tested
-  end-to-end (incl. SSH-inside-Zellij) through a throwaway localhost sshd.
-- **Phase 3 — polish.** *Done:* the `ssh` wrapper (`potty-notify --print-ssh-wrapper`) injects a
+- **Phase 2 — built-in SSH. ✅ shipped.** `potty-session` owns a remote-local notify socket,
+  injects `$POTTY_NOTIFY`/`$POTTY_PANE` into panes, forwards notes over the protocol, and replays
+  pending notes on reattach. The helper reports `host` + Zellij context; remote pane ids are mapped
+  back to local panes for jump/clear behavior.
+- **Phase 3 — plain/manual SSH fallback.** *Done:* the `ssh` wrapper
+  (`potty-notify --print-ssh-wrapper`) injects a
   **per-pane** `RemoteForward`, which both removes the hand-edited ssh config *and* fixes the
   multi-session-per-host collision — each pane forwards `/tmp/potty-notify-$POTTY_PANE.sock`, so two
   live sessions to one host no longer fight over a single path (verified with concurrent sessions).

@@ -30,7 +30,7 @@ fn main() {
 #[cfg(unix)]
 mod imp {
     use std::collections::HashMap;
-    use std::io::{BufReader, Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
@@ -42,10 +42,12 @@ mod imp {
     use std::time::Duration;
 
     use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
+    use potty::notify as feed;
     use potty::proto::{Control, Frame, PROTOCOL_VERSION, PaneId};
 
     /// The daemon's socket, remembered so threads can remove it on exit.
     static SOCK: OnceLock<PathBuf> = OnceLock::new();
+    static NOTIFY_SOCK: OnceLock<PathBuf> = OnceLock::new();
 
     /// How much recent PTY output to keep per pane for replay on reattach. Enough for the current
     /// screen plus some scrollback; bounded so a chatty pane can't grow without limit.
@@ -75,6 +77,9 @@ mod imp {
         next_client: AtomicU64,
         /// The client's last-pushed tab/pane tree (opaque JSON), replayed on reattach.
         layout: Mutex<Option<String>>,
+        /// Attention notes raised while detached, replayed on the next attach.
+        pending_notes: Mutex<HashMap<(String, String), feed::Note>>,
+        notify_sock: PathBuf,
     }
 
     fn shell() -> String {
@@ -110,6 +115,106 @@ mod imp {
         }
     }
 
+    fn note_key(note: &feed::Note) -> (String, String) {
+        (note.host.clone(), note.session.clone())
+    }
+
+    fn send_note(session: &Session, note: &feed::Note) {
+        if let Ok(json) = serde_json::to_string(note) {
+            send_frame(session, Frame::Control(Control::Notify { json }));
+        }
+    }
+
+    fn handle_note(session: &Session, note: feed::Note) {
+        match note.kind {
+            feed::Kind::Raise => {
+                session
+                    .pending_notes
+                    .lock()
+                    .unwrap()
+                    .insert(note_key(&note), note.clone());
+                send_note(session, &note);
+            }
+            feed::Kind::Clear => {
+                if session.client.lock().unwrap().is_some() {
+                    session
+                        .pending_notes
+                        .lock()
+                        .unwrap()
+                        .remove(&note_key(&note));
+                } else {
+                    session
+                        .pending_notes
+                        .lock()
+                        .unwrap()
+                        .insert(note_key(&note), note.clone());
+                }
+                send_note(session, &note);
+            }
+        }
+    }
+
+    fn replay_pending_notes(session: &Session) {
+        let notes: Vec<feed::Note> = {
+            let mut pending = session.pending_notes.lock().unwrap();
+            let notes = pending.values().cloned().collect();
+            pending.retain(|_, note| note.kind == feed::Kind::Raise);
+            notes
+        };
+        for note in notes {
+            send_note(session, &note);
+        }
+    }
+
+    fn notify_socket_path(sock: &Path) -> PathBuf {
+        sock.with_extension("notify.sock")
+    }
+
+    fn inline_notify_socket_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "potty-session-inline-{}-notify.sock",
+            std::process::id()
+        ))
+    }
+
+    fn spawn_notify_listener(session: &Arc<Session>) {
+        let path = session.notify_sock.clone();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!(
+                    "potty-session: attention feed disabled (socket {}: {err})",
+                    path.display()
+                );
+                return;
+            }
+        };
+        let _ = NOTIFY_SOCK.set(path);
+        let session = session.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut line = String::new();
+                if BufReader::new(stream.take(64 * 1024))
+                    .read_line(&mut line)
+                    .is_err()
+                {
+                    continue;
+                }
+                if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim()) {
+                    if note.v == feed::SCHEMA_VERSION {
+                        handle_note(&session, note);
+                    }
+                }
+            }
+        });
+    }
+
     /// Spawn a shell in a fresh PTY: output → `Data` frames to whoever's attached; exit → `Exited`
     /// (and, if nothing's left and nobody's attached, the daemon exits).
     fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16) {
@@ -125,6 +230,8 @@ mod imp {
         };
         let mut cmd = CommandBuilder::new(shell());
         cmd.env("TERM", "xterm-256color");
+        cmd.env(feed::ENV_SOCK, &session.notify_sock);
+        cmd.env(feed::ENV_PANE, pane.to_string());
         let mut child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
             Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
@@ -234,6 +341,7 @@ mod imp {
                     if let Some(json) = session.layout.lock().unwrap().clone() {
                         send_frame(session, Frame::Control(Control::LayoutTree { json }));
                     }
+                    replay_pending_notes(session);
                     send_frame(session, Frame::Control(Control::Ready));
                 }
                 // The client pushed its current layout — store it for the next reattach.
@@ -276,6 +384,9 @@ mod imp {
 
     fn cleanup_and_exit() -> ! {
         if let Some(sock) = SOCK.get() {
+            let _ = std::fs::remove_file(sock);
+        }
+        if let Some(sock) = NOTIFY_SOCK.get() {
             let _ = std::fs::remove_file(sock);
         }
         std::process::exit(0);
@@ -377,12 +488,19 @@ mod imp {
             }
         };
         let _ = SOCK.set(sock);
+        let notify_sock = SOCK
+            .get()
+            .map(|sock| notify_socket_path(sock))
+            .unwrap_or_else(inline_notify_socket_path);
         let session = Arc::new(Session {
             panes: Mutex::new(HashMap::new()),
             client: Mutex::new(None),
             next_client: AtomicU64::new(1),
             layout: Mutex::new(None),
+            pending_notes: Mutex::new(HashMap::new()),
+            notify_sock,
         });
+        spawn_notify_listener(&session);
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
             let Ok(write) = conn.try_clone() else {
@@ -429,6 +547,8 @@ mod imp {
             })),
             next_client: AtomicU64::new(1),
             layout: Mutex::new(None),
+            pending_notes: Mutex::new(HashMap::new()),
+            notify_sock: inline_notify_socket_path(),
         });
         serve(&session, 0, std::io::stdin().lock());
     }

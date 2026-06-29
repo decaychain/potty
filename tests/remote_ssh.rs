@@ -357,6 +357,7 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
     drop(session2);
     let _ = Command::new("pkill").args(["-f", &marker]).status();
     let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(sock.with_extension("notify.sock"));
 
     assert!(restored, "second ssh attach did not restore pane 1");
     assert!(ready, "second ssh attach did not reach Ready");
@@ -364,6 +365,71 @@ async fn persistent_session_survives_ssh_detach_and_reattaches() {
         contains(&replay, marker.as_bytes()),
         "reattach did not replay marker output"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn potty_session_forwards_native_notify_notes_over_ssh() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+
+    let sock = std::env::temp_dir().join(format!(
+        "potty-ssh-notify-{}-{}.sock",
+        std::process::id(),
+        sshd.port
+    ));
+    let command = persistent_session_cmd(&sock);
+    let cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+
+    let (session, outbound, mut rx) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &command)
+            .await
+            .expect("connect persistent session over ssh");
+    let payload = r#"{"session_id":"ssh-native-notify","message":"hello from remote"}"#;
+    for f in [
+        Frame::Control(Control::Hello { version: 1 }),
+        Frame::Control(Control::Open {
+            pane: 1,
+            cols: 80,
+            rows: 24,
+        }),
+        Frame::Data {
+            pane: 1,
+            bytes: format!(
+                "{} --tool codex '{}'\r",
+                env!("CARGO_BIN_EXE_potty-notify"),
+                payload
+            )
+            .into_bytes(),
+        },
+    ] {
+        outbound.send(f).await.expect("send frame");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut got_note = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(Frame::Control(Control::Notify { json }))) => {
+                if json.contains("ssh-native-notify") {
+                    got_note = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    let _ = outbound
+        .send(Frame::Control(Control::Close { pane: 1 }))
+        .await;
+    drop(outbound);
+    drop(session);
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(sock.with_extension("notify.sock"));
+
+    assert!(got_note, "native notify note did not arrive over SSH");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
