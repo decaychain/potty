@@ -616,6 +616,14 @@ fn clean_profile_name(name: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+fn terminal_should_receive_ime_commit(
+    has_terms: bool,
+    text_input_active: bool,
+    egui_consumed: bool,
+) -> bool {
+    has_terms && !text_input_active && !egui_consumed
+}
+
 fn unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1097,8 +1105,9 @@ fn build_ui(
             .show(ctx, |ui| {
                 ui.set_max_width(360.0);
                 ui.label("Host  ([user@]host[:port])");
-                // Capture Enter before the field — a singleline TextEdit consumes it.
+                // Capture keys before the field — a singleline TextEdit consumes them.
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
                 let resp = ui.add(egui::TextEdit::singleline(connect_host).hint_text("user@host"));
                 if ui.memory(|m| m.focused().is_none()) {
                     resp.request_focus();
@@ -1143,7 +1152,7 @@ fn build_ui(
                     {
                         actions.push(Action::Connect(connect_host.clone(), connect_name.clone()));
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").clicked() || escape {
                         actions.push(Action::CloseConnect);
                     }
                 });
@@ -3760,10 +3769,12 @@ impl ApplicationHandler<UserEvent> for App {
             _ => false,
         };
 
+        let mut egui_consumed = false;
         if let Some(window) = self.state.as_ref().map(|s| s.window.clone()) {
             if let Some(es) = self.egui_state.as_mut() {
                 if !withhold_from_egui {
                     let resp = es.on_window_event(&window, &event);
+                    egui_consumed = resp.consumed;
                     if resp.repaint {
                         window.request_redraw();
                     }
@@ -3854,7 +3865,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m,
             WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
             // IME commit (composed text, or text from an active input-method framework).
-            WindowEvent::Ime(Ime::Commit(text)) if !self.terms.is_empty() => {
+            WindowEvent::Ime(Ime::Commit(text))
+                if terminal_should_receive_ime_commit(
+                    !self.terms.is_empty(),
+                    self.text_input_active(),
+                    egui_consumed,
+                ) =>
+            {
                 let focus = self.focus();
                 self.to_pty(focus, text.as_bytes());
             }
@@ -3961,7 +3978,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{csi_tilde, cursor_key, xterm_modifier};
+    use super::{csi_tilde, cursor_key, terminal_should_receive_ime_commit, xterm_modifier};
 
     #[test]
     fn modifier_parameter() {
@@ -3993,5 +4010,13 @@ mod tests {
         assert_eq!(csi_tilde(3, 1), b"\x1b[3~"); // Delete
         assert_eq!(csi_tilde(3, 5), b"\x1b[3;5~"); // Ctrl-Delete
         assert_eq!(csi_tilde(5, 6), b"\x1b[5;6~"); // Ctrl-Shift-PageUp
+    }
+
+    #[test]
+    fn ime_commit_goes_to_terminal_only_when_egui_does_not_own_text() {
+        assert!(terminal_should_receive_ime_commit(true, false, false));
+        assert!(!terminal_should_receive_ime_commit(true, true, false));
+        assert!(!terminal_should_receive_ime_commit(true, false, true));
+        assert!(!terminal_should_receive_ime_commit(false, false, false));
     }
 }
