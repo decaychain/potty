@@ -5,6 +5,7 @@
 //! Unix-only, and each test skips (not fails) when the tools it needs aren't installed.
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -117,6 +118,7 @@ fn start_sshd() -> Option<Sshd> {
              AuthorizedKeysFile {auth}\n\
              PasswordAuthentication no\n\
              PubkeyAuthentication yes\n\
+             AcceptEnv POTTY_TEST_*\n\
              UsePAM no\n\
              StrictModes no\n",
             hk = hostkey.display(),
@@ -184,6 +186,7 @@ fn config(
         host: "127.0.0.1".into(),
         port: sshd.port,
         user: user.into(),
+        env: BTreeMap::new(),
         keys,
         known_hosts: Some(sshd.dir.join("known_hosts")),
         use_agent,
@@ -198,6 +201,23 @@ async fn assert_echo_round_trip(
     outbound: Sender<Frame>,
     mut rx: Receiver<Frame>,
 ) {
+    assert_remote_output(
+        session,
+        outbound,
+        &mut rx,
+        b"echo SSH_ROUNDTRIP_OK\r",
+        b"SSH_ROUNDTRIP_OK",
+    )
+    .await;
+}
+
+async fn assert_remote_output(
+    session: RemoteSession,
+    outbound: Sender<Frame>,
+    rx: &mut Receiver<Frame>,
+    input: &[u8],
+    expected: &[u8],
+) {
     for f in [
         Frame::Control(Control::Hello { version: 1 }),
         Frame::Control(Control::Open {
@@ -207,7 +227,7 @@ async fn assert_echo_round_trip(
         }),
         Frame::Data {
             pane: 1,
-            bytes: b"echo SSH_ROUNDTRIP_OK\r".to_vec(),
+            bytes: input.to_vec(),
         },
     ] {
         outbound.send(f).await.expect("send frame");
@@ -223,11 +243,11 @@ async fn assert_echo_round_trip(
             Ok(None) => break,
             Err(_) => {}
         }
-        if contains(&out, b"SSH_ROUNDTRIP_OK") {
+        if contains(&out, expected) {
             return;
         }
     }
-    panic!("echo did not round-trip over SSH");
+    panic!("expected remote output did not arrive");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -363,6 +383,31 @@ async fn publickey_round_trip_to_potty_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn potty_session_inherits_configured_env() {
+    let Some(sshd) = start_sshd() else {
+        eprintln!("skipping: sshd/ssh-keygen unavailable");
+        return;
+    };
+    let Some(user) = user() else { return };
+
+    let mut cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+    cfg.env
+        .insert("POTTY_TEST_REMOTE_ENV".into(), "space and 'quote'".into());
+    let (session, outbound, mut rx) =
+        connect_and_exec(&cfg, std::sync::Arc::new(AcceptHost(true)), &session_cmd())
+            .await
+            .expect("connect/auth/exec over ssh");
+    assert_remote_output(
+        session,
+        outbound,
+        &mut rx,
+        b"printf 'ENV=<%s>\\n' \"$POTTY_TEST_REMOTE_ENV\"\r",
+        b"ENV=<space and 'quote'>",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_host_key_aborts_connect() {
     let Some(sshd) = start_sshd() else { return };
     let Some(user) = user() else { return };
@@ -461,6 +506,28 @@ async fn plain_shell_round_trip() {
     }
     let _keep = session; // hold the session open until we're done
     assert!(ok, "plain shell output did not round-trip");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_shell_receives_configured_env_when_server_accepts_it() {
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+
+    let mut cfg = config(&sshd, &user, vec![sshd.client_key.clone()], false, None);
+    cfg.env
+        .insert("POTTY_TEST_REMOTE_ENV".into(), "plain-env-ok".into());
+    let (session, outbound, mut rx) = shell_session(&cfg, std::sync::Arc::new(AcceptHost(true)))
+        .await
+        .expect("plain shell over ssh");
+
+    assert_remote_output(
+        session,
+        outbound,
+        &mut rx,
+        b"printf 'ENV=<%s>\\n' \"$POTTY_TEST_REMOTE_ENV\"\r",
+        b"ENV=<plain-env-ok>",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

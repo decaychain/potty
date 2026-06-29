@@ -9,7 +9,7 @@
 //! Note: pulling russh in here means the lib (and thus `potty-session`) compiles it; once the
 //! remote-deploy build matters, this module should move behind a `client` feature.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -73,6 +73,9 @@ pub struct SshConfig {
     pub host: String,
     pub port: u16,
     pub user: String,
+    /// Environment variables requested for each remote channel. Persistent `potty-session`
+    /// connections also prefix the exec command so arbitrary names work without server `AcceptEnv`.
+    pub env: BTreeMap<String, String>,
     /// Private key files to try, in order, after the agent.
     pub keys: Vec<PathBuf>,
     /// known_hosts file; `None` → the default (`~/.ssh/known_hosts`).
@@ -161,6 +164,8 @@ pub async fn connect_and_exec(
     let session = authenticate(cfg, &auth).await?;
 
     let channel = session.channel_open_session().await.map_err(io_err)?;
+    send_env_requests(&channel, &cfg.env).await;
+    let command = command_with_env(command, &cfg.env);
     channel.exec(true, command).await.map_err(io_err)?;
     let (mut read_half, write_half) = channel.split();
 
@@ -241,6 +246,7 @@ pub async fn shell_session(
 
     let (in_tx, in_rx) = mpsc::channel::<Frame>(256); // shells → us
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256); // us → shells
+    let env = cfg.env.clone();
 
     // Coordinator: owns the SSH handle and one channel per pane, translating proto ↔ raw SSH.
     tokio::spawn(async move {
@@ -260,7 +266,7 @@ pub async fn shell_session(
                 }
                 // A new pane → a new channel running a login shell in a PTY of the requested size.
                 Frame::Control(Control::Open { pane, cols, rows }) => {
-                    match open_shell_channel(&handle, cols, rows).await {
+                    match open_shell_channel(&handle, &env, cols, rows).await {
                         Ok(channel) => {
                             let (mut read, write) = channel.split();
                             panes.insert(pane, write);
@@ -325,16 +331,54 @@ pub async fn shell_session(
 /// Open one SSH channel with a PTY of `cols`×`rows` running a login shell.
 async fn open_shell_channel(
     handle: &Handle<ClientHandler>,
+    env: &BTreeMap<String, String>,
     cols: u16,
     rows: u16,
 ) -> std::io::Result<russh::Channel<client::Msg>> {
     let channel = handle.channel_open_session().await.map_err(io_err)?;
+    send_env_requests(&channel, env).await;
     channel
         .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await
         .map_err(io_err)?;
     channel.request_shell(true).await.map_err(io_err)?;
     Ok(channel)
+}
+
+async fn send_env_requests(channel: &russh::Channel<client::Msg>, env: &BTreeMap<String, String>) {
+    for (name, value) in valid_env(env) {
+        let _ = channel.set_env(false, name, value).await;
+    }
+}
+
+fn command_with_env(command: &str, env: &BTreeMap<String, String>) -> String {
+    let assignments: Vec<String> = valid_env(env)
+        .map(|(name, value)| format!("{name}={}", shell_quote(value)))
+        .collect();
+    if assignments.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {command}", assignments.join(" "))
+    }
+}
+
+fn valid_env(env: &BTreeMap<String, String>) -> impl Iterator<Item = (&str, &str)> {
+    env.iter()
+        .filter(|(name, value)| valid_env_name(name) && !value.contains('\0'))
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Open a fresh SSH connection (its own `MaxAuthTries` budget) and verify the host key.
@@ -530,5 +574,38 @@ async fn try_keyboard_interactive(
                     .map_err(io_err)?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::command_with_env;
+
+    #[test]
+    fn command_with_env_shell_quotes_values() {
+        let mut env = BTreeMap::new();
+        env.insert("POTTY_ONE".to_string(), "simple".to_string());
+        env.insert("POTTY_TWO".to_string(), "space and 'quote'".to_string());
+
+        assert_eq!(
+            command_with_env("potty-session --flag", &env),
+            "POTTY_ONE='simple' POTTY_TWO='space and '\\''quote'\\''' potty-session --flag"
+        );
+    }
+
+    #[test]
+    fn command_with_env_skips_invalid_assignments() {
+        let mut env = BTreeMap::new();
+        env.insert("1BAD".to_string(), "nope".to_string());
+        env.insert("ALSO-BAD".to_string(), "nope".to_string());
+        env.insert("GOOD_NAME".to_string(), "ok".to_string());
+        env.insert("NUL_VALUE".to_string(), "bad\0value".to_string());
+
+        assert_eq!(
+            command_with_env("potty-session", &env),
+            "GOOD_NAME='ok' potty-session"
+        );
     }
 }

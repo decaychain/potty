@@ -1784,6 +1784,7 @@ impl App {
                 host: target.host,
                 port: target.port,
                 use_potty_session,
+                env: Default::default(),
                 last_connected: Some(now),
             });
         }
@@ -1795,6 +1796,15 @@ impl App {
         if let Some(c) = self.connections.get_mut(&conn) {
             c.remembered = true;
         }
+    }
+
+    fn remote_env_for(&self, target: &RemoteTarget) -> std::collections::BTreeMap<String, String> {
+        self.config
+            .profiles
+            .iter()
+            .find(|p| p.user == target.user && p.host == target.host && p.port == target.port)
+            .map(|p| p.env.clone())
+            .unwrap_or_default()
     }
 
     /// Focus a pane from the feed: select its tab, focus it, and clear its note.
@@ -2607,6 +2617,7 @@ impl App {
             host,
             port,
             user,
+            env: self.remote_env_for(&target),
             keys: default_keys(),
             known_hosts: None,
             use_agent: true,
@@ -2640,6 +2651,7 @@ impl App {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(22),
             user: std::env::var("POTTY_TEST_USER").unwrap_or_default(),
+            env: Default::default(),
             keys: std::env::var("POTTY_TEST_KEY")
                 .ok()
                 .map(std::path::PathBuf::from)

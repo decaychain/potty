@@ -54,7 +54,8 @@ Or [build from source](#build--run).
   bypass into local selection.
 - **Per-pane titles** — from OSC 0/2; shown in the tab label and propagated to the window title.
 - **Configuration** — `potty.toml` (TOML), **hot-reloaded** on save: font family/size, a separate
-  chrome font size, a full colour scheme, the shell, and the OSC 52 policy.
+  chrome font size, a full colour scheme, the shell, the OSC 52 policy, and per-profile remote
+  environment variables.
 - **Keyboard** — layout-resolved text (German/US, no IME needed) with an IME-commit safety net,
   DECCKM-aware cursor / navigation / function keys (so `mc` and ncurses apps work), and AltGr
   handling on Windows.
@@ -62,6 +63,22 @@ Or [build from source](#build--run).
   waiting on you, gathered out-of-band over a socket rather than scraped from the screen, so a
   session in a **background pane** still surfaces. Click an entry to jump to its pane. See
   [Attention feed](#attention-feed) and [the design doc](docs/attention-feed.md).
+
+Remote profile environment variables live in `potty.toml` on the matching connection profile:
+
+```toml
+[[profiles]]
+name = "work"
+user = "alice"
+host = "build.example.com"
+port = 22
+use_potty_session = true
+env = { CODEX_HOME = "/srv/codex", FEATURE_FLAG = "remote" }
+```
+
+For `potty-session` connections, potty prefixes the remote command so these values are inherited
+by panes. Plain-shell connections use SSH env requests, which OpenSSH only honors for names allowed
+by the server's `AcceptEnv`.
 
 ## Attention feed
 

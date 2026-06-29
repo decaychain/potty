@@ -4,6 +4,7 @@
 //! visual change survives restart). Colors are file-only. Lives at
 //! $XDG_CONFIG_HOME/potty/potty.toml (or ~/.config/potty/potty.toml).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
@@ -58,6 +59,9 @@ pub struct ConnectionProfile {
     pub host: String,
     pub port: u16,
     pub use_potty_session: bool,
+    /// Environment variables to inject into remote sessions for this target.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_connected: Option<u64>,
 }
@@ -103,6 +107,7 @@ impl Default for ConnectionProfile {
             host: String::new(),
             port: 22,
             use_potty_session: false,
+            env: BTreeMap::new(),
             last_connected: None,
         }
     }
@@ -221,4 +226,29 @@ fn parse_hex(s: &str) -> Option<Rgb> {
         g: u8::from_str_radix(&s[2..4], 16).ok()?,
         b: u8::from_str_radix(&s[4..6], 16).ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn connection_profile_env_deserializes_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[profiles]]
+name = "work"
+user = "alice"
+host = "example.test"
+port = 2222
+use_potty_session = true
+env = { POTTY_CONTEXT = "codex", EMPTY_OK = "" }
+"#,
+        )
+        .expect("config parses");
+
+        let profile = &cfg.profiles[0];
+        assert_eq!(profile.env["POTTY_CONTEXT"], "codex");
+        assert_eq!(profile.env["EMPTY_OK"], "");
+    }
 }
