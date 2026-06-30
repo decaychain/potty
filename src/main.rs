@@ -705,6 +705,359 @@ fn human_age(d: Duration) -> String {
     }
 }
 
+fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn chrome_bg() -> egui::Color32 {
+    rgb(18, 20, 24)
+}
+
+fn chrome_surface() -> egui::Color32 {
+    rgb(27, 30, 36)
+}
+
+fn chrome_surface_2() -> egui::Color32 {
+    rgb(37, 41, 49)
+}
+
+fn chrome_hover() -> egui::Color32 {
+    rgb(45, 52, 62)
+}
+
+fn chrome_stroke() -> egui::Stroke {
+    egui::Stroke::new(1.0, rgba(142, 155, 176, 90))
+}
+
+fn chrome_text() -> egui::Color32 {
+    rgb(226, 232, 240)
+}
+
+fn chrome_muted() -> egui::Color32 {
+    rgb(148, 163, 184)
+}
+
+fn chrome_accent() -> egui::Color32 {
+    rgb(34, 244, 255)
+}
+
+fn chrome_magenta() -> egui::Color32 {
+    rgb(214, 93, 255)
+}
+
+fn chrome_blue() -> egui::Color32 {
+    rgb(125, 167, 255)
+}
+
+fn chrome_warn() -> egui::Color32 {
+    rgb(255, 184, 108)
+}
+
+fn chrome_error() -> egui::Color32 {
+    rgb(255, 104, 120)
+}
+
+fn chrome_shadow() -> egui::Shadow {
+    egui::Shadow {
+        offset: [0, 12],
+        blur: 28,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(140),
+    }
+}
+
+fn popup_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .fill(chrome_surface())
+        .stroke(chrome_stroke())
+        .corner_radius(egui::CornerRadius::same(8))
+        .shadow(chrome_shadow())
+}
+
+fn dialog_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .fill(chrome_surface())
+        .stroke(chrome_stroke())
+        .corner_radius(egui::CornerRadius::same(8))
+        .shadow(chrome_shadow())
+}
+
+fn tabbar_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .fill(rgba(16, 18, 22, 245))
+        .stroke(egui::Stroke::new(1.0, rgba(142, 155, 176, 40)))
+}
+
+fn inset_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(9, 7))
+        .fill(chrome_bg())
+        .stroke(egui::Stroke::new(1.0, rgba(142, 155, 176, 55)))
+        .corner_radius(egui::CornerRadius::same(6))
+}
+
+fn warning_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(9, 7))
+        .fill(rgba(255, 104, 120, 26))
+        .stroke(egui::Stroke::new(1.0, rgba(255, 104, 120, 120)))
+        .corner_radius(egui::CornerRadius::same(6))
+}
+
+fn apply_chrome_style(ctx: &egui::Context, ui_size: f32) {
+    ctx.global_style_mut(|style| {
+        for st in [egui::TextStyle::Body, egui::TextStyle::Button] {
+            if let Some(f) = style.text_styles.get_mut(&st) {
+                f.size = ui_size;
+            }
+        }
+        if let Some(f) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
+            f.size = (ui_size + 2.0).max(14.0);
+        }
+
+        style.spacing.window_margin = egui::Margin::symmetric(16, 14);
+        style.spacing.menu_margin = egui::Margin::symmetric(10, 8);
+        style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+        style.spacing.button_padding = egui::vec2(9.0, 4.0);
+        style.spacing.interact_size = egui::vec2(44.0, 24.0);
+        style.spacing.text_edit_width = 260.0;
+        style.spacing.menu_width = 170.0;
+
+        let visuals = &mut style.visuals;
+        visuals.dark_mode = true;
+        visuals.override_text_color = None;
+        visuals.weak_text_alpha = 0.72;
+        visuals.weak_text_color = Some(chrome_muted());
+        visuals.hyperlink_color = chrome_blue();
+        visuals.faint_bg_color = rgba(125, 167, 255, 18);
+        visuals.extreme_bg_color = chrome_bg();
+        visuals.text_edit_bg_color = Some(chrome_bg());
+        visuals.code_bg_color = rgb(15, 18, 22);
+        visuals.warn_fg_color = chrome_warn();
+        visuals.error_fg_color = chrome_error();
+        visuals.window_corner_radius = egui::CornerRadius::same(8);
+        visuals.window_shadow = chrome_shadow();
+        visuals.window_fill = chrome_surface();
+        visuals.window_stroke = chrome_stroke();
+        visuals.menu_corner_radius = egui::CornerRadius::same(8);
+        visuals.panel_fill = rgb(13, 15, 18);
+        visuals.popup_shadow = chrome_shadow();
+        visuals.selection.bg_fill = rgba(34, 244, 255, 72);
+        visuals.selection.stroke = egui::Stroke::new(1.0, chrome_text());
+        visuals.text_cursor.stroke = egui::Stroke::new(1.4, chrome_accent());
+        visuals.button_frame = true;
+
+        visuals.widgets.noninteractive.bg_fill = chrome_surface();
+        visuals.widgets.noninteractive.weak_bg_fill = chrome_surface_2();
+        visuals.widgets.noninteractive.bg_stroke = chrome_stroke();
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, chrome_text());
+        visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+
+        visuals.widgets.inactive.bg_fill = chrome_surface_2();
+        visuals.widgets.inactive.weak_bg_fill = rgba(125, 167, 255, 18);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, rgba(142, 155, 176, 70));
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, chrome_text());
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+
+        visuals.widgets.hovered.bg_fill = chrome_hover();
+        visuals.widgets.hovered.weak_bg_fill = rgba(34, 244, 255, 34);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, rgba(34, 244, 255, 150));
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, chrome_text());
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+
+        visuals.widgets.active.bg_fill = rgba(34, 244, 255, 58);
+        visuals.widgets.active.weak_bg_fill = rgba(214, 93, 255, 42);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, chrome_accent());
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, chrome_text());
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+
+        visuals.widgets.open = visuals.widgets.hovered;
+    });
+}
+
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new(text)
+            .small()
+            .strong()
+            .color(chrome_muted()),
+    );
+}
+
+fn dialog_caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(chrome_muted()));
+}
+
+fn dialog_header(ui: &mut egui::Ui, title: &str, close_hover: Option<&str>) -> bool {
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .strong()
+                .color(chrome_text())
+                .size((ui.text_style_height(&egui::TextStyle::Body) + 1.0).max(14.0)),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(hover) = close_hover {
+                close = icon_button(ui, "x", hover).clicked();
+            }
+        });
+    });
+    ui.add_space(2.0);
+    close
+}
+
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).strong().color(rgb(7, 22, 19)))
+            .fill(chrome_accent())
+            .stroke(egui::Stroke::new(1.0, rgba(207, 250, 244, 120)))
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(84.0, 28.0)),
+    )
+}
+
+fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(text)
+            .fill(chrome_surface_2())
+            .stroke(chrome_stroke())
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(78.0, 28.0)),
+    )
+}
+
+fn stepper_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(text)
+            .fill(chrome_bg())
+            .stroke(chrome_stroke())
+            .corner_radius(egui::CornerRadius::same(5))
+            .min_size(egui::vec2(30.0, 26.0)),
+    )
+}
+
+fn icon_button(ui: &mut egui::Ui, text: &str, hover: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).strong())
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(24.0, 24.0)),
+    )
+    .on_hover_text(hover)
+}
+
+fn chrome_text_edit<'a>(text: &'a mut String, hint: &'static str) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(text)
+        .hint_text(hint)
+        .desired_width(f32::INFINITY)
+        .margin(egui::Margin::symmetric(8, 5))
+}
+
+fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, hint: Option<&str>) -> egui::Response {
+    let width = ui.available_width().clamp(156.0, 170.0);
+    let height = 28.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let fill = if response.hovered() {
+            chrome_hover()
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(6), fill);
+        ui.painter().text(
+            rect.left_center() + egui::vec2(9.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            icon,
+            egui::FontId::monospace(12.0),
+            if response.hovered() {
+                chrome_magenta()
+            } else {
+                chrome_accent()
+            },
+        );
+        ui.painter().text(
+            rect.left_center() + egui::vec2(42.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Button) - 1.0),
+            chrome_text(),
+        );
+        if let Some(hint) = hint {
+            ui.painter().text(
+                rect.right_center() - egui::vec2(10.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                hint,
+                egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Small)),
+                chrome_muted(),
+            );
+        }
+    }
+
+    response
+}
+
+fn profile_row(ui: &mut egui::Ui, profile: &ConnectProfileView) -> egui::Response {
+    let width = ui.available_width().max(300.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 48.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if response.hovered() {
+            chrome_hover()
+        } else {
+            chrome_bg()
+        };
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(7),
+            fill,
+            egui::Stroke::new(1.0, rgba(142, 155, 176, 60)),
+            egui::StrokeKind::Inside,
+        );
+        let mode = if profile.use_potty_session {
+            "session"
+        } else {
+            "plain"
+        };
+        ui.painter().text(
+            rect.left_top() + egui::vec2(10.0, 9.0),
+            egui::Align2::LEFT_TOP,
+            elide(&profile.label, 30),
+            egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Button)),
+            chrome_text(),
+        );
+        ui.painter().text(
+            rect.right_top() + egui::vec2(-10.0, 9.0),
+            egui::Align2::RIGHT_TOP,
+            mode,
+            egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Small)),
+            if profile.use_potty_session {
+                chrome_accent()
+            } else {
+                chrome_muted()
+            },
+        );
+        ui.painter().text(
+            rect.left_bottom() + egui::vec2(10.0, -9.0),
+            egui::Align2::LEFT_BOTTOM,
+            elide(&profile.detail, 48),
+            egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Small)),
+            chrome_muted(),
+        );
+    }
+    response
+}
+
 /// The one pane/tab menu, used by both the ☰ button (`for_pane` = None → acts on the focused
 /// pane) and a pane's right-click context menu (`for_pane` = that pane). Being the single menu
 /// means hiding the tab bar still gives full access via right-click. Font controls live in a
@@ -718,39 +1071,41 @@ fn full_menu(
     for_pane: Option<PaneId>,
     can_detach: bool,
 ) {
+    ui.set_min_width(164.0);
+    ui.style_mut().interaction.selectable_labels = false;
     let focus = |actions: &mut Vec<Action>| {
         if let Some(id) = for_pane {
             actions.push(Action::Focus(id));
         }
     };
-    if ui.button("Split right").clicked() {
+    if menu_item(ui, "+", "New tab", None).clicked() {
+        actions.push(Action::NewTab);
+        ui.close_menu();
+    }
+    if menu_item(ui, ">", "Split right", None).clicked() {
         focus(actions);
         actions.push(Action::Split(Split::Cols));
         ui.close_menu();
     }
-    if ui.button("Split down").clicked() {
+    if menu_item(ui, "v", "Split down", None).clicked() {
         focus(actions);
         actions.push(Action::Split(Split::Rows));
         ui.close_menu();
     }
-    ui.separator();
-    if ui.button("Close pane").clicked() {
+    if menu_item(ui, "x", "Close pane", None).clicked() {
         focus(actions);
         actions.push(Action::ClosePane);
         ui.close_menu();
     }
-    if ui.button("New tab").clicked() {
-        actions.push(Action::NewTab);
-        ui.close_menu();
-    }
-    if ui.button("Connect to host…").clicked() {
+    ui.separator();
+    section_label(ui, "SSH");
+    if menu_item(ui, "ssh", "Connect to host…", None).clicked() {
         actions.push(Action::OpenConnect);
         ui.close_menu();
     }
     // Only for a persistent (potty-session) remote pane: leave the session running and disconnect.
     if can_detach
-        && ui
-            .button("Detach session")
+        && menu_item(ui, "dt", "Detach session", None)
             .on_hover_text("Disconnect but keep the remote shells running, to reattach later")
             .clicked()
     {
@@ -759,7 +1114,8 @@ fn full_menu(
         ui.close_menu();
     }
     ui.separator();
-    if ui.button("Font settings…").clicked() {
+    section_label(ui, "View");
+    if menu_item(ui, "Aa", "Font settings…", None).clicked() {
         actions.push(Action::ShowFontSettings);
         ui.close_menu();
     }
@@ -775,42 +1131,61 @@ fn font_settings_window(
     cur_size: f32,
     actions: &mut Vec<Action>,
 ) {
+    let mut request_close = false;
     egui::Window::new("Font settings")
         .open(open)
+        .title_bar(false)
         .collapsible(false)
         .resizable(false)
+        .frame(dialog_frame())
         .show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            request_close |= dialog_header(ui, "Font settings", Some("Close"));
+            dialog_caption(ui, "Terminal renderer");
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("Size");
-                if ui.button("−").clicked() {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                ui.label(egui::RichText::new("Size").color(chrome_muted()));
+                if stepper_button(ui, "-").clicked() {
                     actions.push(Action::SetFontSize(cur_size - 1.0));
                 }
-                ui.label(format!("{cur_size:.0} px"));
-                if ui.button("+").clicked() {
+                ui.label(
+                    egui::RichText::new(format!("{cur_size:.0} px"))
+                        .monospace()
+                        .color(chrome_text()),
+                );
+                if stepper_button(ui, "+").clicked() {
                     actions.push(Action::SetFontSize(cur_size + 1.0));
                 }
             });
             ui.separator();
-            ui.label("Font family");
-            egui::ScrollArea::vertical()
-                .max_height(280.0)
-                .show(ui, |ui| {
-                    if ui
-                        .selectable_label(cur_family.is_none(), "(default monospace)")
-                        .clicked()
-                    {
-                        actions.push(Action::SetFontFamily(None));
-                    }
-                    for fam in families {
+            section_label(ui, "Font family");
+            let list_width = ui.available_width();
+            inset_frame().show(ui, |ui| {
+                ui.set_min_width((list_width - 20.0).max(260.0));
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
                         if ui
-                            .selectable_label(cur_family == Some(fam.as_str()), fam)
+                            .selectable_label(cur_family.is_none(), "(default monospace)")
                             .clicked()
                         {
-                            actions.push(Action::SetFontFamily(Some(fam.clone())));
+                            actions.push(Action::SetFontFamily(None));
                         }
-                    }
-                });
+                        for fam in families {
+                            if ui
+                                .selectable_label(cur_family == Some(fam.as_str()), fam)
+                                .clicked()
+                            {
+                                actions.push(Action::SetFontFamily(Some(fam.clone())));
+                            }
+                        }
+                    });
+            });
         });
+    if request_close {
+        *open = false;
+    }
 }
 
 #[allow(deprecated)]
@@ -848,59 +1223,71 @@ fn build_ui(
     // (shift-right-click when an app has grabbed the mouse).
     let show_chrome = ws.tabs.len() > 1 || chrome_latched;
     if show_chrome {
-        egui::TopBottomPanel::top("tabbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                for (i, _tab) in ws.tabs.iter().enumerate() {
-                    // Label + close grouped tightly so they read as one tab.
-                    ui.scope(|ui| {
-                        ui.spacing_mut().item_spacing.x = 3.0;
-                        let title = elide(&tab_titles[i], 24);
-                        if ui.selectable_label(i == ws.active, title).clicked() {
-                            actions.push(Action::SelectTab(i));
-                        }
-                        let close = egui::Button::new(egui::RichText::new("×").weak()).frame(false);
-                        if ui.add(close).on_hover_text("Close tab").clicked() {
-                            actions.push(Action::CloseTab(i));
+        egui::TopBottomPanel::top("tabbar")
+            .frame(tabbar_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, _tab) in ws.tabs.iter().enumerate() {
+                        // Label + close grouped tightly so they read as one tab.
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            let title = elide(&tab_titles[i], 24);
+                            if ui
+                                .add(
+                                    egui::Button::selectable(i == ws.active, title)
+                                        .corner_radius(egui::CornerRadius::same(6)),
+                                )
+                                .clicked()
+                            {
+                                actions.push(Action::SelectTab(i));
+                            }
+                            let close =
+                                egui::Button::new(egui::RichText::new("×").weak()).frame(false);
+                            if ui.add(close).on_hover_text("Close tab").clicked() {
+                                actions.push(Action::CloseTab(i));
+                            }
+                        });
+                    }
+                    if icon_button(ui, "+", "New tab").clicked() {
+                        actions.push(Action::NewTab);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let focus_detachable = detachable_panes.contains(&ws.active_tab().focus);
+                        ui.menu_button("☰", |ui| full_menu(ui, actions, None, focus_detachable));
+                        // Attention-feed bell — present once the feed has latched the bar on. Shows
+                        // the waiting count; toggles the overlay.
+                        if chrome_latched {
+                            let empty = pending.is_empty();
+                            let label = if empty {
+                                "\u{1F514}".to_string() // 🔔
+                            } else {
+                                format!("\u{1F514} {}", pending.len())
+                            };
+                            let hover = if empty {
+                                "Nothing waiting — click to dismiss"
+                            } else {
+                                "Sessions waiting for you"
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::selectable(feed_open, label)
+                                        .corner_radius(egui::CornerRadius::same(6)),
+                                )
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                // With nothing waiting, the bell is a dismiss: un-latch the bar.
+                                // Otherwise it toggles the overlay.
+                                actions.push(if empty {
+                                    Action::DismissFeed
+                                } else {
+                                    Action::ShowFeed(!feed_open)
+                                });
+                            }
                         }
                     });
-                }
-                if ui.button("+").on_hover_text("New tab").clicked() {
-                    actions.push(Action::NewTab);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let focus_detachable = detachable_panes.contains(&ws.active_tab().focus);
-                    ui.menu_button("☰", |ui| full_menu(ui, actions, None, focus_detachable));
-                    // Attention-feed bell — present once the feed has latched the bar on. Shows
-                    // the waiting count; toggles the overlay.
-                    if chrome_latched {
-                        let empty = pending.is_empty();
-                        let label = if empty {
-                            "\u{1F514}".to_string() // 🔔
-                        } else {
-                            format!("\u{1F514} {}", pending.len())
-                        };
-                        let hover = if empty {
-                            "Nothing waiting — click to dismiss"
-                        } else {
-                            "Sessions waiting for you"
-                        };
-                        if ui
-                            .selectable_label(feed_open, label)
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            // With nothing waiting, the bell is a dismiss: un-latch the bar.
-                            // Otherwise it toggles the overlay.
-                            actions.push(if empty {
-                                Action::DismissFeed
-                            } else {
-                                Action::ShowFeed(!feed_open)
-                            });
-                        }
-                    }
                 });
             });
-        });
     }
 
     if *show_font_settings {
@@ -1001,7 +1388,7 @@ fn build_ui(
         let r = egui::Area::new(egui::Id::new("attention-feed"))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, top))
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                popup_frame().show(ui, |ui| {
                     // egui labels are drag-selectable by default; that just produces stray text
                     // highlights in a read-only overlay, so turn it off here.
                     ui.style_mut().interaction.selectable_labels = false;
@@ -1011,52 +1398,45 @@ fn build_ui(
                             egui::RichText::new(format!("{} waiting", pending.len())).strong(),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(egui::Button::new("×").frame(false))
-                                .on_hover_text("Hide (reopen from the bell)")
-                                .clicked()
-                            {
+                            if icon_button(ui, "×", "Hide (reopen from the bell)").clicked() {
                                 actions.push(Action::ShowFeed(false));
                             }
                         });
                     });
                     for item in pending {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(egui::RichText::new("×").weak()).frame(false),
-                                )
-                                .on_hover_text("Dismiss")
-                                .clicked()
-                            {
-                                actions.push(Action::DismissNote(
-                                    item.key.0.clone(),
-                                    item.key.1.clone(),
-                                ));
-                            }
-                            let tool = match item.tool {
-                                feed::Tool::Claude => "claude",
-                                feed::Tool::Codex => "codex",
-                                feed::Tool::Other => "tool",
-                            };
-                            let head = format!("{tool} · {} · {}", item.label, item.age);
-                            let jump = item.pane.is_some();
-                            let resp = ui.add(egui::Label::new(head).sense(egui::Sense::click()));
-                            let resp = if jump {
-                                resp.on_hover_text("Jump to this pane")
-                            } else {
-                                resp
-                            };
-                            if jump && resp.clicked() {
-                                if let Some(p) = item.pane {
-                                    actions.push(Action::JumpToPane(p));
+                        ui.add_space(3.0);
+                        inset_frame().show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if icon_button(ui, "×", "Dismiss").clicked() {
+                                    actions.push(Action::DismissNote(
+                                        item.key.0.clone(),
+                                        item.key.1.clone(),
+                                    ));
                                 }
+                                let tool = match item.tool {
+                                    feed::Tool::Claude => "claude",
+                                    feed::Tool::Codex => "codex",
+                                    feed::Tool::Other => "tool",
+                                };
+                                let head = format!("{tool} · {} · {}", item.label, item.age);
+                                let jump = item.pane.is_some();
+                                let resp =
+                                    ui.add(egui::Label::new(head).sense(egui::Sense::click()));
+                                let resp = if jump {
+                                    resp.on_hover_text("Jump to this pane")
+                                } else {
+                                    resp
+                                };
+                                if jump && resp.clicked() {
+                                    if let Some(p) = item.pane {
+                                        actions.push(Action::JumpToPane(p));
+                                    }
+                                }
+                            });
+                            if !item.message.is_empty() {
+                                ui.label(egui::RichText::new(elide(&item.message, 64)).weak());
                             }
                         });
-                        if !item.message.is_empty() {
-                            ui.label(egui::RichText::new(elide(&item.message, 64)).weak());
-                        }
                     }
                 });
             });
@@ -1073,31 +1453,38 @@ fn build_ui(
             status,
         }) => {
             egui::Window::new("SSH host key")
+                .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .frame(dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_max_width(440.0);
+                    dialog_header(ui, "SSH host key", None);
                     let what = match status {
                         remote::HostKeyStatus::Unknown => "is not in your known_hosts yet",
                         remote::HostKeyStatus::Changed => "HAS CHANGED since you last connected",
                     };
-                    ui.label(format!("The host key for {host} {what}:"));
+                    dialog_caption(ui, format!("The host key for {host} {what}:").as_str());
                     ui.add_space(4.0);
-                    ui.monospace(fingerprint);
+                    inset_frame().show(ui, |ui| {
+                        ui.monospace(fingerprint);
+                    });
                     if *status == remote::HostKeyStatus::Changed {
                         ui.add_space(4.0);
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
-                            "If you didn't change it, this could be a man-in-the-middle attack.",
-                        );
+                        warning_frame().show(ui, |ui| {
+                            ui.colored_label(
+                                chrome_error(),
+                                "If you didn't change it, this could be a man-in-the-middle attack.",
+                            );
+                        });
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Connect").clicked() {
+                        if primary_button(ui, "Connect").clicked() {
                             actions.push(Action::AuthAnswer(true));
                         }
-                        if ui.button("Cancel").clicked() {
+                        if secondary_button(ui, "Cancel").clicked() {
                             actions.push(Action::AuthAnswer(false));
                         }
                     });
@@ -1106,16 +1493,19 @@ fn build_ui(
         Some(AuthView::Text { title, fields }) => {
             auth_inputs.resize(fields.len(), String::new());
             egui::Window::new(title.as_str())
+                .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .frame(dialog_frame())
                 .show(ctx, |ui| {
                     ui.set_max_width(440.0);
+                    dialog_header(ui, title.as_str(), None);
                     // Capture Enter before the fields — a singleline TextEdit consumes it.
                     let mut submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     for (i, (label, echo)) in fields.iter().enumerate() {
-                        ui.label(label.as_str());
-                        let edit = egui::TextEdit::singleline(&mut auth_inputs[i]).password(!echo);
+                        section_label(ui, label.as_str());
+                        let edit = chrome_text_edit(&mut auth_inputs[i], "").password(!echo);
                         let resp = ui.add(edit);
                         // Auto-focus the first field on open (only while nothing else is focused, so
                         // it doesn't fight the user tabbing between fields).
@@ -1125,8 +1515,8 @@ fn build_ui(
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        submit |= ui.button("OK").clicked();
-                        if ui.button("Cancel").clicked() {
+                        submit |= primary_button(ui, "OK").clicked();
+                        if secondary_button(ui, "Cancel").clicked() {
                             actions.push(Action::AuthText(false));
                         }
                     });
@@ -1141,22 +1531,26 @@ fn build_ui(
     // "Connect to host…" dialog.
     if show_connect {
         egui::Window::new("Connect to host")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(dialog_frame())
             .show(ctx, |ui| {
-                ui.set_max_width(360.0);
-                ui.label("Host  ([user@]host[:port])");
+                ui.set_min_width(380.0);
+                ui.set_max_width(420.0);
+                dialog_header(ui, "Connect to host", None);
+                section_label(ui, "Host");
                 // Capture keys before the field — a singleline TextEdit consumes them.
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                let resp = ui.add(egui::TextEdit::singleline(connect_host).hint_text("user@host"));
+                let resp = ui.add(chrome_text_edit(connect_host, "user@host"));
                 if ui.memory(|m| m.focused().is_none()) {
                     resp.request_focus();
                 }
                 ui.add_space(4.0);
-                ui.label("Name");
-                ui.add(egui::TextEdit::singleline(connect_name).hint_text("optional"));
+                section_label(ui, "Name");
+                ui.add(chrome_text_edit(connect_name, "optional"));
                 ui.add_space(4.0);
                 ui.checkbox(
                     connect_use_session,
@@ -1168,33 +1562,27 @@ fn build_ui(
                 );
                 if !connect_profiles.is_empty() {
                     ui.separator();
+                    section_label(ui, "Recent");
                     egui::ScrollArea::vertical()
-                        .max_height(180.0)
+                        .max_height(190.0)
                         .show(ui, |ui| {
                             for profile in connect_profiles {
-                                ui.horizontal(|ui| {
-                                    let resp =
-                                        ui.selectable_label(false, elide(&profile.label, 28));
-                                    if resp.on_hover_text(profile.detail.as_str()).clicked() {
-                                        actions.push(Action::UseProfile(profile.index));
-                                    }
-                                    ui.label(if profile.use_potty_session {
-                                        "persist"
-                                    } else {
-                                        "plain"
-                                    });
-                                });
-                                ui.label(egui::RichText::new(elide(&profile.detail, 44)).weak());
+                                let resp = profile_row(ui, profile);
+                                if resp.on_hover_text(profile.detail.as_str()).clicked() {
+                                    actions.push(Action::UseProfile(profile.index));
+                                }
+                                ui.add_space(4.0);
                             }
                         });
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if (ui.button("Connect").clicked() || enter) && !connect_host.trim().is_empty()
+                    if (primary_button(ui, "Connect").clicked() || enter)
+                        && !connect_host.trim().is_empty()
                     {
                         actions.push(Action::Connect(connect_host.clone(), connect_name.clone()));
                     }
-                    if ui.button("Cancel").clicked() || escape {
+                    if secondary_button(ui, "Cancel").clicked() || escape {
                         actions.push(Action::CloseConnect);
                     }
                 });
@@ -1209,24 +1597,26 @@ fn build_ui(
         let r = egui::Area::new(egui::Id::new("connection-progress"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-8.0, -8.0))
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                popup_frame().show(ui, |ui| {
                     ui.style_mut().interaction.selectable_labels = false;
                     ui.set_max_width(340.0);
                     ui.label(egui::RichText::new("Connecting").strong());
                     for item in connect_progress {
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.vertical(|ui| {
-                                ui.label(elide(&item.label, 36));
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} - {}s",
-                                        item.detail,
-                                        item.elapsed.as_secs()
-                                    ))
-                                    .weak(),
-                                );
+                        inset_frame().show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.vertical(|ui| {
+                                    ui.label(elide(&item.label, 36));
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} - {}s",
+                                            item.detail,
+                                            item.elapsed.as_secs()
+                                        ))
+                                        .weak(),
+                                    );
+                                });
                             });
                         });
                     }
@@ -1238,14 +1628,19 @@ fn build_ui(
     // Connection error, shown instead of printing to stderr.
     if let Some(msg) = error {
         egui::Window::new("Connection failed")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(dialog_frame())
             .show(ctx, |ui| {
                 ui.set_max_width(440.0);
-                ui.label(msg);
+                dialog_header(ui, "Connection failed", None);
+                warning_frame().show(ui, |ui| {
+                    ui.colored_label(chrome_error(), msg);
+                });
                 ui.separator();
-                if ui.button("OK").clicked() {
+                if primary_button(ui, "OK").clicked() {
                     actions.push(Action::DismissError);
                 }
             });
@@ -3348,15 +3743,8 @@ impl App {
             })
             .collect();
 
-        // Apply the configurable chrome font size to egui's text styles.
-        let ui_size = self.config.ui_font_size;
-        self.egui_ctx.style_mut(|style| {
-            for st in [egui::TextStyle::Body, egui::TextStyle::Button] {
-                if let Some(f) = style.text_styles.get_mut(&st) {
-                    f.size = ui_size;
-                }
-            }
-        });
+        // Apply the configurable chrome font size plus potty's shared menu/dialog style.
+        apply_chrome_style(&self.egui_ctx, self.config.ui_font_size);
 
         let raw = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let mut actions = Vec::new();
