@@ -3,7 +3,7 @@
 //! - Linux: `smithay-clipboard`, driven from our own `wl_display`/seat (core `wl_data_device`),
 //!   so it works on KWin and any Wayland compositor without XWayland or data-control protocols.
 //!   It also gives us the primary selection (middle-click paste).
-//! - Windows: the Win32 clipboard via `arboard`. There is no primary selection on Windows, so
+//! - macOS/Windows: the system clipboard via `arboard`. There is no primary selection there, so
 //!   those calls are no-ops.
 //!
 //! Methods take `&self` (the Windows backend uses interior mutability) so call sites don't care
@@ -16,10 +16,10 @@ pub struct Clipboard(Backend);
 enum Backend {
     #[cfg(target_os = "linux")]
     Wayland(smithay_clipboard::Clipboard),
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     Arboard(std::cell::RefCell<arboard::Clipboard>),
     // Keeps the type inhabited (and matches exhaustive) on platforms with no backend.
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     Disabled,
 }
 
@@ -38,13 +38,13 @@ impl Clipboard {
             }
             None
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             arboard::Clipboard::new()
                 .ok()
                 .map(|c| Self(Backend::Arboard(std::cell::RefCell::new(c))))
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
         {
             None
         }
@@ -55,11 +55,11 @@ impl Clipboard {
         match &self.0 {
             #[cfg(target_os = "linux")]
             Backend::Wayland(c) => c.store(text),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Backend::Arboard(c) => {
                 let _ = c.borrow_mut().set_text(text);
             }
-            #[cfg(not(any(target_os = "linux", windows)))]
+            #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
             Backend::Disabled => {}
         }
     }
@@ -69,9 +69,9 @@ impl Clipboard {
         match &self.0 {
             #[cfg(target_os = "linux")]
             Backend::Wayland(c) => c.load().ok(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Backend::Arboard(c) => c.borrow_mut().get_text().ok(),
-            #[cfg(not(any(target_os = "linux", windows)))]
+            #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
             Backend::Disabled => None,
         }
     }
@@ -81,11 +81,11 @@ impl Clipboard {
         match &self.0 {
             #[cfg(target_os = "linux")]
             Backend::Wayland(c) => c.store_primary(text),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Backend::Arboard(_) => {
                 let _ = text;
             }
-            #[cfg(not(any(target_os = "linux", windows)))]
+            #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
             Backend::Disabled => {}
         }
     }
@@ -95,9 +95,9 @@ impl Clipboard {
         match &self.0 {
             #[cfg(target_os = "linux")]
             Backend::Wayland(c) => c.load_primary().ok(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Backend::Arboard(_) => None,
-            #[cfg(not(any(target_os = "linux", windows)))]
+            #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
             Backend::Disabled => None,
         }
     }

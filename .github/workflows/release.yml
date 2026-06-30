@@ -2,6 +2,7 @@ name: Release
 
 on:
   push:
+    branches: ["macos-packaging"]
     tags: ["v*"]
   workflow_dispatch: {}
 
@@ -11,6 +12,7 @@ permissions:
 jobs:
   # Windows installers: one NSIS .exe per arch, attached to the GitHub Release.
   windows:
+    if: github.ref_name != 'macos-packaging'
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +67,7 @@ jobs:
   # Users `dnf copr enable decaychain/potty && dnf install potty` and get updates
   # via `dnf upgrade`. No RPMs are attached to the GitHub Release.
   copr:
+    if: github.ref_name != 'macos-packaging'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -135,3 +138,61 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           SRPM=$(ls "$HOME/rpmbuild/SRPMS"/*.src.rpm | head -1)
           copr-cli build --nowait decaychain/potty "$SRPM"
+
+  # macOS experimental packaging. On the macos-packaging branch this is the only job that runs,
+  # so we can iterate without kicking Windows installers or COPR. On tags it attaches the artifacts
+  # to the GitHub Release alongside the existing platform artifacts.
+  macos:
+    if: github.ref_name == 'macos-packaging' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version
+        shell: bash
+        run: |
+          CARGO_VERSION="$(awk -F\" '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            PKG_VERSION="$VERSION"
+            sed -i '' "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          else
+            SHORT_SHA="${GITHUB_SHA::7}"
+            VERSION="$CARGO_VERSION-$SHORT_SHA"
+            PKG_VERSION="$CARGO_VERSION"
+          fi
+          ARCH="$(uname -m)"
+          {
+            echo "VERSION=$VERSION"
+            echo "PKG_VERSION=$PKG_VERSION"
+            echo "ARCH=$ARCH"
+          } >> "$GITHUB_ENV"
+          echo "Version=$VERSION  PackageVersion=$PKG_VERSION  Arch=$ARCH"
+          grep '^version' Cargo.toml | head -1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bin potty --bin potty-notify
+
+      - name: Smoke-test helper binary
+        run: target/release/potty-notify --help
+
+      - name: Build app bundle, tarball, and pkg
+        run: packaging/macos/build.sh
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: potty-macos-${{ env.ARCH }}
+          path: |
+            dist/macos/*.tar.gz
+            dist/macos/*.pkg
+
+      - name: Upload macOS artifacts to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/macos/*.tar.gz
+            dist/macos/*.pkg
