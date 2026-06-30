@@ -656,6 +656,16 @@ fn terminal_should_receive_ime_commit(
     has_terms && !text_input_active && !egui_consumed
 }
 
+/// Some Wayland compositors send ordinary key text as a bare `Ime::Commit` once text input is
+/// enabled, without a preceding `Ime::Preedit`. `egui-winit` deliberately does not enable its
+/// Linux composition state for `Ime::Enabled` alone, so its stored IME cursor stops advancing and
+/// a `TextEdit` discards every commit after the first. Feed bare Linux commits to egui as ordinary
+/// text; commits belonging to a real composition keep the normal IME path so the preedit text is
+/// replaced rather than duplicated.
+fn ime_commit_needs_text_fallback(text_input_active: bool, had_preedit: bool) -> bool {
+    cfg!(target_os = "linux") && text_input_active && !had_preedit
+}
+
 fn unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1570,6 +1580,9 @@ struct App {
     auth_prompts: Vec<AuthPrompt>,
     /// Text-field buffers for the active `AuthPrompt::Text` dialog (one per prompt field).
     auth_inputs: Vec<String>,
+    /// Whether the current IME composition emitted a preedit event. Wayland can also emit bare
+    /// commits for ordinary text; those need a different egui input path (see `window_event`).
+    ime_had_preedit: bool,
     /// Whether the "Connect to host…" dialog is open, and its host-field buffer.
     show_connect: bool,
     connect_host: String,
@@ -1634,6 +1647,7 @@ impl App {
             next_conn_id: 0,
             auth_prompts: Vec::new(),
             auth_inputs: Vec::new(),
+            ime_had_preedit: false,
             show_connect: false,
             connect_host: String::new(),
             connect_name: String::new(),
@@ -3871,17 +3885,43 @@ impl ApplicationHandler<UserEvent> for App {
             _ => false,
         };
 
+        let bare_text_commit = matches!(&event, WindowEvent::Ime(Ime::Commit(_)))
+            && ime_commit_needs_text_fallback(self.text_input_active(), self.ime_had_preedit);
         let mut egui_consumed = false;
-        if let Some(window) = self.state.as_ref().map(|s| s.window.clone()) {
-            if let Some(es) = self.egui_state.as_mut() {
-                if !withhold_from_egui {
-                    let resp = es.on_window_event(&window, &event);
-                    egui_consumed = resp.consumed;
-                    if resp.repaint {
-                        window.request_redraw();
-                    }
+        if let Some(window) = self.state.as_ref().map(|s| s.window.clone())
+            && let Some(es) = self.egui_state.as_mut()
+        {
+            if bare_text_commit {
+                // KDE/Wayland can switch from `KeyboardInput.text` to bare IME commits after
+                // the first character. A bare commit is plain text, not a composition event.
+                if let WindowEvent::Ime(Ime::Commit(text)) = &event {
+                    es.egui_input_mut()
+                        .events
+                        .push(egui::Event::Text(text.clone()));
+                }
+                egui_consumed = true;
+                window.request_redraw();
+            } else if !withhold_from_egui {
+                let resp = es.on_window_event(&window, &event);
+                egui_consumed = resp.consumed;
+                if resp.repaint {
+                    window.request_redraw();
                 }
             }
+        }
+
+        // Keep a preedit latched through `Preedit(_, None)`: several IMEs end the visible
+        // preedit immediately before sending its Commit. Commit/Disabled finish the composition.
+        match &event {
+            WindowEvent::Ime(Ime::Preedit(text, Some(_))) => {
+                // An empty positioned preedit means a cancelled/cleared composition. A commit
+                // that finalizes a composition arrives after `Preedit(_, None)` instead.
+                self.ime_had_preedit = !text.is_empty();
+            }
+            WindowEvent::Ime(Ime::Commit(_)) | WindowEvent::Ime(Ime::Disabled) => {
+                self.ime_had_preedit = false;
+            }
+            _ => {}
         }
 
         match event {
@@ -4080,7 +4120,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{csi_tilde, cursor_key, terminal_should_receive_ime_commit, xterm_modifier};
+    use super::{
+        csi_tilde, cursor_key, ime_commit_needs_text_fallback, terminal_should_receive_ime_commit,
+        xterm_modifier,
+    };
 
     #[test]
     fn modifier_parameter() {
@@ -4120,5 +4163,15 @@ mod tests {
         assert!(!terminal_should_receive_ime_commit(true, true, false));
         assert!(!terminal_should_receive_ime_commit(true, false, true));
         assert!(!terminal_should_receive_ime_commit(false, false, false));
+    }
+
+    #[test]
+    fn bare_ime_commit_is_plain_text_only_for_an_active_editor() {
+        assert_eq!(
+            ime_commit_needs_text_fallback(true, false),
+            cfg!(target_os = "linux")
+        );
+        assert!(!ime_commit_needs_text_fallback(true, true));
+        assert!(!ime_commit_needs_text_fallback(false, false));
     }
 }
