@@ -55,8 +55,10 @@ We let the tool tell us, using its own first-class notification hooks:
   (permission prompt, idle waiting for input). It passes the helper a JSON object on **stdin**
   with `session_id`, `cwd`, `message`, `transcript_path`, `hook_event_name`. A
   `UserPromptSubmit` hook (fires when you submit a prompt) is the natural **clear** signal.
-- **Codex** — the `notify` program in `~/.codex/config.toml` is spawned with a single JSON
-  **argv** argument on events like `agent-turn-complete`. Same idea, different plumbing.
+- **Codex** — the `notify` program in `~/.codex/config.toml` is still useful for
+  turn-complete events, but approval prompts come through Codex lifecycle hooks:
+  `PermissionRequest` raises attention and `UserPromptSubmit` clears it. `notify` passes JSON as
+  an **argv** argument; hooks pass JSON on **stdin**.
 
 No regexes, no guessing — the tool already knows it's blocked and is willing to say so.
 
@@ -65,7 +67,8 @@ No regexes, no guessing — the tool already knows it's blocked and is willing t
 A tiny Rust binary, a second `[[bin]]` in this crate (shares `serde`, cross-compiles to remote
 hosts with one toolchain). Its job:
 
-1. Read the event — stdin JSON (Claude) or `argv[1]` JSON (Codex); a `--tool` flag disambiguates.
+1. Read the event — stdin JSON for hooks, or `argv[1]` JSON for Codex `notify`; a `--tool` flag
+   disambiguates.
 2. Augment it with identity it can read from **its own environment**:
    - `hostname`
    - `cwd`, `pid`
@@ -227,6 +230,7 @@ SSH pane" is the bulk of the win.
 
 The hooks can be wired automatically — `potty-notify --install-hook claude` and
 `potty-notify --install-hook codex` (idempotent; merges into existing config, never clobbers).
+Codex command hooks may need a one-time trust review with `/hooks` before they run.
 For reference, what they write:
 
 **Claude Code** (`~/.claude/settings.json`):
@@ -244,6 +248,21 @@ For reference, what they write:
 
 ```toml
 notify = ["potty-notify", "--tool", "codex"]
+
+[[hooks.PermissionRequest]]
+matcher = "*"
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "potty-notify --tool codex"
+timeout = 10
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "potty-notify --tool codex --clear"
+timeout = 10
 ```
 
 For built-in `potty-session` SSH: drop the `potty-notify` binary on the remote's `$PATH` and
@@ -273,7 +292,5 @@ For plain/manual `ssh`, `potty-notify --print-ssh-config <host>` still emits the
 - **Socket path on the local side** — fixed `notify.sock` (simplest; pane comes from
   `$POTTY_PANE`) vs per-pane sockets. Leaning fixed: one listener, pane identity in the payload.
 - **Overlay vs reusing the existing menu chrome** for the feed UI — TBD against the egui layer.
-- **Exact Codex event coverage** — confirm which Codex `notify` events mean "blocked on user"
-  vs merely "turn done"; we only want the former to `raise`.
 </content>
 </invoke>

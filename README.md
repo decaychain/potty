@@ -98,6 +98,8 @@ potty-notify --install-hook claude   # ~/.claude/settings.json
 potty-notify --install-hook codex    # ~/.codex/config.toml
 ```
 
+Codex command hooks may need a one-time trust review with `/hooks` before they run.
+
 <details><summary>…or wire them by hand</summary>
 
 **Claude Code** — `~/.claude/settings.json`:
@@ -111,7 +113,26 @@ potty-notify --install-hook codex    # ~/.codex/config.toml
 }
 ```
 
-**Codex** — `~/.codex/config.toml`: `notify = ["potty-notify", "--tool", "codex"]`
+**Codex** — `~/.codex/config.toml`:
+
+```toml
+notify = ["potty-notify", "--tool", "codex"]
+
+[[hooks.PermissionRequest]]
+matcher = "*"
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "potty-notify --tool codex"
+timeout = 10
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "potty-notify --tool codex --clear"
+timeout = 10
+```
 </details>
 
 **Over SSH** with potty's built-in `potty-session`: no extra socket forwarding is needed.
