@@ -6,10 +6,11 @@
 //!   - one instanced quad pipeline for foreground glyphs (atlas-sampled, per-cell color).
 //!
 //! Everything is in physical pixels. Cell metrics are MEASURED from the monospace font
-//! (retires the old hardcoded CELL_W). Bold is rendered with a real bold face (and the 8
-//! ANSI colors brighten under bold, per xterm tradition). Not yet handled, by design:
-//! italic, color emoji (Mask glyphs only), ligatures (correct for a grid), and damage
-//! tracking (we rebuild instances each frame — fine at these sizes, the next perf step).
+//! (retires the old hardcoded CELL_W). Bold and italic are rendered with real bold/italic
+//! faces where the family has them (and the 8 ANSI colors brighten under bold, per xterm
+//! tradition). Not yet handled, by design: color emoji (Mask glyphs only), ligatures
+//! (correct for a grid), and damage tracking (we rebuild instances each frame — fine at
+//! these sizes, the next perf step).
 
 use std::collections::HashMap;
 
@@ -18,7 +19,7 @@ use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight,
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
 };
 use wgpu::util::DeviceExt;
 
@@ -187,7 +188,8 @@ pub struct GridRenderer {
     families: Vec<String>,
 
     atlas: Atlas,
-    glyphs: HashMap<(char, bool), Option<Glyph>>,
+    /// Rasterized-glyph cache, keyed by (char, bold, italic).
+    glyphs: HashMap<(char, bool, bool), Option<Glyph>>,
 
     screen_buf: wgpu::Buffer,
     common_bg: wgpu::BindGroup,
@@ -488,25 +490,32 @@ impl GridRenderer {
         self.atlas.row_h = 0;
     }
 
-    fn glyph(&mut self, queue: &wgpu::Queue, c: char, bold: bool) -> Option<Glyph> {
-        if let Some(g) = self.glyphs.get(&(c, bold)) {
+    fn glyph(&mut self, queue: &wgpu::Queue, c: char, bold: bool, italic: bool) -> Option<Glyph> {
+        if let Some(g) = self.glyphs.get(&(c, bold, italic)) {
             return *g;
         }
-        let g = self.rasterize(queue, c, bold);
-        self.glyphs.insert((c, bold), g);
+        let g = self.rasterize(queue, c, bold, italic);
+        self.glyphs.insert((c, bold, italic), g);
         g
     }
 
-    fn rasterize(&mut self, queue: &wgpu::Queue, c: char, bold: bool) -> Option<Glyph> {
+    fn rasterize(
+        &mut self,
+        queue: &wgpu::Queue,
+        c: char,
+        bold: bool,
+        italic: bool,
+    ) -> Option<Glyph> {
         let mut buf = Buffer::new(
             &mut self.font_system,
             Metrics::new(self.font_px, self.metrics.h),
         );
         let weight = if bold { Weight::BOLD } else { Weight::NORMAL };
+        let style = if italic { Style::Italic } else { Style::Normal };
         buf.set_text(
             &mut self.font_system,
             &c.to_string(),
-            &mono_attrs(&self.family, weight),
+            &mono_attrs(&self.family, weight, style),
             Shaping::Advanced,
             None,
         );
@@ -615,6 +624,8 @@ impl GridRenderer {
 
             let flags = cell.flags;
             let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
+            // BOLD_ITALIC is the union of both bits, so this also catches it.
+            let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
             let mut fg_col = resolve(cell.fg, colors, &palette, bold);
             let mut bg_col = resolve(cell.bg, colors, &palette, false);
             if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
@@ -694,7 +705,7 @@ impl GridRenderer {
             if c != ' '
                 && c != '\0'
                 && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN)
-                && let Some(g) = self.glyph(queue, c, bold)
+                && let Some(g) = self.glyph(queue, c, bold, italic)
             {
                 fg.push(FgInstance {
                     pos: [x + g.offset[0], y + asc - g.offset[1]],
@@ -799,13 +810,15 @@ fn resolve(
     }
 }
 
-/// Build cosmic-text attrs for the active family + weight (None → generic monospace).
-fn mono_attrs(family: &Option<String>, weight: Weight) -> Attrs<'_> {
+/// Build cosmic-text attrs for the active family + weight + style (None → generic monospace).
+/// If the family has no italic face, font matching falls back to the regular one (no synthetic
+/// slant) — text stays readable, just unslanted.
+fn mono_attrs(family: &Option<String>, weight: Weight, style: Style) -> Attrs<'_> {
     let fam = match family {
         Some(name) => Family::Name(name.as_str()),
         None => Family::Monospace,
     };
-    Attrs::new().family(fam).weight(weight)
+    Attrs::new().family(fam).weight(weight).style(style)
 }
 
 /// Standard xterm 256-color palette (used for indices 16–255; 0–15 come from the palette).
@@ -839,7 +852,7 @@ fn measure(
     buf.set_text(
         fs,
         "M",
-        &mono_attrs(family, Weight::NORMAL),
+        &mono_attrs(family, Weight::NORMAL, Style::Normal),
         Shaping::Advanced,
         None,
     );
