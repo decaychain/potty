@@ -119,12 +119,11 @@ mod imp {
     /// atomically, so the whole write happens under the lock.
     fn send_frame(session: &Session, frame: Frame) {
         let mut guard = session.client.lock().unwrap();
-        if let Some(client) = guard.as_mut() {
-            if frame.write(&mut client.writer).is_err() {
-                if let Some(stream) = client.shutdown.as_ref() {
-                    let _ = stream.shutdown(Shutdown::Both);
-                }
-            }
+        if let Some(client) = guard.as_mut()
+            && frame.write(&mut client.writer).is_err()
+            && let Some(stream) = client.shutdown.as_ref()
+        {
+            let _ = stream.shutdown(Shutdown::Both);
         }
     }
 
@@ -235,10 +234,10 @@ mod imp {
                 {
                     continue;
                 }
-                if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim()) {
-                    if note.v == feed::SCHEMA_VERSION {
-                        handle_note(&session, note);
-                    }
+                if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim())
+                    && note.v == feed::SCHEMA_VERSION
+                {
+                    handle_note(&session, note);
                 }
             }
         });

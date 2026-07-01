@@ -1,6 +1,7 @@
 //! Persistence tests (step 4):
 //!   - a shell's process survives the client disconnecting (the daemon keeps it alive), and
 //!   - reattaching restores the pane and replays its current screen.
+//!
 //! Unix-only; the first skips if `pgrep` is unavailable.
 #![cfg(unix)]
 
@@ -11,6 +12,11 @@ use std::time::{Duration, Instant};
 
 use potty::notify::{Kind, Note, SCHEMA_VERSION, Tool};
 use potty::proto::{Control, Frame, Layout, LayoutNode, LayoutTab};
+
+/// What a client's reader thread accumulates: pane output keyed by daemon pane id, plus every
+/// control frame in arrival order.
+type Collected =
+    std::sync::Arc<std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>>;
 
 fn have(bin: &str) -> bool {
     Command::new(bin)
@@ -96,8 +102,7 @@ fn start_daemon(sock: &Path) -> Child {
 /// A direct client connection to the daemon, with a background thread demuxing its output.
 struct Client {
     stream: UnixStream,
-    collected:
-        std::sync::Arc<std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>>,
+    collected: Collected,
 }
 
 impl Client {
@@ -114,9 +119,7 @@ impl Client {
             }
         };
         let mut read = stream.try_clone().unwrap();
-        let collected: std::sync::Arc<
-            std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>,
-        > = std::sync::Arc::new(std::sync::Mutex::new((
+        let collected: Collected = std::sync::Arc::new(std::sync::Mutex::new((
             std::collections::HashMap::new(),
             Vec::new(),
         )));
@@ -161,8 +164,7 @@ impl Client {
 struct RelayClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    collected:
-        std::sync::Arc<std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>>,
+    collected: Collected,
 }
 
 impl RelayClient {
@@ -176,9 +178,7 @@ impl RelayClient {
             .expect("spawn attach relay");
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
-        let collected: std::sync::Arc<
-            std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>,
-        > = std::sync::Arc::new(std::sync::Mutex::new((
+        let collected: Collected = std::sync::Arc::new(std::sync::Mutex::new((
             std::collections::HashMap::new(),
             Vec::new(),
         )));

@@ -230,10 +230,10 @@ impl GridRenderer {
         let families = {
             let mut set = std::collections::BTreeSet::new();
             for f in font_system.db_mut().faces() {
-                if f.monospaced {
-                    if let Some((name, _)) = f.families.first() {
-                        set.insert(name.clone());
-                    }
+                if f.monospaced
+                    && let Some((name, _)) = f.families.first()
+                {
+                    set.insert(name.clone());
                 }
             }
             set.into_iter().collect::<Vec<_>>()
@@ -560,6 +560,9 @@ impl GridRenderer {
 
     /// Rebuild a pane's instance data, positioned within the pane at `origin` (px). Only called
     /// for panes flagged dirty; clean panes keep their cached buffers from a previous call.
+    // too_many_arguments: one over the limit, and each parameter is genuinely per-call render
+    // state; a params struct would be built fresh at the sole call site anyway.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare<L: EventListener>(
         &mut self,
         device: &wgpu::Device,
@@ -691,16 +694,15 @@ impl GridRenderer {
             if c != ' '
                 && c != '\0'
                 && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN)
+                && let Some(g) = self.glyph(queue, c, bold)
             {
-                if let Some(g) = self.glyph(queue, c, bold) {
-                    fg.push(FgInstance {
-                        pos: [x + g.offset[0], y + asc - g.offset[1]],
-                        size: g.size,
-                        uv0: g.uv0,
-                        uv1: g.uv1,
-                        color: rgba(fg_col, 1.0),
-                    });
-                }
+                fg.push(FgInstance {
+                    pos: [x + g.offset[0], y + asc - g.offset[1]],
+                    size: g.size,
+                    uv0: g.uv0,
+                    uv1: g.uv1,
+                    color: rgba(fg_col, 1.0),
+                });
             }
         }
 

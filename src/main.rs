@@ -154,18 +154,19 @@ impl EventListener for EventProxy {
 
 /// Build alacritty's terminal Config from ours (currently just the OSC 52 policy).
 fn term_config(cfg: &Config) -> TermConfig {
-    let mut tc = TermConfig::default();
-    tc.osc52 = match cfg.osc52.as_str() {
-        "disabled" => Osc52::Disabled,
-        "paste" => Osc52::OnlyPaste,
-        "copy-paste" => Osc52::CopyPaste,
-        _ => Osc52::OnlyCopy,
-    };
-    tc.default_cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
-        shape: cfg.cursor_shape(),
-        blinking: cfg.cursor_blink,
-    };
-    tc
+    TermConfig {
+        osc52: match cfg.osc52.as_str() {
+            "disabled" => Osc52::Disabled,
+            "paste" => Osc52::OnlyPaste,
+            "copy-paste" => Osc52::CopyPaste,
+            _ => Osc52::OnlyCopy,
+        },
+        default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle {
+            shape: cfg.cursor_shape(),
+            blinking: cfg.cursor_blink,
+        },
+        ..TermConfig::default()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -404,8 +405,9 @@ enum Backend {
         /// Input/resize/close frames go here (to the russh writer task).
         outbound: tokio::sync::mpsc::Sender<potty::proto::Frame>,
         /// Per-pane vte parse state — for a local pane this lives in its reader thread; a remote
-        /// pane is fed from the main loop, so it owns its parser here.
-        parser: Processor<StdSyncHandler>,
+        /// pane is fed from the main loop, so it owns its parser here. Boxed: the parser dwarfs
+        /// every other field, and `Backend` lives inside each `Terminal`.
+        parser: Box<Processor<StdSyncHandler>>,
     },
 }
 
@@ -1296,7 +1298,9 @@ fn font_settings_window(
     }
 }
 
-#[allow(deprecated)]
+// too_many_arguments: this is the once-per-frame chrome entry point; its parameters *are* the
+// view model. Bundling them into a struct would just move the list, not shrink it.
+#[allow(deprecated, clippy::too_many_arguments)]
 fn build_ui(
     ctx: &egui::Context,
     ws: &Workspace,
@@ -1475,14 +1479,14 @@ fn build_ui(
                     ui.painter()
                         .rect_filled(d.rect, egui::CornerRadius::ZERO, border_color);
                 }
-                if resp.dragged() {
-                    if let Some(p) = resp.interact_pointer_pos() {
-                        let ratio = match d.split {
-                            Split::Cols => (p.x - d.area.min.x) / (d.area.width() - GAP),
-                            Split::Rows => (p.y - d.area.min.y) / (d.area.height() - GAP),
-                        };
-                        actions.push(Action::SetRatio(d.id, ratio));
-                    }
+                if resp.dragged()
+                    && let Some(p) = resp.interact_pointer_pos()
+                {
+                    let ratio = match d.split {
+                        Split::Cols => (p.x - d.area.min.x) / (d.area.width() - GAP),
+                        Split::Rows => (p.y - d.area.min.y) / (d.area.height() - GAP),
+                    };
+                    actions.push(Action::SetRatio(d.id, ratio));
                 }
             }
         });
@@ -2817,7 +2821,7 @@ impl App {
                     remote_id,
                     label,
                     outbound: outbound.clone(),
-                    parser: Processor::new(),
+                    parser: Box::new(Processor::new()),
                 },
                 dims,
                 title: "shell".into(),
@@ -2916,11 +2920,11 @@ impl App {
                     .and_then(|c| c.routes.get(&remote_id))
                     .copied();
                 if let Some(local) = local {
-                    if let Some(t) = self.terms.get_mut(&local) {
-                        if let Backend::Remote { parser, .. } = &mut t.backend {
-                            let mut term = t.term.lock().unwrap();
-                            parser.advance(&mut *term, &bytes);
-                        }
+                    if let Some(t) = self.terms.get_mut(&local)
+                        && let Backend::Remote { parser, .. } = &mut t.backend
+                    {
+                        let mut term = t.term.lock().unwrap();
+                        parser.advance(&mut *term, &bytes);
                     }
                     self.touch(local);
                 }
@@ -2936,10 +2940,10 @@ impl App {
             }
             // The daemon's replayed layout — stash it; applied at `Ready`.
             Frame::Control(Control::LayoutTree { json }) => {
-                if let Ok(layout) = serde_json::from_str::<proto::Layout>(&json) {
-                    if let Some(c) = self.connections.get_mut(&conn) {
-                        c.restore_layout = Some(layout);
-                    }
+                if let Ok(layout) = serde_json::from_str::<proto::Layout>(&json)
+                    && let Some(c) = self.connections.get_mut(&conn)
+                {
+                    c.restore_layout = Some(layout);
                 }
             }
             // Restore burst done: place the restored panes (by layout), or open a fresh pane.
@@ -2964,21 +2968,21 @@ impl App {
                 }
             }
             Frame::Control(Control::Notify { json }) => {
-                if let Ok(mut note) = serde_json::from_str::<feed::Note>(&json) {
-                    if note.v == feed::SCHEMA_VERSION {
-                        if note.host.is_empty()
-                            && let Some(host) =
-                                self.connections.get(&conn).map(|c| c.target.host.clone())
-                        {
-                            note.host = host;
-                        }
-                        note.pane = note.pane.and_then(|remote_id| {
-                            self.connections
-                                .get(&conn)
-                                .and_then(|c| c.routes.get(&remote_id).copied())
-                        });
-                        self.on_note(note);
+                if let Ok(mut note) = serde_json::from_str::<feed::Note>(&json)
+                    && note.v == feed::SCHEMA_VERSION
+                {
+                    if note.host.is_empty()
+                        && let Some(host) =
+                            self.connections.get(&conn).map(|c| c.target.host.clone())
+                    {
+                        note.host = host;
                     }
+                    note.pane = note.pane.and_then(|remote_id| {
+                        self.connections
+                            .get(&conn)
+                            .and_then(|c| c.routes.get(&remote_id).copied())
+                    });
+                    self.on_note(note);
                 }
             }
             // Welcome / Opened: nothing to do.
@@ -3100,13 +3104,13 @@ impl App {
                 continue; // not ready (mid-restore), or ephemeral (no daemon to store layout)
             }
             let json = serde_json::to_string(&self.layout_for(conn)).unwrap_or_default();
-            if let Some(c) = self.connections.get_mut(&conn) {
-                if c.pushed_layout.as_deref() != Some(json.as_str()) {
-                    c.pushed_layout = Some(json.clone());
-                    let _ = c
-                        .outbound
-                        .try_send(Frame::Control(Control::LayoutTree { json }));
-                }
+            if let Some(c) = self.connections.get_mut(&conn)
+                && c.pushed_layout.as_deref() != Some(json.as_str())
+            {
+                c.pushed_layout = Some(json.clone());
+                let _ = c
+                    .outbound
+                    .try_send(Frame::Control(Control::LayoutTree { json }));
             }
         }
     }
@@ -3319,7 +3323,7 @@ impl App {
     }
 
     /// Write raw bytes to a pane: its local PTY, or the remote session as an input `Data` frame.
-    fn to_pty(&mut self, id: PaneId, bytes: &[u8]) {
+    fn write_pty(&mut self, id: PaneId, bytes: &[u8]) {
         if let Some(t) = self.terms.get_mut(&id) {
             match &mut t.backend {
                 Backend::Local { writer, .. } => {
@@ -3383,7 +3387,7 @@ impl App {
                     final_byte,
                 ];
                 for _ in 0..lines.unsigned_abs() {
-                    self.to_pty(id, &seq);
+                    self.write_pty(id, &seq);
                 }
             }
         } else {
@@ -3496,7 +3500,7 @@ impl App {
                 (row.min(223) + 32) as u8,
             ]
         };
-        self.to_pty(id, &bytes);
+        self.write_pty(id, &bytes);
     }
 
     /// Report motion for the held button (or 3 = no button) in pane `id`, deduped to cell changes.
@@ -3549,10 +3553,10 @@ impl App {
         let Some((point, side)) = self.point_at(id, px, py) else {
             return;
         };
-        if let Some(term) = self.arc(id) {
-            if let Some(sel) = term.lock().unwrap().selection.as_mut() {
-                sel.update(point, side);
-            }
+        if let Some(term) = self.arc(id)
+            && let Some(sel) = term.lock().unwrap().selection.as_mut()
+        {
+            sel.update(point, side);
         }
         self.touch(id);
     }
@@ -3571,10 +3575,10 @@ impl App {
                 selected = t.selection_to_string();
             }
         }
-        if let (Some(cb), Some(s)) = (&self.clipboard, selected) {
-            if !s.is_empty() {
-                cb.store_primary(s);
-            }
+        if let (Some(cb), Some(s)) = (&self.clipboard, selected)
+            && !s.is_empty()
+        {
+            cb.store_primary(s);
         }
         if let Some(id) = id {
             self.touch(id);
@@ -3625,7 +3629,7 @@ impl App {
         if bracketed {
             out.extend_from_slice(b"\x1b[201~");
         }
-        self.to_pty(id, &out);
+        self.write_pty(id, &out);
     }
 
     fn paste(&mut self) {
@@ -3748,7 +3752,7 @@ impl App {
             // Typing clears the focused selection and returns its viewport to the prompt.
             self.clear_selection();
             self.scroll(focus, Scroll::Bottom);
-            self.to_pty(focus, &out);
+            self.write_pty(focus, &out);
         }
     }
 
@@ -4059,25 +4063,25 @@ impl App {
         let focus = self.focus();
         let cursor_thickness = self.config.cursor_thickness;
         for (id, r) in &leaves {
-            if self.dirty.remove(id) {
-                if let Some(term) = self.arc(*id) {
-                    let origin = (r.min.x * ppp, r.min.y * ppp);
-                    // Only the focused pane's cursor blinks; suppress it during the off phase.
-                    let show_cursor = !(*id == focus && !self.blink_on);
-                    let guard = term.lock().unwrap();
-                    self.state.as_mut().unwrap().prepare_pane(
-                        *id as u64,
-                        &guard,
-                        origin,
-                        (sw, sh),
-                        show_cursor,
-                        cursor_thickness,
-                    );
-                }
+            if self.dirty.remove(id)
+                && let Some(term) = self.arc(*id)
+            {
+                let origin = (r.min.x * ppp, r.min.y * ppp);
+                // Only the focused pane's cursor blinks; suppress it during the off phase.
+                let show_cursor = *id != focus || self.blink_on;
+                let guard = term.lock().unwrap();
+                self.state.as_mut().unwrap().prepare_pane(
+                    *id,
+                    &guard,
+                    origin,
+                    (sw, sh),
+                    show_cursor,
+                    cursor_thickness,
+                );
             }
         }
 
-        let panes: Vec<(egui::Rect, u64)> = leaves.iter().map(|(id, r)| (*r, *id as u64)).collect();
+        let panes: Vec<(egui::Rect, u64)> = leaves.iter().map(|(id, r)| (*r, (*id))).collect();
         let renderer = self.egui_renderer.as_mut().unwrap();
         if let Some(state) = self.state.as_mut() {
             state.render(renderer, &textures_delta, &prims, ppp, &panes);
@@ -4148,10 +4152,9 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 })
+                && w.watch(&dir, notify::RecursiveMode::NonRecursive).is_ok()
             {
-                if w.watch(&dir, notify::RecursiveMode::NonRecursive).is_ok() {
-                    self._watcher = Some(w);
-                }
+                self._watcher = Some(w);
             }
         }
 
@@ -4271,11 +4274,11 @@ impl ApplicationHandler<UserEvent> for App {
                 let text = self.clipboard.as_ref().and_then(|cb| cb.load());
                 if let Some(t) = text {
                     let response = fmt(&t);
-                    self.to_pty(pane, response.as_bytes());
+                    self.write_pty(pane, response.as_bytes());
                 }
             }
             // Terminal query response (DSR, DA, cursor position, …).
-            UserEvent::PtyWrite(pane, text) => self.to_pty(pane, text.as_bytes()),
+            UserEvent::PtyWrite(pane, text) => self.write_pty(pane, text.as_bytes()),
             // The pane's program set / reset its title — redraw to refresh tab + window title.
             UserEvent::Title(pane, title) => {
                 if let Some(t) = self.terms.get_mut(&pane) {
@@ -4453,14 +4456,13 @@ impl ApplicationHandler<UserEvent> for App {
                     if pressed {
                         self.workspace.focus(id);
                     }
-                    if let Some(cb) = cb {
-                        if let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1)
-                        {
-                            self.mouse_held = if pressed { Some(cb) } else { None };
-                            self.mouse_pane = if pressed { Some(id) } else { None };
-                            self.last_report_cell = Some((col, row));
-                            self.report_mouse(id, cb, pressed, col, row, sgr);
-                        }
+                    if let Some(cb) = cb
+                        && let Some((col, row)) = self.cell_vp(id, self.mouse_px.0, self.mouse_px.1)
+                    {
+                        self.mouse_held = if pressed { Some(cb) } else { None };
+                        self.mouse_pane = if pressed { Some(id) } else { None };
+                        self.last_report_cell = Some((col, row));
+                        self.report_mouse(id, cb, pressed, col, row, sgr);
                     }
                     self.request_redraw();
                 } else {
@@ -4494,7 +4496,7 @@ impl ApplicationHandler<UserEvent> for App {
                 ) =>
             {
                 let focus = self.focus();
-                self.to_pty(focus, text.as_bytes());
+                self.write_pty(focus, text.as_bytes());
             }
             WindowEvent::MouseWheel { delta, .. }
                 if !self.menu_open && !self.show_font_settings =>
@@ -4577,10 +4579,10 @@ fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>) {
             {
                 continue;
             }
-            if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim()) {
-                if note.v == feed::SCHEMA_VERSION {
-                    let _ = proxy.send_event(UserEvent::Notify(note));
-                }
+            if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim())
+                && note.v == feed::SCHEMA_VERSION
+            {
+                let _ = proxy.send_event(UserEvent::Notify(note));
             }
         }
     });

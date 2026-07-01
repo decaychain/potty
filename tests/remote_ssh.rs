@@ -2,6 +2,7 @@
 //!   - publickey round trip → `potty-session` (the protocol survives real SSH),
 //!   - host-key rejection aborts the connect,
 //!   - ssh-agent authentication.
+//!
 //! Unix-only, and each test skips (not fails) when the tools it needs aren't installed.
 #![cfg(unix)]
 

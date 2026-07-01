@@ -31,9 +31,7 @@ impl Clipboard {
         {
             use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
             if let Ok(RawDisplayHandle::Wayland(h)) = window.display_handle().map(|h| h.as_raw()) {
-                let cb = unsafe {
-                    smithay_clipboard::Clipboard::new(h.display.as_ptr() as *mut std::ffi::c_void)
-                };
+                let cb = unsafe { smithay_clipboard::Clipboard::new(h.display.as_ptr()) };
                 return Some(Self(Backend::Wayland(cb)));
             }
             None
