@@ -666,6 +666,21 @@ fn ime_commit_needs_text_fallback(text_input_active: bool, had_preedit: bool) ->
     cfg!(target_os = "linux") && text_input_active && !had_preedit
 }
 
+/// Terminals that belong to neither the current workspace nor an in-progress restore can be
+/// removed. Restored panes are deliberately wired before `Ready` and only placed into tabs when
+/// the restore burst finishes, so treating them as stale in that interval would close them on the
+/// daemon during an unrelated redraw (the connection-progress spinner is enough to trigger one).
+fn stale_terminal_ids(
+    terminal_ids: impl IntoIterator<Item = PaneId>,
+    workspace_live: &[PaneId],
+    restoring: &std::collections::HashSet<PaneId>,
+) -> Vec<PaneId> {
+    terminal_ids
+        .into_iter()
+        .filter(|id| !workspace_live.contains(id) && !restoring.contains(id))
+        .collect()
+}
+
 fn unix_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1058,6 +1073,97 @@ fn profile_row(ui: &mut egui::Ui, profile: &ConnectProfileView) -> egui::Respons
     response
 }
 
+/// A full-width attention-feed card. The card itself jumps to the pane; the dismiss target is a
+/// separate, later interaction so its click cannot leak through and activate the card beneath it.
+fn feed_row(ui: &mut egui::Ui, item: &FeedItem) -> (bool, bool) {
+    let can_jump = item.pane.is_some();
+    let width = ui.available_width().max(300.0);
+    let height = if item.message.is_empty() { 44.0 } else { 62.0 };
+    let (rect, card) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+
+    let dismiss_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 18.0, rect.center().y),
+        egui::vec2(26.0, 26.0),
+    );
+    let dismiss = ui
+        .interact(
+            dismiss_rect,
+            egui::Id::new(("feed-dismiss", &item.key)),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Dismiss");
+    let card = if can_jump {
+        card.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Jump to this pane")
+    } else {
+        card
+    };
+
+    if ui.is_rect_visible(rect) {
+        let hovered = can_jump && card.hovered();
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(7),
+            if hovered { chrome_hover() } else { chrome_bg() },
+            if hovered {
+                egui::Stroke::new(1.0, rgba(34, 244, 255, 145))
+            } else {
+                egui::Stroke::new(1.0, rgba(142, 155, 176, 60))
+            },
+            egui::StrokeKind::Inside,
+        );
+        if dismiss.hovered() {
+            ui.painter().rect_filled(
+                dismiss_rect,
+                egui::CornerRadius::same(6),
+                rgba(255, 104, 120, 34),
+            );
+        }
+        ui.painter().text(
+            dismiss_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Button)),
+            if dismiss.hovered() {
+                chrome_error()
+            } else {
+                chrome_muted()
+            },
+        );
+
+        let tool = match item.tool {
+            feed::Tool::Claude => "claude",
+            feed::Tool::Codex => "codex",
+            feed::Tool::Other => "tool",
+        };
+        let head = format!("{tool} · {} · {}", item.label, item.age);
+        let text_left = rect.left() + 38.0;
+        ui.painter().text(
+            egui::pos2(text_left, rect.top() + 10.0),
+            egui::Align2::LEFT_TOP,
+            elide(&head, 48),
+            egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Button)),
+            chrome_text(),
+        );
+        if !item.message.is_empty() {
+            ui.painter().text(
+                egui::pos2(text_left, rect.bottom() - 10.0),
+                egui::Align2::LEFT_BOTTOM,
+                elide(&item.message, 56),
+                egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Small)),
+                chrome_muted(),
+            );
+        }
+    }
+
+    let dismiss_clicked = dismiss.clicked();
+    (
+        can_jump && card.clicked() && !dismiss_clicked,
+        dismiss_clicked,
+    )
+}
+
 /// The one pane/tab menu, used by both the ☰ button (`for_pane` = None → acts on the focused
 /// pane) and a pane's right-click context menu (`for_pane` = that pane). Being the single menu
 /// means hiding the tab bar still gives full access via right-click. Font controls live in a
@@ -1392,6 +1498,7 @@ fn build_ui(
                     // egui labels are drag-selectable by default; that just produces stray text
                     // highlights in a read-only overlay, so turn it off here.
                     ui.style_mut().interaction.selectable_labels = false;
+                    ui.set_min_width(360.0);
                     ui.set_max_width(360.0);
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1405,38 +1512,13 @@ fn build_ui(
                     });
                     for item in pending {
                         ui.add_space(3.0);
-                        inset_frame().show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if icon_button(ui, "×", "Dismiss").clicked() {
-                                    actions.push(Action::DismissNote(
-                                        item.key.0.clone(),
-                                        item.key.1.clone(),
-                                    ));
-                                }
-                                let tool = match item.tool {
-                                    feed::Tool::Claude => "claude",
-                                    feed::Tool::Codex => "codex",
-                                    feed::Tool::Other => "tool",
-                                };
-                                let head = format!("{tool} · {} · {}", item.label, item.age);
-                                let jump = item.pane.is_some();
-                                let resp =
-                                    ui.add(egui::Label::new(head).sense(egui::Sense::click()));
-                                let resp = if jump {
-                                    resp.on_hover_text("Jump to this pane")
-                                } else {
-                                    resp
-                                };
-                                if jump && resp.clicked() {
-                                    if let Some(p) = item.pane {
-                                        actions.push(Action::JumpToPane(p));
-                                    }
-                                }
-                            });
-                            if !item.message.is_empty() {
-                                ui.label(egui::RichText::new(elide(&item.message, 64)).weak());
-                            }
-                        });
+                        let (jump, dismiss) = feed_row(ui, item);
+                        if dismiss {
+                            actions
+                                .push(Action::DismissNote(item.key.0.clone(), item.key.1.clone()));
+                        } else if jump && let Some(pane) = item.pane {
+                            actions.push(Action::JumpToPane(pane));
+                        }
                     }
                 });
             });
@@ -2409,12 +2491,16 @@ impl App {
                 self.spawn_terminal(*id, self.last_dims);
             }
         }
-        let removed: Vec<PaneId> = self
-            .terms
-            .keys()
-            .copied()
-            .filter(|id| !live.contains(id))
+        // A restore pane has a Terminal and route as soon as `Restore` arrives, but is absent from
+        // the workspace until `Ready`. Keep it alive across redraws in that interval; otherwise
+        // reconciliation sends `Close`, kills the remote process, and drops the whole connection.
+        let restoring: std::collections::HashSet<PaneId> = self
+            .connections
+            .values()
+            .filter(|c| !c.ready)
+            .flat_map(|c| c.restore_panes.iter().map(|(_, local)| *local))
             .collect();
+        let removed = stale_terminal_ids(self.terms.keys().copied(), &live, &restoring);
         for id in removed {
             // A remote pane closed via the UI: tell the remote to kill its shell.
             if let Some(Backend::Remote {
@@ -4509,9 +4595,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        csi_tilde, cursor_key, ime_commit_needs_text_fallback, terminal_should_receive_ime_commit,
-        xterm_modifier,
+        csi_tilde, cursor_key, ime_commit_needs_text_fallback, stale_terminal_ids,
+        terminal_should_receive_ime_commit, xterm_modifier,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn modifier_parameter() {
@@ -4561,5 +4648,16 @@ mod tests {
         );
         assert!(!ime_commit_needs_text_fallback(true, true));
         assert!(!ime_commit_needs_text_fallback(false, false));
+    }
+
+    #[test]
+    fn reconciliation_keeps_panes_until_restore_reaches_ready() {
+        let workspace_live = vec![0];
+        let restoring = HashSet::from([2]);
+
+        assert_eq!(
+            stale_terminal_ids([0, 2, 3], &workspace_live, &restoring),
+            vec![3]
+        );
     }
 }
