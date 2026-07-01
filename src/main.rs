@@ -425,6 +425,8 @@ struct Terminal {
 enum Action {
     SelectTab(usize),
     NewTab,
+    /// New tab that is always a local shell, regardless of the focused pane (the tab bar's "+").
+    NewLocalTab,
     Split(Split),
     ClosePane,
     CloseTab(usize),
@@ -525,7 +527,7 @@ struct ConnectProgressView {
 fn apply(ws: &mut Workspace, action: Action) {
     match action {
         Action::SelectTab(i) => ws.active = i.min(ws.tabs.len() - 1),
-        Action::NewTab => ws.new_tab(),
+        Action::NewTab | Action::NewLocalTab => ws.new_tab(),
         Action::Split(s) => ws.split(s),
         Action::ClosePane => ws.close_focused(),
         Action::CloseTab(i) => ws.close_tab(i),
@@ -1355,7 +1357,7 @@ fn build_ui(
                         });
                     }
                     if icon_button(ui, "+", "New tab").clicked() {
-                        actions.push(Action::NewTab);
+                        actions.push(Action::NewLocalTab);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let focus_detachable = detachable_panes.contains(&ws.active_tab().focus);
@@ -2867,10 +2869,11 @@ impl App {
         }
     }
 
-    /// New tab. From a remote pane, it's a new tab on the same connection; otherwise a local tab.
-    fn new_tab(&mut self) {
+    /// New tab. From a remote pane, it's a new tab on the same connection — unless `local` forces
+    /// a local shell (the tab bar's "+"); otherwise a local tab inheriting the focused pane's cwd.
+    fn new_tab(&mut self, local: bool) {
         let focus = self.focus();
-        let conn = self.focused_conn();
+        let conn = if local { None } else { self.focused_conn() };
         let cwd = conn.is_none().then(|| self.pane_cwd(focus)).flatten();
         let cwd_from = conn.and_then(|_| self.remote_id_of(focus));
         self.workspace.new_tab();
@@ -3965,9 +3968,11 @@ impl App {
                     self.request_redraw();
                 }
                 Action::DetachSession => self.detach_focused_session(),
-                // Remote-aware: a split/new-tab from a remote pane stays on its connection.
+                // Remote-aware: a split/new-tab from a remote pane stays on its connection; the
+                // tab bar's "+" always opens a local shell.
                 Action::Split(s) => self.split_pane(s),
-                Action::NewTab => self.new_tab(),
+                Action::NewTab => self.new_tab(false),
+                Action::NewLocalTab => self.new_tab(true),
                 a => apply(&mut self.workspace, a),
             }
         }
