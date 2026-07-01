@@ -375,6 +375,15 @@ struct Connection {
     /// True once the attach handshake finished (`Ready` seen). We only push layout updates after
     /// this, so a mid-handshake push can't clobber the daemon's stored layout we're restoring from.
     ready: bool,
+    /// Our daemon-assigned client id (`Welcome`), and the current focus owner (`Focus`). Both
+    /// start at 0, so against a v1 daemon (no id, no `Focus`) we correctly act as the sole
+    /// controller. While `client_id != focus_owner` another attached potty is driving: we mirror
+    /// its layout and pane sizes instead of pushing our own, until our next input flips focus.
+    client_id: u64,
+    focus_owner: u64,
+    /// Panes adopted live (another client opened them) but not yet placed into a tab — the
+    /// owner's next `LayoutTree` places them. Kept out of `reconcile_terms`' reaping until then.
+    adopting: std::collections::HashSet<PaneId>,
     /// Panes adopted during the restore burst (remote_id, local), placed into tabs at `Ready`.
     restore_panes: Vec<(u64, PaneId)>,
     /// The daemon's replayed layout, applied at `Ready`.
@@ -2498,13 +2507,20 @@ impl App {
             }
         }
         // A restore pane has a Terminal and route as soon as `Restore` arrives, but is absent from
-        // the workspace until `Ready`. Keep it alive across redraws in that interval; otherwise
+        // the workspace until `Ready` — and a live-adopted pane (another client opened it) until
+        // the owner's next `LayoutTree` places it. Keep both alive across redraws; otherwise
         // reconciliation sends `Close`, kills the remote process, and drops the whole connection.
         let restoring: std::collections::HashSet<PaneId> = self
             .connections
             .values()
-            .filter(|c| !c.ready)
-            .flat_map(|c| c.restore_panes.iter().map(|(_, local)| *local))
+            .flat_map(|c| {
+                let pre_ready = (!c.ready).then_some(&c.restore_panes);
+                pre_ready
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, local)| *local)
+                    .chain(c.adopting.iter().copied())
+            })
             .collect();
         let removed = stale_terminal_ids(self.terms.keys().copied(), &live, &restoring);
         for id in removed {
@@ -2772,6 +2788,9 @@ impl App {
                 routes: HashMap::new(),
                 ephemeral,
                 ready: false,
+                client_id: 0,
+                focus_owner: 0,
+                adopting: std::collections::HashSet::new(),
                 restore_panes: Vec::new(),
                 restore_layout: None,
                 pushed_layout: None,
@@ -2930,20 +2949,71 @@ impl App {
                 }
             }
             // Adopt an existing daemon pane (its screen replay follows as Data frames). We create
-            // its backend now but defer tab placement to `Ready`, where the layout is applied.
+            // its backend now; placement comes from the layout — at `Ready` during the attach
+            // restore burst, or from the owner's next `LayoutTree` push for a live adoption
+            // (another attached client opened a pane).
             Frame::Control(Control::Restore { pane: remote_id }) => {
+                let ready = self.connections.get(&conn).is_some_and(|c| c.ready);
                 let local = self.workspace.alloc_pane();
                 self.wire_remote_pane(conn, remote_id, local, false, None);
                 if let Some(c) = self.connections.get_mut(&conn) {
-                    c.restore_panes.push((remote_id, local));
+                    if ready {
+                        c.adopting.insert(local);
+                    } else {
+                        c.restore_panes.push((remote_id, local));
+                    }
                 }
             }
-            // The daemon's replayed layout — stash it; applied at `Ready`.
+            // The daemon's layout — stashed and applied at `Ready` during the restore burst, or
+            // (once ready) mirrored immediately: another attached client reshaped the session.
             Frame::Control(Control::LayoutTree { json }) => {
-                if let Ok(layout) = serde_json::from_str::<proto::Layout>(&json)
+                if self.connections.get(&conn).is_some_and(|c| c.ready) {
+                    self.apply_remote_layout(conn, &json);
+                } else if let Ok(layout) = serde_json::from_str::<proto::Layout>(&json)
                     && let Some(c) = self.connections.get_mut(&conn)
                 {
                     c.restore_layout = Some(layout);
+                }
+            }
+            // Our daemon-assigned client id.
+            Frame::Control(Control::Welcome { client, .. }) => {
+                if let Some(c) = self.connections.get_mut(&conn) {
+                    c.client_id = client;
+                }
+            }
+            // Focus moved (input from some client). If it came to us, the next redraw re-fits our
+            // panes to our own geometry; if it left, we stop resizing and follow instead.
+            Frame::Control(Control::Focus { owner }) => {
+                if let Some(c) = self.connections.get_mut(&conn) {
+                    c.focus_owner = owner;
+                }
+                self.request_redraw();
+            }
+            // The focused client resized a pane; conform our grid to the PTY (we're a follower —
+            // our own `fit_terminal` is suspended while someone else holds focus).
+            Frame::Control(Control::Resize {
+                pane: remote_id,
+                cols,
+                rows,
+            }) => {
+                let local = self
+                    .connections
+                    .get(&conn)
+                    .and_then(|c| c.routes.get(&remote_id))
+                    .copied();
+                if let Some(local) = local
+                    && let Some(t) = self.terms.get_mut(&local)
+                {
+                    let dims = Dims {
+                        cols: (cols as usize).max(1),
+                        rows: (rows as usize).max(1),
+                    };
+                    if t.dims != dims {
+                        t.dims = dims;
+                        t.term.lock().unwrap().resize(dims);
+                        self.dirty.insert(local);
+                        self.request_redraw();
+                    }
                 }
             }
             // Restore burst done: place the restored panes (by layout), or open a fresh pane.
@@ -3091,17 +3161,143 @@ impl App {
         }
     }
 
+    /// True when we may drive `conn`'s layout and pane sizes: we hold the daemon's focus, or the
+    /// daemon never said otherwise (plain shells; v1 daemons — both ids stay 0). Focus follows
+    /// input, so typing into the session is what makes this true again.
+    fn conn_focused(&self, conn: ConnId) -> bool {
+        self.connections
+            .get(&conn)
+            .is_none_or(|c| c.client_id == c.focus_owner)
+    }
+
+    /// Mirror a layout change made by another attached client (the focus owner): rebuild this
+    /// connection's tabs in place, placing freshly-adopted panes and locally dropping panes the
+    /// layout no longer references. The owner already closed those shells, so nothing is sent
+    /// back (a `Close` would also steal the focus).
+    fn apply_remote_layout(&mut self, conn: ConnId, json: &str) {
+        let Ok(layout) = serde_json::from_str::<proto::Layout>(json) else {
+            return;
+        };
+        // Already in sync (e.g. an `Exited` reshaped us the same way): just record the push so
+        // `sync_layouts` won't echo it back once we regain focus.
+        let current = serde_json::to_string(&self.layout_for(conn)).unwrap_or_default();
+        if current == json {
+            if let Some(c) = self.connections.get_mut(&conn) {
+                c.pushed_layout = Some(json.to_string());
+            }
+            return;
+        }
+        let (map, label) = match self.connections.get(&conn) {
+            Some(c) => (
+                c.routes.clone(),
+                c.display_name
+                    .clone()
+                    .unwrap_or_else(|| c.target.host.clone()),
+            ),
+            None => return,
+        };
+        // Where the user is looking, to put them back after the rebuild.
+        let focus_before = self.workspace.active_tab().focus;
+
+        // Take this connection's tabs out, remembering where they started so the rebuilt set
+        // lands in the same spot in the tab bar.
+        let mine: Vec<usize> = self
+            .workspace
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                matches!(
+                    self.terms.get(&tab.layout.first_leaf()).map(|t| &t.backend),
+                    Some(Backend::Remote { conn: c, .. }) if *c == conn
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let insert_at = mine.first().copied().unwrap_or(self.workspace.tabs.len());
+        for &i in mine.iter().rev() {
+            self.workspace.tabs.remove(i);
+        }
+        let mut placed: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+        let mut rebuilt: Vec<workspace::Tab> = Vec::new();
+        for ltab in &layout.tabs {
+            if let Some(node) = self.build_node(&ltab.root, &map, &mut placed) {
+                let focus = ltab
+                    .focus
+                    .and_then(|r| map.get(&r).copied())
+                    .unwrap_or_else(|| node.first_leaf());
+                rebuilt.push(workspace::Tab {
+                    title: label.clone(),
+                    layout: node,
+                    focus,
+                });
+            }
+        }
+        self.workspace.tabs.splice(insert_at..insert_at, rebuilt);
+
+        // Panes the new layout doesn't reference were closed by the owner — drop them locally.
+        // Panes still awaiting placement (`adopting`) survive until a layout mentions them.
+        let adopting = self
+            .connections
+            .get(&conn)
+            .map(|c| c.adopting.clone())
+            .unwrap_or_default();
+        for (remote_id, local) in &map {
+            if placed.contains(local) || adopting.contains(local) {
+                continue;
+            }
+            self.terms.remove(local);
+            self.remote_panes.remove(local);
+            self.pending_cwds.remove(local);
+            self.dirty.remove(local);
+            self.last_rect.remove(local);
+            if let Some(state) = self.state.as_mut() {
+                state.grid.forget_pane(*local);
+            }
+            if let Some(c) = self.connections.get_mut(&conn) {
+                c.routes.remove(remote_id);
+            }
+        }
+        let mut drop_conn = false;
+        if let Some(c) = self.connections.get_mut(&conn) {
+            c.adopting.retain(|p| !placed.contains(p));
+            c.pushed_layout = Some(json.to_string());
+            // The owner closed every pane: the session emptied under us.
+            drop_conn = c.routes.is_empty() && c.adopting.is_empty();
+        }
+        if drop_conn {
+            // Like `drop_remote_route`: dropping the last outbound Sender detaches us.
+            self.connections.remove(&conn);
+            self.connect_progress.remove(&conn);
+        }
+
+        if self.workspace.tabs.is_empty() {
+            self.workspace.new_tab();
+        }
+        if let Some(tab) = self.workspace.tab_of(focus_before) {
+            self.workspace.active = tab;
+            self.workspace.tabs[tab].focus = focus_before;
+        } else {
+            self.workspace.active = self
+                .workspace
+                .active
+                .min(self.workspace.tabs.len().saturating_sub(1));
+        }
+        self.request_redraw();
+    }
+
     /// Push each ready connection's current tab/pane tree to its daemon, so a reattach can restore
     /// it. Deduplicated against the last push. Called after structural changes (see the redraw).
+    /// A follower (someone else holds the focus) pushes nothing: it mirrors instead.
     fn sync_layouts(&mut self) {
         let conns: Vec<ConnId> = self.connections.keys().copied().collect();
         for conn in conns {
             if !self
                 .connections
                 .get(&conn)
-                .is_some_and(|c| c.ready && !c.ephemeral)
+                .is_some_and(|c| c.ready && !c.ephemeral && c.client_id == c.focus_owner)
             {
-                continue; // not ready (mid-restore), or ephemeral (no daemon to store layout)
+                continue; // mid-restore, ephemeral (no daemon), or following another client
             }
             let json = serde_json::to_string(&self.layout_for(conn)).unwrap_or_default();
             if let Some(c) = self.connections.get_mut(&conn)
@@ -3758,6 +3954,13 @@ impl App {
 
     /// Resize a pane's terminal + PTY to `dims` (no-op if unchanged).
     fn fit_terminal(&mut self, id: PaneId, dims: Dims) {
+        // A follower doesn't fit remote panes to its own rects: the focus owner's geometry drives
+        // the PTY size, and we conform via the daemon's `Resize` broadcasts instead.
+        if let Some(Backend::Remote { conn, .. }) = self.terms.get(&id).map(|t| &t.backend)
+            && !self.conn_focused(*conn)
+        {
+            return;
+        }
         if let Some(t) = self.terms.get_mut(&id) {
             if t.dims == dims {
                 return;

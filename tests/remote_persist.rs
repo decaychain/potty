@@ -368,15 +368,16 @@ fn reattach_restores_and_replays() {
 }
 
 #[test]
-fn reattach_while_client_attached_takes_over() {
+fn second_attach_joins_without_evicting_first() {
     let tag = std::process::id();
-    let sock = std::env::temp_dir().join(format!("potty-steal-{tag}.sock"));
-    let marker = format!("STEAL_REATTACH_MARKER_{tag}");
+    let sock = std::env::temp_dir().join(format!("potty-multi-{tag}.sock"));
+    let marker = format!("MULTI_ATTACH_MARKER_{tag}");
+    let marker2 = format!("MULTI_ATTACH_SECOND_{tag}");
     let daemon = start_daemon(&sock);
 
-    // Client #1 is still attached and has a live shell.
+    // Client #1 is attached and has a live shell.
     let mut c1 = Client::connect(&sock);
-    c1.send(Frame::Control(Control::Hello { version: 1 }));
+    c1.send(Frame::Control(Control::Hello { version: 2 }));
     c1.send(Frame::Control(Control::Open {
         pane: 1,
         cols: 80,
@@ -390,24 +391,210 @@ fn reattach_while_client_attached_takes_over() {
     let echoed = c1.wait(|out, _| out.get(&1).is_some_and(|o| contains(o, marker.as_bytes())));
     assert!(echoed, "marker never echoed on client #1");
 
-    // Client #2 should not wait behind client #1 forever. It becomes the active attachment and
-    // receives the existing pane plus replayed output.
+    // Client #2 joins alongside: it gets the pane (size + replay) without evicting client #1.
     let mut c2 = Client::connect(&sock);
-    c2.send(Frame::Control(Control::Hello { version: 1 }));
+    c2.send(Frame::Control(Control::Hello { version: 2 }));
     let restored = c2.wait(|out, ctrl| {
         ctrl.iter()
             .any(|m| matches!(m, Control::Restore { pane: 1 }))
+            && ctrl
+                .iter()
+                .any(|m| matches!(m, Control::Resize { pane: 1, .. }))
             && ctrl.iter().any(|m| matches!(m, Control::Ready))
             && out.get(&1).is_some_and(|o| contains(o, marker.as_bytes()))
     });
+    assert!(
+        restored,
+        "a second attach did not restore the live session alongside the first"
+    );
+
+    // Client #1 is still live: its input works, and the output is broadcast to both clients.
+    c1.send(Frame::Data {
+        pane: 1,
+        bytes: format!("echo {marker2}\r").into_bytes(),
+    });
+    let both_saw = c1.wait(|out, _| out.get(&1).is_some_and(|o| contains(o, marker2.as_bytes())))
+        && c2.wait(|out, _| out.get(&1).is_some_and(|o| contains(o, marker2.as_bytes())));
 
     c1.disconnect();
     c2.disconnect();
     cleanup(daemon, &sock);
 
     assert!(
-        restored,
-        "a second attach did not take over and restore the live session"
+        both_saw,
+        "output after the second attach did not reach both clients"
+    );
+}
+
+#[test]
+fn focus_follows_input_and_gates_layout_and_resize() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-focus-{tag}.sock"));
+    let daemon = start_daemon(&sock);
+
+    // Client #1 attaches first and opens a pane — it holds the focus.
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 2 }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    assert!(
+        c1.wait(|_, ctrl| ctrl
+            .iter()
+            .any(|m| matches!(m, Control::Opened { pane: 1 }))),
+        "pane did not open"
+    );
+
+    // Client #2 joins as a follower and learns who owns the focus (client #1's id).
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(
+        c2.wait(|_, ctrl| ctrl.iter().any(|m| matches!(m, Control::Ready))),
+        "second client never became ready"
+    );
+    let (my_id, owner) = {
+        let g = c2.collected.lock().unwrap();
+        let my_id = g.1.iter().find_map(|m| match m {
+            Control::Welcome { client, .. } => Some(*client),
+            _ => None,
+        });
+        let owner = g.1.iter().rev().find_map(|m| match m {
+            Control::Focus { owner } => Some(*owner),
+            _ => None,
+        });
+        (my_id, owner)
+    };
+    let my_id = my_id.expect("no Welcome with a client id");
+    let owner = owner.expect("no Focus frame during attach");
+    assert_ne!(owner, 0, "attach burst did not name a focus owner");
+    assert_ne!(
+        owner, my_id,
+        "the follower must not steal focus by attaching"
+    );
+
+    // A layout push from the follower is a stale echo: dropped, and it doesn't flip focus.
+    let bad = serde_json::to_string(&Layout {
+        tabs: vec![LayoutTab {
+            root: LayoutNode::Leaf { pane: 999 },
+            focus: None,
+        }],
+    })
+    .unwrap();
+    c2.send(Frame::Control(Control::LayoutTree { json: bad.clone() }));
+
+    // Typing flips focus to the follower (both clients hear about it)...
+    c2.send(Frame::Data {
+        pane: 1,
+        bytes: b"true\r".to_vec(),
+    });
+    assert!(
+        c1.wait(|_, ctrl| ctrl
+            .iter()
+            .any(|m| matches!(m, Control::Focus { owner } if *owner == my_id))),
+        "client #1 was not told focus moved to client #2"
+    );
+
+    // ...after which the same client's layout pushes and resizes are honored and mirrored.
+    let good = serde_json::to_string(&Layout {
+        tabs: vec![LayoutTab {
+            root: LayoutNode::Leaf { pane: 1 },
+            focus: Some(1),
+        }],
+    })
+    .unwrap();
+    c2.send(Frame::Control(Control::LayoutTree { json: good.clone() }));
+    c2.send(Frame::Control(Control::Resize {
+        pane: 1,
+        cols: 100,
+        rows: 30,
+    }));
+    assert!(
+        c1.wait(|_, ctrl| {
+            ctrl.iter()
+                .any(|m| matches!(m, Control::LayoutTree { json } if *json == good))
+                && ctrl.iter().any(|m| {
+                    matches!(
+                        m,
+                        Control::Resize {
+                            pane: 1,
+                            cols: 100,
+                            rows: 30
+                        }
+                    )
+                })
+        }),
+        "the new owner's layout/resize were not mirrored to client #1"
+    );
+    let leaked = {
+        let g = c1.collected.lock().unwrap();
+        g.1.iter()
+            .any(|m| matches!(m, Control::LayoutTree { json } if *json == bad))
+    };
+
+    c1.disconnect();
+    c2.disconnect();
+    cleanup(daemon, &sock);
+
+    assert!(
+        !leaked,
+        "a follower's layout push must be dropped, not mirrored"
+    );
+}
+
+#[test]
+fn pane_opened_by_one_client_is_announced_to_the_other() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-announce-{tag}.sock"));
+    let marker = format!("ANNOUNCE_MARKER_{tag}");
+    let daemon = start_daemon(&sock);
+
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c1.wait(|_, ctrl| ctrl.iter().any(|m| matches!(m, Control::Ready))));
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c2.wait(|_, ctrl| ctrl.iter().any(|m| matches!(m, Control::Ready))));
+
+    // Client #1 opens a pane: it gets Opened; client #2 is told to adopt it (Restore + size),
+    // and from then on sees the pane's output.
+    c1.send(Frame::Control(Control::Open {
+        pane: 7,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    assert!(
+        c1.wait(|_, ctrl| ctrl
+            .iter()
+            .any(|m| matches!(m, Control::Opened { pane: 7 }))),
+        "opener did not get Opened"
+    );
+    assert!(
+        c2.wait(|_, ctrl| {
+            ctrl.iter()
+                .any(|m| matches!(m, Control::Restore { pane: 7 }))
+                && ctrl
+                    .iter()
+                    .any(|m| matches!(m, Control::Resize { pane: 7, .. }))
+        }),
+        "the other client was not told to adopt the new pane"
+    );
+    c1.send(Frame::Data {
+        pane: 7,
+        bytes: format!("echo {marker}\r").into_bytes(),
+    });
+    let mirrored = c2.wait(|out, _| out.get(&7).is_some_and(|o| contains(o, marker.as_bytes())));
+
+    c1.disconnect();
+    c2.disconnect();
+    cleanup(daemon, &sock);
+
+    assert!(
+        mirrored,
+        "the new pane's output did not reach the other client"
     );
 }
 

@@ -255,12 +255,17 @@ pub async fn shell_session(
         while let Some(frame) = out_rx.recv().await {
             match frame {
                 // Greet exactly like the daemon would, so the GUI's connect flow proceeds: with no
-                // panes to restore it will open a fresh one (an `Open`).
+                // panes to restore it will open a fresh one (an `Open`). There is exactly one
+                // client on a plain shell, so it holds focus by construction.
                 Frame::Control(Control::Hello { .. }) => {
                     let _ = in_tx
                         .send(Frame::Control(Control::Welcome {
                             version: crate::proto::PROTOCOL_VERSION,
+                            client: 1,
                         }))
+                        .await;
+                    let _ = in_tx
+                        .send(Frame::Control(Control::Focus { owner: 1 }))
                         .await;
                     let _ = in_tx.send(Frame::Control(Control::Ready)).await;
                 }

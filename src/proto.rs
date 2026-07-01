@@ -15,7 +15,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub type PaneId = u64;
 
@@ -31,8 +31,18 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub enum Control {
     /// C→S: first frame; negotiate version.
     Hello { version: u32 },
-    /// S→C: acknowledge the connection.
-    Welcome { version: u32 },
+    /// S→C: acknowledge the connection. `client` is this client's daemon-assigned id (0 from a
+    /// v1 daemon, which also never sends `Focus` — so `owner == client == 0` and the client
+    /// correctly behaves as the sole controller).
+    Welcome {
+        version: u32,
+        #[serde(default)]
+        client: u64,
+    },
+    /// S→C: which attached client currently holds focus (drives layout and pane sizes). Broadcast
+    /// whenever it changes; `owner == 0` means nobody (e.g. the focused client detached) until the
+    /// next input claims it.
+    Focus { owner: u64 },
     /// C→S: open a new pane running a shell of the given size. `cwd_from`, when present, asks the
     /// remote daemon to start the new shell in the current directory of an existing pane.
     Open {
@@ -44,21 +54,25 @@ pub enum Control {
     },
     /// S→C: the pane is live.
     Opened { pane: PaneId },
-    /// C→S: resize a pane.
+    /// C→S (focused client): resize a pane. S→C (to the others): conform your grid — the pane has
+    /// one PTY size, and the focused client's geometry is the one that wins.
     Resize { pane: PaneId, cols: u16, rows: u16 },
     /// C→S: close a pane (kill its shell).
     Close { pane: PaneId },
     /// S→C: a pane's shell exited.
     Exited { pane: PaneId },
-    /// S→C (on attach): a pane that already exists in the daemon; the client should adopt it. The
-    /// pane's current screen follows as `Data` frames (replay).
+    /// S→C: a pane that exists in the daemon but that this client doesn't know yet; the client
+    /// should adopt it. Its current screen follows as `Data` frames (replay). Sent during the
+    /// attach restore burst, and live when another attached client opens a pane (placement then
+    /// comes with the next `LayoutTree`).
     Restore { pane: PaneId },
     /// S→C (on attach): the end of the restore burst. If nothing was restored, the client opens a
     /// fresh pane; otherwise it has adopted the daemon's panes.
     Ready,
-    /// The client's tab/pane tree for this session, so the daemon can replay it on reattach.
-    /// C→S whenever the layout changes; S→C once during the attach restore burst (before `Ready`).
-    /// Carries the tree as JSON (`Layout`) — the daemon stores it opaquely.
+    /// The client's tab/pane tree for this session, so the daemon can replay it on reattach and
+    /// mirror it to other attached clients. C→S from the focused client whenever the layout
+    /// changes; S→C during the attach restore burst (before `Ready`) and live whenever the stored
+    /// layout changes. Carries the tree as JSON (`Layout`) — the daemon stores it opaquely.
     LayoutTree { json: String },
     /// S→C: an attention-feed note captured by the remote `potty-session` daemon. The payload is a
     /// `notify::Note` JSON object; keeping it opaque here avoids coupling the terminal protocol to
@@ -239,6 +253,18 @@ mod tests {
             json: r#"{"v":1,"session":"abc"}"#.into(),
         });
         assert_eq!(roundtrip(&f), f);
+    }
+
+    #[test]
+    fn welcome_from_v1_daemon_defaults_client_to_zero() {
+        let c: Control = serde_json::from_str(r#"{"t":"Welcome","version":1}"#).unwrap();
+        assert_eq!(
+            c,
+            Control::Welcome {
+                version: 1,
+                client: 0,
+            }
+        );
     }
 
     #[test]

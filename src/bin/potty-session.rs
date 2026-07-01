@@ -6,8 +6,9 @@
 //!    leaving the daemon (and its shells) alive.
 //!  * **daemon** (`--daemon <sock>`, forked + detached): owns the PTYs and speaks the wire
 //!    protocol over the socket, surviving client disconnects so remote programs keep running.
-//!    Newer attaches become the active client if an older attach is still connected. One per user
-//!    (per host, implicitly). See `docs/remote-sessions.md`, step 4.
+//!    Any number of clients may attach at once; pane output is broadcast to all of them, and
+//!    focus follows input — whoever last typed/opened/closed drives the layout and pane sizes
+//!    (see `docs/remote-sessions.md`, steps 4–5). One per user (per host, implicitly).
 //!
 //! `POTTY_SESSION_NODAEMON=1` runs the multiplexer inline over stdin/stdout (no daemon, no
 //! persistence) — used by the protocol/transport tests.
@@ -63,21 +64,30 @@ mod imp {
         child_pid: Option<u32>,
         /// Recent raw output (capped at `REPLAY_CAP`), replayed when a client (re)attaches.
         buffer: Arc<Mutex<Vec<u8>>>,
+        /// Current PTY size, replayed to late-joining clients so their grids match the PTY.
+        size: (u16, u16), // (cols, rows)
     }
 
     struct Client {
         id: u64,
         writer: Box<dyn Write + Send>,
         shutdown: Option<UnixStream>,
+        /// Panes this client has been told about (`Restore`/`Opened`). `Data` is only broadcast to
+        /// clients that know the pane, so replay always precedes live output on their stream.
+        announced: std::collections::HashSet<PaneId>,
     }
 
     /// Shared session state. `panes` outlive any single client connection (that's the persistence);
-    /// `client` is the currently-attached client's write half, or `None` while detached.
+    /// `clients` are all currently-attached clients — any number may watch, and `focus` (a client
+    /// id; 0 = nobody) names the one whose layout pushes and resizes are authoritative. Focus
+    /// follows input: it flips to whichever client last typed, opened, or closed a pane.
     struct Session {
         panes: Mutex<HashMap<PaneId, Pane>>,
-        client: Mutex<Option<Client>>,
+        clients: Mutex<Vec<Client>>,
         next_client: AtomicU64,
-        /// The client's last-pushed tab/pane tree (opaque JSON), replayed on reattach.
+        focus: AtomicU64,
+        /// The focused client's last-pushed tab/pane tree (opaque JSON), replayed on reattach and
+        /// mirrored live to the other clients.
         layout: Mutex<Option<String>>,
         /// Attention notes raised while detached, replayed on the next attach.
         pending_notes: Mutex<HashMap<(String, String), feed::Note>>,
@@ -115,31 +125,80 @@ mod imp {
         session.panes.lock().unwrap().get(&pane).and_then(pane_cwd)
     }
 
-    /// Write a frame to the attached client, if any (dropped while detached). Frames must go out
-    /// atomically, so the whole write happens under the lock.
-    fn send_frame(session: &Session, frame: Frame) {
-        let mut guard = session.client.lock().unwrap();
-        if let Some(client) = guard.as_mut()
-            && frame.write(&mut client.writer).is_err()
+    /// Write a frame to one client under the clients lock (frames must go out atomically). A write
+    /// error shuts the client's stream down; its serve thread then cleans it up.
+    fn write_or_hangup(client: &mut Client, frame: &Frame) {
+        if frame.write(&mut client.writer).is_err()
             && let Some(stream) = client.shutdown.as_ref()
         {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
 
-    fn client_is_current(session: &Session, client_id: u64) -> bool {
-        session
-            .client
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|client| client.id == client_id)
+    /// Send a frame to one attached client by id (dropped if it detached meanwhile).
+    fn send_to(session: &Session, client_id: u64, frame: Frame) {
+        let mut clients = session.clients.lock().unwrap();
+        if let Some(client) = clients.iter_mut().find(|c| c.id == client_id) {
+            write_or_hangup(client, &frame);
+        }
     }
 
-    fn clear_client(session: &Session, client_id: u64) {
-        let mut guard = session.client.lock().unwrap();
-        if guard.as_ref().is_some_and(|client| client.id == client_id) {
-            *guard = None;
+    /// Broadcast a frame to every attached client except `except` (the originator, if any).
+    fn broadcast(session: &Session, frame: Frame, except: Option<u64>) {
+        let mut clients = session.clients.lock().unwrap();
+        for client in clients.iter_mut() {
+            if Some(client.id) != except {
+                write_or_hangup(client, &frame);
+            }
+        }
+    }
+
+    /// Broadcast pane output — only to clients that already know the pane, so a client never sees
+    /// `Data` before its `Restore`/`Opened` announcement (which carries the replay).
+    fn broadcast_data(session: &Session, pane: PaneId, bytes: Vec<u8>) {
+        let mut clients = session.clients.lock().unwrap();
+        for client in clients.iter_mut() {
+            if client.announced.contains(&pane) {
+                write_or_hangup(
+                    client,
+                    &Frame::Data {
+                        pane,
+                        bytes: bytes.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Make `client_id` the focus owner (it typed / opened / closed something). Broadcasts the
+    /// change to everyone, the new owner included.
+    fn take_focus(session: &Session, client_id: u64) {
+        if session.focus.swap(client_id, Ordering::Relaxed) != client_id {
+            broadcast(
+                session,
+                Frame::Control(Control::Focus { owner: client_id }),
+                None,
+            );
+        }
+    }
+
+    fn has_focus(session: &Session, client_id: u64) -> bool {
+        session.focus.load(Ordering::Relaxed) == client_id
+    }
+
+    fn remove_client(session: &Session, client_id: u64) {
+        session
+            .clients
+            .lock()
+            .unwrap()
+            .retain(|c| c.id != client_id);
+        // The focused client left: nobody owns the layout until the next input claims it.
+        if session
+            .focus
+            .compare_exchange(client_id, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            broadcast(session, Frame::Control(Control::Focus { owner: 0 }), None);
         }
     }
 
@@ -149,7 +208,7 @@ mod imp {
 
     fn send_note(session: &Session, note: &feed::Note) {
         if let Ok(json) = serde_json::to_string(note) {
-            send_frame(session, Frame::Control(Control::Notify { json }));
+            broadcast(session, Frame::Control(Control::Notify { json }), None);
         }
     }
 
@@ -164,7 +223,7 @@ mod imp {
                 send_note(session, &note);
             }
             feed::Kind::Clear => {
-                if session.client.lock().unwrap().is_some() {
+                if !session.clients.lock().unwrap().is_empty() {
                     session
                         .pending_notes
                         .lock()
@@ -182,7 +241,8 @@ mod imp {
         }
     }
 
-    fn replay_pending_notes(session: &Session) {
+    /// Replay stored notes to the client that just attached.
+    fn replay_pending_notes(session: &Session, client_id: u64) {
         let notes: Vec<feed::Note> = {
             let mut pending = session.pending_notes.lock().unwrap();
             let notes = pending.values().cloned().collect();
@@ -190,7 +250,9 @@ mod imp {
             notes
         };
         for note in notes {
-            send_note(session, &note);
+            if let Ok(json) = serde_json::to_string(&note) {
+                send_to(session, client_id, Frame::Control(Control::Notify { json }));
+            }
         }
     }
 
@@ -243,18 +305,28 @@ mod imp {
         });
     }
 
-    /// Spawn a shell in a fresh PTY: output → `Data` frames to whoever's attached; exit → `Exited`
-    /// (and, if nothing's left and nobody's attached, the daemon exits).
-    fn open_pane(session: &Arc<Session>, pane: PaneId, cols: u16, rows: u16, cwd: Option<PathBuf>) {
+    /// Spawn a shell in a fresh PTY for `opener`: it gets `Opened`; every other attached client is
+    /// told to adopt the pane (`Restore` + `Resize`). Output → `Data` frames broadcast to everyone
+    /// who knows the pane; exit → `Exited` (and, if nothing's left and nobody's attached, the
+    /// daemon exits).
+    fn open_pane(
+        session: &Arc<Session>,
+        opener: u64,
+        pane: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<PathBuf>,
+    ) {
         let size = PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
         };
+        let fail = |s: &Session| send_to(s, opener, Frame::Control(Control::Exited { pane }));
         let pair = match portable_pty::native_pty_system().openpty(size) {
             Ok(p) => p,
-            Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+            Err(_) => return fail(session),
         };
         let mut cmd = CommandBuilder::new(shell());
         cmd.env("TERM", "xterm-256color");
@@ -266,26 +338,57 @@ mod imp {
         }
         let mut child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
-            Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+            Err(_) => return fail(session),
         };
         let child_pid = child.process_id();
         let killer = child.clone_killer();
         let mut reader = match pair.master.try_clone_reader() {
             Ok(r) => r,
-            Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+            Err(_) => return fail(session),
         };
         let writer = match pair.master.take_writer() {
             Ok(w) => w,
-            Err(_) => return send_frame(session, Frame::Control(Control::Exited { pane })),
+            Err(_) => return fail(session),
         };
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
 
-        // PTY output → the replay buffer and the attached client (if any). Keeps reading (and
-        // buffering) while detached, so the shell never blocks on a full PTY and the screen can be
-        // replayed on reattach.
+        session.panes.lock().unwrap().insert(
+            pane,
+            Pane {
+                writer,
+                master: pair.master,
+                killer,
+                child_pid,
+                buffer: buffer.clone(),
+                size: (cols, rows),
+            },
+        );
+
+        // Announce before the output reader starts, so nobody can see `Data` for an unknown pane:
+        // the opener gets `Opened`, everyone else adopts it (`Restore` + its size; no replay — the
+        // pane is brand new). Placement into tabs follows with the opener's next layout push.
+        {
+            let mut clients = session.clients.lock().unwrap();
+            for client in clients.iter_mut() {
+                client.announced.insert(pane);
+                if client.id == opener {
+                    write_or_hangup(client, &Frame::Control(Control::Opened { pane }));
+                } else {
+                    write_or_hangup(client, &Frame::Control(Control::Restore { pane }));
+                    write_or_hangup(
+                        client,
+                        &Frame::Control(Control::Resize { pane, cols, rows }),
+                    );
+                }
+            }
+        }
+
+        // PTY output → the replay buffer and all attached clients. Keeps reading (and buffering)
+        // while detached, so the shell never blocks on a full PTY and the screen can be replayed
+        // on reattach.
         let out = session.clone();
-        let out_buf = buffer.clone();
+        let out_buf = buffer;
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
@@ -300,70 +403,93 @@ mod imp {
                         b.drain(..excess);
                     }
                 }
-                send_frame(
-                    &out,
-                    Frame::Data {
-                        pane,
-                        bytes: buf[..n].to_vec(),
-                    },
-                );
+                broadcast_data(&out, pane, buf[..n].to_vec());
             }
         });
 
-        // Shell exit → Exited, drop the pane, and shut the daemon down if it's now idle.
+        // Shell exit → Exited to everyone, drop the pane, and shut the daemon down if it's idle.
         let wait = session.clone();
         thread::spawn(move || {
             let _ = child.wait();
-            send_frame(&wait, Frame::Control(Control::Exited { pane }));
+            broadcast(&wait, Frame::Control(Control::Exited { pane }), None);
             wait.panes.lock().unwrap().remove(&pane);
             let idle =
-                wait.panes.lock().unwrap().is_empty() && wait.client.lock().unwrap().is_none();
+                wait.panes.lock().unwrap().is_empty() && wait.clients.lock().unwrap().is_empty();
             if idle {
                 cleanup_and_exit();
             }
         });
-
-        session.panes.lock().unwrap().insert(
-            pane,
-            Pane {
-                writer,
-                master: pair.master,
-                killer,
-                child_pid,
-                buffer,
-            },
-        );
-        send_frame(session, Frame::Control(Control::Opened { pane }));
     }
 
     /// Serve one client connection: apply its frames to the session until it disconnects (EOF).
+    /// Any number of clients may be attached at once; focus follows input (`Data`/`Open`/`Close`
+    /// flip it to the sender), and only the focused client's `Resize`/`LayoutTree` are honored.
     fn serve(session: &Arc<Session>, client_id: u64, reader: impl Read) {
         let mut reader = BufReader::new(reader);
         while let Ok(Some(frame)) = Frame::read(&mut reader) {
-            if !client_is_current(session, client_id) {
-                break;
-            }
             match frame {
-                // Attach handshake: greet, replay every existing pane's current screen, then Ready.
+                // Attach handshake: greet, tell the client who holds focus, replay every existing
+                // pane (screen + size), the stored layout, pending notes, then Ready. All of it
+                // goes to this client only — attaching neither disturbs nor evicts the others.
                 Frame::Control(Control::Hello { .. }) => {
-                    send_frame(
+                    send_to(
                         session,
+                        client_id,
                         Frame::Control(Control::Welcome {
                             version: PROTOCOL_VERSION,
+                            client: client_id,
                         }),
                     );
-                    let restores: Vec<(PaneId, Vec<u8>)> = {
+                    // Nobody focused (fresh daemon, or the owner left) → the newcomer claims it;
+                    // otherwise it joins as a follower of whoever is working.
+                    let _ = session.focus.compare_exchange(
+                        0,
+                        client_id,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                    broadcast(
+                        session,
+                        Frame::Control(Control::Focus {
+                            owner: session.focus.load(Ordering::Relaxed),
+                        }),
+                        None,
+                    );
+                    let restores: Vec<(PaneId, Vec<u8>, (u16, u16))> = {
                         let panes = session.panes.lock().unwrap();
                         panes
                             .iter()
-                            .map(|(id, p)| (*id, p.buffer.lock().unwrap().clone()))
+                            .map(|(id, p)| (*id, p.buffer.lock().unwrap().clone(), p.size))
                             .collect()
                     };
-                    for (id, buf) in restores {
-                        send_frame(session, Frame::Control(Control::Restore { pane: id }));
+                    for (id, buf, (cols, rows)) in restores {
+                        if let Some(client) = session
+                            .clients
+                            .lock()
+                            .unwrap()
+                            .iter_mut()
+                            .find(|c| c.id == client_id)
+                        {
+                            client.announced.insert(id);
+                        }
+                        send_to(
+                            session,
+                            client_id,
+                            Frame::Control(Control::Restore { pane: id }),
+                        );
+                        send_to(
+                            session,
+                            client_id,
+                            Frame::Control(Control::Resize {
+                                pane: id,
+                                cols,
+                                rows,
+                            }),
+                        );
                         if !buf.is_empty() {
-                            send_frame(
+                            send_to(
                                 session,
+                                client_id,
                                 Frame::Data {
                                     pane: id,
                                     bytes: buf,
@@ -373,14 +499,27 @@ mod imp {
                     }
                     // Replay the stored tab/pane tree (if any) so the client rebuilds the layout.
                     if let Some(json) = session.layout.lock().unwrap().clone() {
-                        send_frame(session, Frame::Control(Control::LayoutTree { json }));
+                        send_to(
+                            session,
+                            client_id,
+                            Frame::Control(Control::LayoutTree { json }),
+                        );
                     }
-                    replay_pending_notes(session);
-                    send_frame(session, Frame::Control(Control::Ready));
+                    replay_pending_notes(session, client_id);
+                    send_to(session, client_id, Frame::Control(Control::Ready));
                 }
-                // The client pushed its current layout — store it for the next reattach.
+                // The focused client pushed its layout — store it for reattach and mirror it to
+                // the other clients. Pushes from followers are stale echoes: dropped, and they do
+                // NOT flip focus (they're machine-generated, not user intent).
                 Frame::Control(Control::LayoutTree { json }) => {
-                    *session.layout.lock().unwrap() = Some(json);
+                    if has_focus(session, client_id) {
+                        *session.layout.lock().unwrap() = Some(json.clone());
+                        broadcast(
+                            session,
+                            Frame::Control(Control::LayoutTree { json }),
+                            Some(client_id),
+                        );
+                    }
                 }
                 // Ignore an Open for a pane that already exists (e.g. a restored one).
                 Frame::Control(Control::Open {
@@ -389,28 +528,46 @@ mod imp {
                     rows,
                     cwd_from,
                 }) => {
+                    take_focus(session, client_id);
                     if !session.panes.lock().unwrap().contains_key(&pane) {
                         let cwd = cwd_from_pane(session, cwd_from);
-                        open_pane(session, pane, cols, rows, cwd);
+                        open_pane(session, client_id, pane, cols, rows, cwd);
                     }
                 }
+                // A pane has one PTY size; the focused client's geometry wins, and the others are
+                // told to conform. Resizes from followers are dropped without flipping focus —
+                // honoring them would start a resize war between differently-sized windows.
                 Frame::Control(Control::Resize { pane, cols, rows }) => {
+                    if !has_focus(session, client_id) {
+                        continue;
+                    }
                     let size = PtySize {
                         rows,
                         cols,
                         pixel_width: 0,
                         pixel_height: 0,
                     };
-                    if let Some(p) = session.panes.lock().unwrap().get(&pane) {
-                        let _ = p.master.resize(size);
+                    let mut resized = false;
+                    if let Some(p) = session.panes.lock().unwrap().get_mut(&pane) {
+                        p.size = (cols, rows);
+                        resized = p.master.resize(size).is_ok();
+                    }
+                    if resized {
+                        broadcast(
+                            session,
+                            Frame::Control(Control::Resize { pane, cols, rows }),
+                            Some(client_id),
+                        );
                     }
                 }
                 Frame::Control(Control::Close { pane }) => {
+                    take_focus(session, client_id);
                     if let Some(mut p) = session.panes.lock().unwrap().remove(&pane) {
                         let _ = p.killer.kill();
                     }
                 }
                 Frame::Data { pane, bytes } => {
+                    take_focus(session, client_id);
                     if let Some(p) = session.panes.lock().unwrap().get_mut(&pane) {
                         let _ = p.writer.write_all(&bytes);
                         let _ = p.writer.flush();
@@ -534,8 +691,9 @@ mod imp {
             .unwrap_or_else(inline_notify_socket_path);
         let session = Arc::new(Session {
             panes: Mutex::new(HashMap::new()),
-            client: Mutex::new(None),
+            clients: Mutex::new(Vec::new()),
             next_client: AtomicU64::new(1),
+            focus: AtomicU64::new(0),
             layout: Mutex::new(None),
             pending_notes: Mutex::new(HashMap::new()),
             notify_sock,
@@ -548,27 +706,20 @@ mod imp {
             };
             let shutdown = conn.try_clone().ok();
             let id = session.next_client.fetch_add(1, Ordering::Relaxed);
-            let old = {
-                let mut client = session.client.lock().unwrap();
-                let old = client.take();
-                *client = Some(Client {
-                    id,
-                    writer: Box::new(write),
-                    shutdown,
-                });
-                old
-            };
-            if let Some(stream) = old.and_then(|client| client.shutdown) {
-                let _ = stream.shutdown(Shutdown::Both);
-            }
+            session.clients.lock().unwrap().push(Client {
+                id,
+                writer: Box::new(write),
+                shutdown,
+                announced: std::collections::HashSet::new(),
+            });
 
             let serving = session.clone();
             thread::spawn(move || {
                 serve(&serving, id, conn);
-                clear_client(&serving, id);
+                remove_client(&serving, id);
                 // Detached. If nothing's left to persist, shut down.
                 let idle = serving.panes.lock().unwrap().is_empty()
-                    && serving.client.lock().unwrap().is_none();
+                    && serving.clients.lock().unwrap().is_empty();
                 if idle {
                     cleanup_and_exit();
                 }
@@ -576,21 +727,23 @@ mod imp {
         }
     }
 
-    /// Inline role (tests): multiplex directly over stdin/stdout, no daemon.
+    /// Inline role (tests): multiplex directly over stdin/stdout, no daemon, one client.
     fn run_inline() {
         let session = Arc::new(Session {
             panes: Mutex::new(HashMap::new()),
-            client: Mutex::new(Some(Client {
-                id: 0,
+            clients: Mutex::new(vec![Client {
+                id: 1,
                 writer: Box::new(std::io::stdout()),
                 shutdown: None,
-            })),
-            next_client: AtomicU64::new(1),
+                announced: std::collections::HashSet::new(),
+            }]),
+            next_client: AtomicU64::new(2),
+            focus: AtomicU64::new(0),
             layout: Mutex::new(None),
             pending_notes: Mutex::new(HashMap::new()),
             notify_sock: inline_notify_socket_path(),
         });
-        serve(&session, 0, std::io::stdin().lock());
+        serve(&session, 1, std::io::stdin().lock());
     }
 
     pub fn main() {

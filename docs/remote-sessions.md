@@ -61,7 +61,7 @@ running across disconnects; reconnecting re-attaches to the same session.
 client and the `potty-session` server — same pattern as `potty::notify`. Over time the PTY/grid
 backend factors into `potty-core` so `potty-session` is "potty's backend, headless".
 
-## Wire protocol (v1)
+## Wire protocol (v2)
 
 One byte stream, length-prefixed frames. Two frame kinds so terminal bytes avoid encoding
 overhead while control stays small and debuggable:
@@ -78,16 +78,20 @@ payload= [u8 tag][...]
 | message | dir | meaning |
 |---|---|---|
 | `Hello { version }` | C→S | first frame; negotiate version |
-| `Welcome { version }` | S→C | ack |
+| `Welcome { version, client }` | S→C | ack; `client` = this client's daemon-assigned id (v2) |
+| `Focus { owner }` | S→C | which client id drives layout/sizes now; 0 = nobody (v2) |
 | `Open { pane, cols, rows, cwd_from? }` | C→S | start a shell pane of this size, optionally inheriting cwd from another daemon pane |
 | `Opened { pane }` | S→C | pane is live |
-| `Resize { pane, cols, rows }` | C→S | resize a pane |
+| `Resize { pane, cols, rows }` | C→S from the owner; S→C mirrors it to the other clients (v2) |
 | `Close { pane }` | C→S | kill a pane's shell |
 | `Exited { pane }` | S→C | a pane's shell exited |
+| `Restore { pane }` | S→C | adopt an existing pane (attach burst, or another client opened it) |
+| `LayoutTree { json }` | C→S from the owner; S→C on attach and mirrored live (v2) |
+| `Notify { json }` | S→C | attention-feed note passthrough |
+| `Ready` | S→C | end of the attach restore burst |
 
-Pane ids are assigned by the client. Terminal I/O is `Data` frames. This is the **spike** surface;
-persistence (reattach repaint), the tab/pane *tree* (vs. flat panes), titles, bell, and the
-attention-feed passthrough are added once the spike proves the round trip and feel.
+Pane ids are assigned by the client (`next_remote_id` is seeded past restored ids). Terminal I/O
+is `Data` frames.
 
 ## Lifecycle (target, beyond the spike)
 
@@ -166,4 +170,37 @@ attention-feed passthrough are added once the spike proves the round trip and fe
      one-tab-per-pane. A pane that died while detached collapses to its surviving split sibling;
      panes the layout doesn't cover fall back to their own tab. Verified: the pushed split layout
      round-trips verbatim through disconnect/reattach (`tests/remote_persist.rs`).
-5. **Later:** auto-reattach, bootstrapping, ProxyJump, agent forwarding, Windows `potty attach` IPC.
+5. **Multi-client attach (done).** Any number of potty instances can attach to the same daemon at
+   once (protocol v2) — attaching no longer evicts the previous client. The daemon keeps a client
+   list, broadcasts pane output to every client that has been told about the pane (`Restore`/
+   `Opened` announcements always precede a pane's `Data` on a given client's stream, carrying the
+   replay buffer and the pane's current size), and mirrors layout changes live.
+   - **Focus follows input.** Exactly one client (the *focus owner*) drives the layout and pane
+     sizes at a time; there is no permission system — any client that types (`Data`), opens, or
+     closes a pane simply becomes the owner (`Focus{owner}` broadcast). `Resize`/`LayoutTree`
+     from non-owners are dropped *without* flipping focus: they're machine-generated echoes, and
+     honoring them would start a resize war between differently-sized windows. When the owner
+     detaches, `owner = 0` until the next input claims it.
+   - **Followers mirror.** A non-owner client stops fitting remote panes to its own window
+     (`fit_terminal` is suspended for that connection) and stops pushing layouts; instead it
+     conforms its grids to the daemon's `Resize` broadcasts (the pane rect scissors any overflow)
+     and rebuilds its tabs in place from mirrored `LayoutTree` pushes — adopting live-announced
+     panes and locally dropping panes the owner closed (never sending `Close` back, which would
+     kill shells and steal focus). Typing into the session is all it takes to become the owner
+     again; the next redraw then re-fits every pane to the local window.
+   - **Compat.** A v2 client against a v1 daemon degrades to the old single-client behavior:
+     `Welcome` carries no client id (serde-defaults to 0), no `Focus` ever arrives, and
+     `client_id == focus_owner == 0` means "we're the controller". Plain-SSH shells fabricate
+     `Welcome{client:1}` + `Focus{owner:1}` for the same reason. A v1 *client* against a v2
+     daemon, however, fails on the unknown `Focus` variant — upgrade potty and potty-tools
+     together.
+   - Verified in `tests/remote_persist.rs`: a second attach joins without evicting the first
+     (output broadcast to both); focus flips on input and gates layout/resize (a follower's push
+     is dropped, the owner's is mirrored); a pane opened by one client is announced to the other,
+     which then sees its output.
+   - *Known gap:* pane ids are still client-assigned (each client seeds `next_remote_id` past
+     every id it has seen), so two clients opening panes *simultaneously* can collide — the daemon
+     ignores the second `Open` and that client's pane stays dead. Unlikely with one human driving
+     focus-follows-input; the fix, if it ever bites, is daemon-assigned ids or a per-client id
+     namespace.
+6. **Later:** auto-reattach, bootstrapping, ProxyJump, agent forwarding, Windows `potty attach` IPC.
