@@ -569,6 +569,18 @@ fn xterm_modifier(shift: bool, alt: bool, ctrl: bool) -> u8 {
     1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl)
 }
 
+fn macos_control_click(button: MouseButton, control: bool) -> bool {
+    cfg!(target_os = "macos") && matches!(button, MouseButton::Left) && control
+}
+
+fn pane_context_click(button: MouseButton, control: bool) -> bool {
+    matches!(button, MouseButton::Right) || macos_control_click(button, control)
+}
+
+fn terminal_mouse_claims_context_click(button: MouseButton, report: bool, shift: bool) -> bool {
+    matches!(button, MouseButton::Right) && report && !shift
+}
+
 /// Encode a cursor key (`final_byte` = `A`/`B`/`C`/`D`/`H`/`F`). With a modifier held, xterm always
 /// uses the CSI form `ESC [ 1 ; <mod> <final>` regardless of DECCKM; unmodified it honours
 /// application-cursor mode (`ESC O <final>` vs `ESC [ <final>`).
@@ -1240,6 +1252,20 @@ fn full_menu(
     }
 }
 
+fn pane_context_menu(
+    response: &egui::Response,
+    force_open: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let popup = egui::Popup::context_menu(response);
+    let popup = if force_open {
+        popup.open_memory(Some(egui::SetOpenCommand::Bool(true)))
+    } else {
+        popup
+    };
+    popup.show(add_contents);
+}
+
 /// The floating Font settings window: terminal font size + family picker. Visibility is tied to
 /// `open` (its close button flips it off).
 fn font_settings_window(
@@ -1338,6 +1364,7 @@ fn build_ui(
     connect_progress_active: &mut bool,
     error: Option<&str>,
     detachable_panes: &std::collections::HashSet<PaneId>,
+    context_menu_pane: Option<PaneId>,
 ) {
     // The tab bar earns its space with more than one tab, or once the attention feed has latched
     // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
@@ -1439,12 +1466,12 @@ fn build_ui(
             let rects = ws.leaf_rects(area);
             let single = rects.len() == 1;
             for (id, rect) in rects {
-                ui.interact(
+                let response = ui.interact(
                     rect,
                     egui::Id::new(("pane", ws.active, id)),
                     egui::Sense::click(),
-                )
-                .context_menu(|ui| {
+                );
+                pane_context_menu(&response, context_menu_pane == Some(id), |ui| {
                     full_menu(ui, actions, Some(id), detachable_panes.contains(&id))
                 });
                 if single {
@@ -2031,6 +2058,9 @@ struct App {
     /// Whether an egui popup/menu was open as of the last frame — suppresses our own mouse
     /// handling so clicking a menu item doesn't also hit the terminal underneath.
     menu_open: bool,
+    /// Pane whose context menu should be opened on the next egui frame. Used for platform
+    /// secondary-click paths that egui/winit don't consistently turn into `secondary_clicked`.
+    context_menu_pane: Option<PaneId>,
     /// Whether the floating Font settings window is shown.
     show_font_settings: bool,
 
@@ -2122,6 +2152,7 @@ impl App {
             clipboard: None,
             window_title: String::new(),
             menu_open: false,
+            context_menu_pane: None,
             show_font_settings: false,
             dirty: std::collections::HashSet::new(),
             visible: std::collections::HashSet::new(),
@@ -4074,6 +4105,7 @@ impl App {
         let error = self.error_msg.clone();
         let connect_profiles = self.connect_profile_views();
         let connect_progress = self.connect_progress_views();
+        let context_menu_pane = self.context_menu_pane.take();
         // Panes whose connection is a persistent (potty-session) remote — the only ones that can be
         // detached. Computed fresh (owned) so it doesn't tangle with the borrows below.
         let detachable_panes: std::collections::HashSet<PaneId> = self
@@ -4121,6 +4153,7 @@ impl App {
                     &mut connect_progress_active,
                     error.as_deref(),
                     &detachable_panes,
+                    context_menu_pane,
                 )
             })
         };
@@ -4553,19 +4586,26 @@ impl ApplicationHandler<UserEvent> for App {
         //    (Tab navigating widgets, Space/Enter activating a focused tab) from the terminal.
         //  - A plain right-click over a mouse-reporting pane: it belongs to the app, not our
         //    context menu (shift, or a non-reporting pane, lets egui open the menu as usual).
+        //  - macOS reports Control-click as a primary click; Potty treats it as a menu trigger
+        //    instead of letting egui see a normal left click.
         let withhold_from_egui = match &event {
             // Keys normally go to the focused pane, not egui — except while a dialog text field is
             // open, when egui needs them.
             WindowEvent::KeyboardInput { .. } => !self.text_input_active(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
-                button: MouseButton::Right,
+                button,
                 ..
             } => {
-                !self.mods.state().shift_key()
-                    && self
-                        .pane_at(self.mouse_px.0, self.mouse_px.1)
-                        .is_some_and(|id| self.mouse_modes(id).0)
+                let mods = self.mods.state();
+                let shift = mods.shift_key();
+                let control = mods.control_key();
+                self.pane_at(self.mouse_px.0, self.mouse_px.1)
+                    .is_some_and(|id| {
+                        let (report, ..) = self.mouse_modes(id);
+                        terminal_mouse_claims_context_click(*button, report, shift)
+                            || macos_control_click(*button, control)
+                    })
             }
             _ => false,
         };
@@ -4647,6 +4687,16 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let (report, sgr, ..) = self.mouse_modes(id);
                 let pressed = state == ElementState::Pressed;
+                let control = self.mods.state().control_key();
+                let context_click = pane_context_click(button, control);
+                if context_click && !terminal_mouse_claims_context_click(button, report, shift) {
+                    if pressed {
+                        self.workspace.focus(id);
+                        self.context_menu_pane = Some(id);
+                        self.request_redraw();
+                    }
+                    return;
+                }
                 let cb = match button {
                     MouseButton::Left => Some(0),
                     MouseButton::Middle => Some(1),
@@ -4805,10 +4855,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        csi_tilde, cursor_key, ime_commit_needs_text_fallback, stale_terminal_ids,
+        csi_tilde, cursor_key, ime_commit_needs_text_fallback, macos_control_click,
+        pane_context_click, stale_terminal_ids, terminal_mouse_claims_context_click,
         terminal_should_receive_ime_commit, xterm_modifier,
     };
     use std::collections::HashSet;
+    use winit::event::MouseButton;
 
     #[test]
     fn modifier_parameter() {
@@ -4818,6 +4870,44 @@ mod tests {
         assert_eq!(xterm_modifier(false, false, true), 5); // ctrl
         assert_eq!(xterm_modifier(true, false, true), 6); // ctrl+shift
         assert_eq!(xterm_modifier(true, true, true), 8); // all
+    }
+
+    #[test]
+    fn pane_context_clicks_include_macos_control_click() {
+        assert!(pane_context_click(MouseButton::Right, false));
+        assert!(!pane_context_click(MouseButton::Left, false));
+        assert_eq!(
+            macos_control_click(MouseButton::Left, true),
+            cfg!(target_os = "macos")
+        );
+        assert_eq!(
+            pane_context_click(MouseButton::Left, true),
+            cfg!(target_os = "macos")
+        );
+    }
+
+    #[test]
+    fn terminal_mouse_claims_plain_unshifted_right_click() {
+        assert!(terminal_mouse_claims_context_click(
+            MouseButton::Right,
+            true,
+            false
+        ));
+        assert!(!terminal_mouse_claims_context_click(
+            MouseButton::Right,
+            true,
+            true
+        ));
+        assert!(!terminal_mouse_claims_context_click(
+            MouseButton::Right,
+            false,
+            false
+        ));
+        assert!(!terminal_mouse_claims_context_click(
+            MouseButton::Left,
+            true,
+            false
+        ));
     }
 
     #[test]
