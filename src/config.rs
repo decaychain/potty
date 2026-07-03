@@ -47,6 +47,9 @@ pub struct Config {
     /// connection; `name` is only a display label.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<ConnectionProfile>,
+    /// Keyboard shortcut overrides, keyed by action id. Missing or invalid entries use defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hotkeys: BTreeMap<String, String>,
     pub colors: Colors,
 }
 
@@ -94,6 +97,7 @@ impl Default for Config {
             cursor_thickness: 0.15,
             remote_command: "potty-session".into(),
             profiles: Vec::new(),
+            hotkeys: BTreeMap::new(),
             colors: Colors::default(),
         }
     }
