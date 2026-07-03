@@ -445,7 +445,9 @@ enum Action {
     SetRatio(u64, f32),
     SetFontFamily(Option<String>),
     SetFontSize(f32),
-    ShowFontSettings,
+    ShowSettings,
+    CaptureShortcut(MenuAction),
+    ResetShortcut(MenuAction),
     /// Jump to (focus) a pane from the attention feed — selects its tab too.
     JumpToPane(PaneId),
     /// Dismiss an attention-feed entry, keyed by (host, session).
@@ -547,7 +549,9 @@ fn apply(ws: &mut Workspace, action: Action) {
         // Handled in the redraw action loop (they touch App, not just the workspace).
         Action::SetFontFamily(_)
         | Action::SetFontSize(_)
-        | Action::ShowFontSettings
+        | Action::ShowSettings
+        | Action::CaptureShortcut(_)
+        | Action::ResetShortcut(_)
         | Action::JumpToPane(_)
         | Action::DismissNote(..)
         | Action::ShowFeed(_)
@@ -611,6 +615,155 @@ fn csi_tilde(code: u8, modifier: u8) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // egui chrome
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    NewTab,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    Connect,
+    DetachSession,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Font,
+    Hotkeys,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ShortcutBinding {
+    key: String,
+    shift: bool,
+}
+
+struct ShortcutDef {
+    action: MenuAction,
+    label: &'static str,
+    default_key: &'static str,
+    default_shift: bool,
+}
+
+const SHORTCUTS: &[ShortcutDef] = &[
+    ShortcutDef {
+        action: MenuAction::NewTab,
+        label: "New tab",
+        default_key: "T",
+        default_shift: false,
+    },
+    ShortcutDef {
+        action: MenuAction::SplitRight,
+        label: "Split right",
+        default_key: "D",
+        default_shift: false,
+    },
+    ShortcutDef {
+        action: MenuAction::SplitDown,
+        label: "Split down",
+        default_key: "D",
+        default_shift: true,
+    },
+    ShortcutDef {
+        action: MenuAction::ClosePane,
+        label: "Close pane",
+        default_key: "W",
+        default_shift: false,
+    },
+    ShortcutDef {
+        action: MenuAction::Connect,
+        label: "Connect to host",
+        default_key: "K",
+        default_shift: false,
+    },
+    ShortcutDef {
+        action: MenuAction::DetachSession,
+        label: "Detach session",
+        default_key: "W",
+        default_shift: true,
+    },
+    ShortcutDef {
+        action: MenuAction::Settings,
+        label: "Settings",
+        default_key: ",",
+        default_shift: false,
+    },
+];
+
+fn modkey_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl"
+    }
+}
+
+fn shortcut_for(action: MenuAction) -> &'static ShortcutDef {
+    SHORTCUTS
+        .iter()
+        .find(|s| s.action == action)
+        .expect("menu action has a shortcut")
+}
+
+fn action_id(action: MenuAction) -> &'static str {
+    match action {
+        MenuAction::NewTab => "new_tab",
+        MenuAction::SplitRight => "split_right",
+        MenuAction::SplitDown => "split_down",
+        MenuAction::ClosePane => "close_pane",
+        MenuAction::Connect => "connect",
+        MenuAction::DetachSession => "detach_session",
+        MenuAction::Settings => "settings",
+    }
+}
+
+fn default_binding(action: MenuAction) -> ShortcutBinding {
+    let shortcut = shortcut_for(action);
+    ShortcutBinding {
+        key: shortcut.default_key.to_string(),
+        shift: shortcut.default_shift,
+    }
+}
+
+fn parse_binding(s: &str) -> Option<ShortcutBinding> {
+    let mut has_mod = false;
+    let mut shift = false;
+    let mut key = None;
+    for part in s.split('+') {
+        let part = part.trim();
+        match part.to_ascii_lowercase().as_str() {
+            "mod" | "cmd" | "command" | "ctrl" | "control" => has_mod = true,
+            "shift" => shift = true,
+            "" => {}
+            _ => key = Some(part.to_ascii_uppercase()),
+        }
+    }
+    let key = key?;
+    (has_mod && !key.is_empty()).then_some(ShortcutBinding { key, shift })
+}
+
+fn binding_from_config(cfg: &Config, action: MenuAction) -> ShortcutBinding {
+    cfg.hotkeys
+        .get(action_id(action))
+        .and_then(|s| parse_binding(s))
+        .unwrap_or_else(|| default_binding(action))
+}
+
+fn shortcut_hint(binding: &ShortcutBinding) -> String {
+    if binding.shift {
+        format!("{}+Shift+{}", modkey_name(), binding.key)
+    } else {
+        format!("{}+{}", modkey_name(), binding.key)
+    }
+}
+
+fn char_key(ev: &KeyEvent) -> Option<String> {
+    match &ev.logical_key {
+        Key::Character(s) => Some(s.to_lowercase()),
+        _ => None,
+    }
+}
 
 /// Shorten a title for a tab label, with an ellipsis when it overflows.
 fn elide(s: &str, max: usize) -> String {
@@ -872,7 +1025,7 @@ fn apply_chrome_style(ctx: &egui::Context, ui_size: f32) {
         style.spacing.button_padding = egui::vec2(9.0, 4.0);
         style.spacing.interact_size = egui::vec2(44.0, 24.0);
         style.spacing.text_edit_width = 260.0;
-        style.spacing.menu_width = 170.0;
+        style.spacing.menu_width = 240.0;
 
         let visuals = &mut style.visuals;
         visuals.dark_mode = true;
@@ -1008,7 +1161,7 @@ fn chrome_text_edit<'a>(text: &'a mut String, hint: &'static str) -> egui::TextE
 }
 
 fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, hint: Option<&str>) -> egui::Response {
-    let width = ui.available_width().clamp(156.0, 170.0);
+    let width = ui.available_width().clamp(220.0, 240.0);
     let height = 28.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
 
@@ -1203,44 +1356,51 @@ fn feed_row(ui: &mut egui::Ui, item: &FeedItem) -> (bool, bool) {
 fn full_menu(
     ui: &mut egui::Ui,
     actions: &mut Vec<Action>,
+    cfg: &Config,
     for_pane: Option<PaneId>,
     can_detach: bool,
 ) {
-    ui.set_min_width(164.0);
+    ui.set_min_width(228.0);
     ui.style_mut().interaction.selectable_labels = false;
     let focus = |actions: &mut Vec<Action>| {
         if let Some(id) = for_pane {
             actions.push(Action::Focus(id));
         }
     };
-    if menu_item(ui, "+", "New tab", None).clicked() {
+    let new_tab = shortcut_hint(&binding_from_config(cfg, MenuAction::NewTab));
+    if menu_item(ui, "+", "New tab", Some(&new_tab)).clicked() {
         actions.push(Action::NewTab);
         ui.close_menu();
     }
-    if menu_item(ui, ">", "Split right", None).clicked() {
+    let split_right = shortcut_hint(&binding_from_config(cfg, MenuAction::SplitRight));
+    if menu_item(ui, ">", "Split right", Some(&split_right)).clicked() {
         focus(actions);
         actions.push(Action::Split(Split::Cols));
         ui.close_menu();
     }
-    if menu_item(ui, "v", "Split down", None).clicked() {
+    let split_down = shortcut_hint(&binding_from_config(cfg, MenuAction::SplitDown));
+    if menu_item(ui, "v", "Split down", Some(&split_down)).clicked() {
         focus(actions);
         actions.push(Action::Split(Split::Rows));
         ui.close_menu();
     }
-    if menu_item(ui, "x", "Close pane", None).clicked() {
+    let close_pane = shortcut_hint(&binding_from_config(cfg, MenuAction::ClosePane));
+    if menu_item(ui, "x", "Close pane", Some(&close_pane)).clicked() {
         focus(actions);
         actions.push(Action::ClosePane);
         ui.close_menu();
     }
     ui.separator();
     section_label(ui, "SSH");
-    if menu_item(ui, "ssh", "Connect to host…", None).clicked() {
+    let connect = shortcut_hint(&binding_from_config(cfg, MenuAction::Connect));
+    if menu_item(ui, "ssh", "Connect to host...", Some(&connect)).clicked() {
         actions.push(Action::OpenConnect);
         ui.close_menu();
     }
     // Only for a persistent (potty-session) remote pane: leave the session running and disconnect.
+    let detach = shortcut_hint(&binding_from_config(cfg, MenuAction::DetachSession));
     if can_detach
-        && menu_item(ui, "dt", "Detach session", None)
+        && menu_item(ui, "dt", "Detach session", Some(&detach))
             .on_hover_text("Disconnect but keep the remote shells running, to reattach later")
             .clicked()
     {
@@ -1250,8 +1410,9 @@ fn full_menu(
     }
     ui.separator();
     section_label(ui, "View");
-    if menu_item(ui, "Aa", "Font settings…", None).clicked() {
-        actions.push(Action::ShowFontSettings);
+    let settings = shortcut_hint(&binding_from_config(cfg, MenuAction::Settings));
+    if menu_item(ui, "Aa", "Settings...", Some(&settings)).clicked() {
+        actions.push(Action::ShowSettings);
         ui.close_menu();
     }
 }
@@ -1270,66 +1431,153 @@ fn pane_context_menu(
     popup.show(add_contents);
 }
 
-/// The floating Font settings window: terminal font size + family picker. Visibility is tied to
+/// The floating Settings window: terminal font size/family plus app hotkeys. Visibility is tied to
 /// `open` (its close button flips it off).
-fn font_settings_window(
+fn settings_window(
     ctx: &egui::Context,
+    cfg: &Config,
     open: &mut bool,
+    page: &mut SettingsPage,
+    shortcut_capture: Option<MenuAction>,
     families: &[String],
     cur_family: Option<&str>,
     cur_size: f32,
     actions: &mut Vec<Action>,
 ) {
     let mut request_close = false;
-    egui::Window::new("Font settings")
+    egui::Window::new("Settings")
         .open(open)
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
         .frame(dialog_frame())
         .show(ctx, |ui| {
-            ui.set_min_width(360.0);
-            request_close |= dialog_header(ui, "Font settings", Some("Close"));
-            dialog_caption(ui, "Terminal renderer");
+            ui.set_min_width(560.0);
+            request_close |= dialog_header(ui, "Settings", Some("Close"));
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                ui.label(egui::RichText::new("Size").color(chrome_muted()));
-                if stepper_button(ui, "-").clicked() {
-                    actions.push(Action::SetFontSize(cur_size - 1.0));
-                }
-                ui.label(
-                    egui::RichText::new(format!("{cur_size:.0} px"))
-                        .monospace()
-                        .color(chrome_text()),
-                );
-                if stepper_button(ui, "+").clicked() {
-                    actions.push(Action::SetFontSize(cur_size + 1.0));
-                }
-            });
-            ui.separator();
-            section_label(ui, "Font family");
-            let list_width = ui.available_width();
-            inset_frame().show(ui, |ui| {
-                ui.set_min_width((list_width - 20.0).max(260.0));
-                egui::ScrollArea::vertical()
-                    .max_height(280.0)
-                    .show(ui, |ui| {
-                        if ui
-                            .selectable_label(cur_family.is_none(), "(default monospace)")
-                            .clicked()
-                        {
-                            actions.push(Action::SetFontFamily(None));
+                ui.vertical(|ui| {
+                    ui.set_width(132.0);
+                    ui.style_mut().interaction.selectable_labels = false;
+                    if ui
+                        .selectable_label(*page == SettingsPage::Font, "Font")
+                        .clicked()
+                    {
+                        *page = SettingsPage::Font;
+                    }
+                    if ui
+                        .selectable_label(*page == SettingsPage::Hotkeys, "Hotkeys")
+                        .clicked()
+                    {
+                        *page = SettingsPage::Hotkeys;
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.set_min_width(390.0);
+                    match *page {
+                        SettingsPage::Font => {
+                            dialog_caption(ui, "Terminal renderer");
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                ui.label(egui::RichText::new("Size").color(chrome_muted()));
+                                if stepper_button(ui, "-").clicked() {
+                                    actions.push(Action::SetFontSize(cur_size - 1.0));
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("{cur_size:.0} px"))
+                                        .monospace()
+                                        .color(chrome_text()),
+                                );
+                                if stepper_button(ui, "+").clicked() {
+                                    actions.push(Action::SetFontSize(cur_size + 1.0));
+                                }
+                            });
+                            ui.separator();
+                            section_label(ui, "Font family");
+                            let list_width = ui.available_width();
+                            inset_frame().show(ui, |ui| {
+                                ui.set_min_width((list_width - 20.0).max(260.0));
+                                egui::ScrollArea::vertical()
+                                    .max_height(280.0)
+                                    .show(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                cur_family.is_none(),
+                                                "(default monospace)",
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(Action::SetFontFamily(None));
+                                        }
+                                        for fam in families {
+                                            if ui
+                                                .selectable_label(
+                                                    cur_family == Some(fam.as_str()),
+                                                    fam,
+                                                )
+                                                .clicked()
+                                            {
+                                                actions
+                                                    .push(Action::SetFontFamily(Some(fam.clone())));
+                                            }
+                                        }
+                                    });
+                            });
                         }
-                        for fam in families {
-                            if ui
-                                .selectable_label(cur_family == Some(fam.as_str()), fam)
-                                .clicked()
-                            {
-                                actions.push(Action::SetFontFamily(Some(fam.clone())));
-                            }
+                        SettingsPage::Hotkeys => {
+                            dialog_caption(ui, "Keyboard shortcuts");
+                            ui.add_space(2.0);
+                            inset_frame().show(ui, |ui| {
+                                ui.set_min_width(360.0);
+                                for shortcut in SHORTCUTS {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(shortcut.label)
+                                                .color(chrome_text()),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if secondary_button(ui, "Reset").clicked() {
+                                                    actions.push(Action::ResetShortcut(
+                                                        shortcut.action,
+                                                    ));
+                                                }
+                                                let binding =
+                                                    binding_from_config(cfg, shortcut.action);
+                                                let waiting =
+                                                    shortcut_capture == Some(shortcut.action);
+                                                let label = if waiting {
+                                                    "Press shortcut...".to_string()
+                                                } else {
+                                                    shortcut_hint(&binding)
+                                                };
+                                                if ui
+                                                    .button(
+                                                        egui::RichText::new(label)
+                                                            .monospace()
+                                                            .color(if waiting {
+                                                                chrome_accent()
+                                                            } else {
+                                                                chrome_text()
+                                                            }),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    actions.push(Action::CaptureShortcut(
+                                                        shortcut.action,
+                                                    ));
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            });
                         }
-                    });
+                    }
+                });
             });
         });
     if request_close {
@@ -1342,6 +1590,7 @@ fn font_settings_window(
 #[allow(deprecated, clippy::too_many_arguments)]
 fn build_ui(
     ctx: &egui::Context,
+    cfg: &Config,
     ws: &Workspace,
     families: &[String],
     cur_family: Option<&str>,
@@ -1349,7 +1598,9 @@ fn build_ui(
     tab_titles: &[String],
     border_color: egui::Color32,
     pane_padding: f32,
-    show_font_settings: &mut bool,
+    show_settings: &mut bool,
+    settings_page: &mut SettingsPage,
+    shortcut_capture: Option<MenuAction>,
     actions: &mut Vec<Action>,
     leaves: &mut Vec<(PaneId, egui::Rect)>,
     dividers: &mut Vec<egui::Rect>,
@@ -1405,7 +1656,9 @@ fn build_ui(
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let focus_detachable = detachable_panes.contains(&ws.active_tab().focus);
-                        ui.menu_button("☰", |ui| full_menu(ui, actions, None, focus_detachable));
+                        ui.menu_button("☰", |ui| {
+                            full_menu(ui, actions, cfg, None, focus_detachable)
+                        });
                         // Attention-feed bell — present once the feed has latched the bar on. Shows
                         // the waiting count; toggles the overlay.
                         if chrome_latched {
@@ -1442,10 +1695,13 @@ fn build_ui(
             });
     }
 
-    if *show_font_settings {
-        font_settings_window(
+    if *show_settings {
+        settings_window(
             ctx,
-            show_font_settings,
+            cfg,
+            show_settings,
+            settings_page,
+            shortcut_capture,
             families,
             cur_family,
             cur_size,
@@ -1476,7 +1732,7 @@ fn build_ui(
                     egui::Sense::click(),
                 );
                 pane_context_menu(&response, context_menu_pane == Some(id), |ui| {
-                    full_menu(ui, actions, Some(id), detachable_panes.contains(&id))
+                    full_menu(ui, actions, cfg, Some(id), detachable_panes.contains(&id))
                 });
                 if single {
                     leaves.push((id, rect));
@@ -2076,8 +2332,10 @@ struct App {
     /// Pane whose context menu should be opened on the next egui frame. Used for platform
     /// secondary-click paths that egui/winit don't consistently turn into `secondary_clicked`.
     context_menu_pane: Option<PaneId>,
-    /// Whether the floating Font settings window is shown.
-    show_font_settings: bool,
+    /// Whether the floating Settings window is shown.
+    show_settings: bool,
+    settings_page: SettingsPage,
+    shortcut_capture: Option<MenuAction>,
 
     /// Panes whose cached render is stale and must be re-prepared next frame (damage tracking).
     dirty: std::collections::HashSet<PaneId>,
@@ -2168,7 +2426,9 @@ impl App {
             window_title: String::new(),
             menu_open: false,
             context_menu_pane: None,
-            show_font_settings: false,
+            show_settings: false,
+            settings_page: SettingsPage::Font,
+            shortcut_capture: None,
             dirty: std::collections::HashSet::new(),
             visible: std::collections::HashSet::new(),
             last_rect: HashMap::new(),
@@ -3472,6 +3732,88 @@ impl App {
         self.show_connect || matches!(self.auth_prompts.first(), Some(AuthPrompt::Text { .. }))
     }
 
+    fn shortcut_action(&self, ev: &KeyEvent) -> Option<MenuAction> {
+        if ev.state != ElementState::Pressed {
+            return None;
+        }
+        let mods = self.mods.state();
+        let standard_mod_only = if cfg!(target_os = "macos") {
+            mods.super_key() && !mods.control_key()
+        } else {
+            mods.control_key() && !mods.super_key()
+        };
+        if !standard_mod_only || mods.alt_key() {
+            return None;
+        }
+        let key = char_key(ev)?;
+        SHORTCUTS
+            .iter()
+            .find(|s| {
+                let binding = binding_from_config(&self.config, s.action);
+                binding.key.eq_ignore_ascii_case(&key) && binding.shift == mods.shift_key()
+            })
+            .map(|s| s.action)
+    }
+
+    fn capture_binding_from_key(&self, ev: &KeyEvent) -> Option<ShortcutBinding> {
+        if ev.state != ElementState::Pressed {
+            return None;
+        }
+        let mods = self.mods.state();
+        let standard_mod_only = if cfg!(target_os = "macos") {
+            mods.super_key() && !mods.control_key()
+        } else {
+            mods.control_key() && !mods.super_key()
+        };
+        if !standard_mod_only || mods.alt_key() {
+            return None;
+        }
+        Some(ShortcutBinding {
+            key: char_key(ev)?.to_ascii_uppercase(),
+            shift: mods.shift_key(),
+        })
+    }
+
+    fn set_shortcut(&mut self, action: MenuAction, binding: ShortcutBinding) {
+        let id = action_id(action).to_string();
+        if binding == default_binding(action) {
+            self.config.hotkeys.remove(&id);
+        } else {
+            self.config.hotkeys.insert(id, shortcut_hint(&binding));
+        }
+        self.shortcut_capture = None;
+        self.config.save(&self.config_path);
+        self.request_redraw();
+    }
+
+    fn reset_shortcut(&mut self, action: MenuAction) {
+        self.config.hotkeys.remove(action_id(action));
+        if self.shortcut_capture == Some(action) {
+            self.shortcut_capture = None;
+        }
+        self.config.save(&self.config_path);
+        self.request_redraw();
+    }
+
+    fn run_shortcut(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::NewTab => self.new_tab(false),
+            MenuAction::SplitRight => self.split_pane(Split::Cols),
+            MenuAction::SplitDown => self.split_pane(Split::Rows),
+            MenuAction::ClosePane => self.workspace.close_focused(),
+            MenuAction::Connect => {
+                self.show_connect = true;
+            }
+            MenuAction::DetachSession => self.detach_focused_session(),
+            MenuAction::Settings => {
+                self.show_settings = true;
+            }
+        }
+        self.reconcile_terms();
+        self.sync_layouts();
+        self.request_redraw();
+    }
+
     /// SPIKE SCAFFOLDING: auto-connect to a host from `$POTTY_TEST_*` env on startup, to exercise
     /// the remote path before the `+`/menu connect flow exists. To be removed once that lands.
     fn maybe_test_connect(&mut self) {
@@ -3886,7 +4228,25 @@ impl App {
         if self.text_input_active() {
             return;
         }
+        if let Some(action) = self.shortcut_capture {
+            if ev.state != ElementState::Pressed {
+                return;
+            }
+            if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
+                self.shortcut_capture = None;
+                self.request_redraw();
+                return;
+            }
+            if let Some(binding) = self.capture_binding_from_key(ev) {
+                self.set_shortcut(action, binding);
+            }
+            return;
+        }
         if ev.state != ElementState::Pressed || self.terms.is_empty() {
+            return;
+        }
+        if let Some(action) = self.shortcut_action(ev) {
+            self.run_shortcut(action);
             return;
         }
         // Typing keeps the cursor solid and restarts the blink cycle.
@@ -4092,7 +4452,9 @@ impl App {
         let mut actions = Vec::new();
         let mut leaves: Vec<(PaneId, egui::Rect)> = Vec::new();
         let mut dividers: Vec<egui::Rect> = Vec::new();
-        let mut show_font = self.show_font_settings;
+        let mut show_settings = self.show_settings;
+        let mut settings_page = self.settings_page;
+        let shortcut_capture = self.shortcut_capture;
         let b = self.config.border();
         let border_color = egui::Color32::from_rgb(b.r, b.g, b.b);
         let pane_padding = self.config.pane_padding;
@@ -4142,6 +4504,7 @@ impl App {
             self.egui_ctx.run(raw, |ctx| {
                 build_ui(
                     ctx,
+                    &self.config,
                     ws,
                     families,
                     cur_family,
@@ -4149,7 +4512,9 @@ impl App {
                     &tab_titles,
                     border_color,
                     pane_padding,
-                    &mut show_font,
+                    &mut show_settings,
+                    &mut settings_page,
+                    shortcut_capture,
                     &mut actions,
                     &mut leaves,
                     &mut dividers,
@@ -4172,7 +4537,11 @@ impl App {
                 )
             })
         };
-        self.show_font_settings = show_font;
+        self.show_settings = show_settings;
+        self.settings_page = settings_page;
+        if !self.show_settings {
+            self.shortcut_capture = None;
+        }
         // Remember whether a popup/menu is open so the next frame's clicks don't leak through
         // the menu into the terminal underneath.
         // The feed overlay isn't a popup, so OR in whether the pointer is over it — otherwise a
@@ -4182,13 +4551,19 @@ impl App {
             || feed_active
             || connect_progress_active
             || auth_view.is_some()
+            || self.show_settings
             || self.show_connect
             || self.error_msg.is_some();
         for a in actions {
             match a {
                 Action::SetFontFamily(f) => self.set_font_family(f),
                 Action::SetFontSize(s) => self.set_font_size(s),
-                Action::ShowFontSettings => self.show_font_settings = true,
+                Action::ShowSettings => self.show_settings = true,
+                Action::CaptureShortcut(action) => {
+                    self.shortcut_capture = Some(action);
+                    self.request_redraw();
+                }
+                Action::ResetShortcut(action) => self.reset_shortcut(action),
                 Action::JumpToPane(p) => self.jump_to_pane(p),
                 Action::DismissNote(host, session) => {
                     self.pending.remove(&(host, session));
@@ -4689,9 +5064,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                // A menu/popup, the font window, or a divider grab — let egui own this click.
+                // A menu/popup, the settings window, or a divider grab — let egui own this click.
                 if self.menu_open
-                    || self.show_font_settings
+                    || self.show_settings
                     || self.on_divider(self.mouse_px.0, self.mouse_px.1)
                 {
                     return;
@@ -4766,9 +5141,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let focus = self.focus();
                 self.write_pty(focus, text.as_bytes());
             }
-            WindowEvent::MouseWheel { delta, .. }
-                if !self.menu_open && !self.show_font_settings =>
-            {
+            WindowEvent::MouseWheel { delta, .. } if !self.menu_open && !self.show_settings => {
                 // Positive = up / into history. 3 lines per wheel notch; touchpad by pixels.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
