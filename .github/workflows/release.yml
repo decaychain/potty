@@ -141,12 +141,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute version
+      - name: Compute packaging version
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           PKG_VERSION="$VERSION"
-          sed -i '' "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
           ARCH="$(uname -m)"
           {
             echo "VERSION=$VERSION"
@@ -154,7 +153,6 @@ jobs:
             echo "ARCH=$ARCH"
           } >> "$GITHUB_ENV"
           echo "Version=$VERSION  PackageVersion=$PKG_VERSION  Arch=$ARCH"
-          grep '^version' Cargo.toml | head -1
 
       - uses: dtolnay/rust-toolchain@stable
 
