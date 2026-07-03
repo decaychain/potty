@@ -1,7 +1,8 @@
 //! User configuration: font family/size + color scheme, persisted as TOML and hot-reloaded.
 //!
 //! Font family/size are also editable visually (the "Aa" menu writes them back here, so a
-//! visual change survives restart). Colors are file-only. Lives at
+//! visual change survives restart). Colors can be picked from the presets in Settings (also
+//! written back here) or fine-tuned by hand in the file. Lives at
 //! $XDG_CONFIG_HOME/potty/potty.toml (or ~/.config/potty/potty.toml).
 
 use std::collections::BTreeMap;
@@ -69,7 +70,7 @@ pub struct ConnectionProfile {
     pub last_connected: Option<u64>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Colors {
     pub foreground: String,
@@ -82,6 +83,99 @@ pub struct Colors {
     /// The 16 base ANSI colors as `#rrggbb`. Missing/short entries fall back to defaults.
     pub ansi: Vec<String>,
 }
+
+/// A named, hardcoded color scheme selectable in Settings. Applying one overwrites the whole
+/// `[colors]` table; hand-tuning individual entries in the file still works afterwards (the
+/// preset list then just shows nothing selected). Potty's own scheme (`Colors::default()`) is
+/// offered by the UI separately.
+pub struct ColorPreset {
+    pub name: &'static str,
+    foreground: &'static str,
+    background: &'static str,
+    cursor: &'static str,
+    selection: &'static str,
+    border: &'static str,
+    ansi: [&'static str; 16],
+}
+
+impl ColorPreset {
+    pub fn colors(&self) -> Colors {
+        Colors {
+            foreground: self.foreground.into(),
+            background: self.background.into(),
+            cursor: self.cursor.into(),
+            selection: self.selection.into(),
+            border: self.border.into(),
+            ansi: self.ansi.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+}
+
+/// Dark variants of common schemes. ANSI order: the 8 normal then the 8 bright colors,
+/// black red green yellow blue magenta cyan white. Cursor follows the foreground; the border
+/// (focused-pane accent) uses each scheme's signature accent color.
+pub const COLOR_PRESETS: &[ColorPreset] = &[
+    ColorPreset {
+        name: "Adwaita Dark",
+        foreground: "#d0cfcc",
+        background: "#171421",
+        cursor: "#d0cfcc",
+        selection: "#26436e",
+        border: "#51a1ff",
+        ansi: [
+            "#241f31", "#c01c28", "#2ec27e", "#f5c211", "#1e78e4", "#9841bb", "#0ab9dc", "#c0bfbc",
+            "#5e5c64", "#ed333b", "#57e389", "#f8e45c", "#51a1ff", "#c061cb", "#4fd2fd", "#f6f5f4",
+        ],
+    },
+    ColorPreset {
+        name: "Monokai",
+        foreground: "#f8f8f2",
+        background: "#272822",
+        cursor: "#f8f8f2",
+        selection: "#49483e",
+        border: "#f92672",
+        ansi: [
+            "#272822", "#f92672", "#a6e22e", "#e6db74", "#66d9ef", "#ae81ff", "#a1efe4", "#f8f8f2",
+            "#75715e", "#f92672", "#a6e22e", "#e6db74", "#66d9ef", "#ae81ff", "#a1efe4", "#f9f8f5",
+        ],
+    },
+    ColorPreset {
+        name: "Gruvbox Dark",
+        foreground: "#ebdbb2",
+        background: "#282828",
+        cursor: "#ebdbb2",
+        selection: "#504945",
+        border: "#fe8019",
+        ansi: [
+            "#282828", "#cc241d", "#98971a", "#d79921", "#458588", "#b16286", "#689d6a", "#a89984",
+            "#928374", "#fb4934", "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c", "#ebdbb2",
+        ],
+    },
+    ColorPreset {
+        name: "Solarized Dark",
+        foreground: "#839496",
+        background: "#002b36",
+        cursor: "#839496",
+        selection: "#073642",
+        border: "#268bd2",
+        ansi: [
+            "#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
+            "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3",
+        ],
+    },
+    ColorPreset {
+        name: "One Dark",
+        foreground: "#abb2bf",
+        background: "#282c34",
+        cursor: "#abb2bf",
+        selection: "#3e4451",
+        border: "#61afef",
+        ansi: [
+            "#282c34", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+            "#5c6370", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#ffffff",
+        ],
+    },
+];
 
 impl Default for Config {
     fn default() -> Self {
@@ -220,7 +314,7 @@ pub fn config_path() -> PathBuf {
     base.join("potty").join("potty.toml")
 }
 
-fn parse_hex(s: &str) -> Option<Rgb> {
+pub(crate) fn parse_hex(s: &str) -> Option<Rgb> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 {
         return None;

@@ -445,6 +445,8 @@ enum Action {
     SetRatio(u64, f32),
     SetFontFamily(Option<String>),
     SetFontSize(f32),
+    /// Replace the whole color scheme (a Settings preset, or the defaults).
+    SetColors(config::Colors),
     ShowSettings,
     CaptureShortcut(MenuAction),
     ResetShortcut(MenuAction),
@@ -549,6 +551,7 @@ fn apply(ws: &mut Workspace, action: Action) {
         // Handled in the redraw action loop (they touch App, not just the workspace).
         Action::SetFontFamily(_)
         | Action::SetFontSize(_)
+        | Action::SetColors(_)
         | Action::ShowSettings
         | Action::CaptureShortcut(_)
         | Action::ResetShortcut(_)
@@ -630,6 +633,7 @@ enum MenuAction {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
     Font,
+    Colors,
     Hotkeys,
 }
 
@@ -1431,6 +1435,35 @@ fn pane_context_menu(
     popup.show(add_contents);
 }
 
+/// One row of the color-scheme list: a swatch strip (background, foreground, then the six
+/// colorful normal ANSI slots) and the scheme name; clicking the name applies the scheme.
+fn scheme_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    scheme: config::Colors,
+    current: &config::Colors,
+    actions: &mut Vec<Action>,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for hex in [&scheme.background, &scheme.foreground]
+            .into_iter()
+            .chain(scheme.ansi.iter().skip(1).take(6))
+        {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            if let Some(c) = config::parse_hex(hex) {
+                ui.painter()
+                    .rect_filled(rect, 2, egui::Color32::from_rgb(c.r, c.g, c.b));
+            }
+        }
+        ui.add_space(4.0);
+        let selected = *current == scheme;
+        if ui.selectable_label(selected, name).clicked() && !selected {
+            actions.push(Action::SetColors(scheme));
+        }
+    });
+}
+
 /// The floating Settings window: terminal font size/family plus app hotkeys. Visibility is tied to
 /// `open` (its close button flips it off).
 // too_many_arguments: like `build_ui`, the parameters are the dialog's view model.
@@ -1466,6 +1499,12 @@ fn settings_window(
                         .clicked()
                     {
                         *page = SettingsPage::Font;
+                    }
+                    if ui
+                        .selectable_label(*page == SettingsPage::Colors, "Colors")
+                        .clicked()
+                    {
+                        *page = SettingsPage::Colors;
                     }
                     if ui
                         .selectable_label(*page == SettingsPage::Hotkeys, "Hotkeys")
@@ -1532,6 +1571,30 @@ fn settings_window(
                                             }
                                         }
                                     });
+                            });
+                        }
+                        SettingsPage::Colors => {
+                            dialog_caption(ui, "Color scheme");
+                            ui.add_space(2.0);
+                            let list_width = ui.available_width();
+                            inset_frame().show(ui, |ui| {
+                                ui.set_min_width((list_width - 20.0).max(260.0));
+                                scheme_row(
+                                    ui,
+                                    "(default)",
+                                    config::Colors::default(),
+                                    &cfg.colors,
+                                    actions,
+                                );
+                                for preset in config::COLOR_PRESETS {
+                                    scheme_row(
+                                        ui,
+                                        preset.name,
+                                        preset.colors(),
+                                        &cfg.colors,
+                                        actions,
+                                    );
+                                }
                             });
                         }
                         SettingsPage::Hotkeys => {
@@ -3914,6 +3977,13 @@ impl App {
         self.apply_config(c);
     }
 
+    fn set_colors(&mut self, colors: config::Colors) {
+        let mut c = self.config.clone();
+        c.colors = colors;
+        c.save(&self.config_path);
+        self.apply_config(c);
+    }
+
     /// Write raw bytes to a pane: its local PTY, or the remote session as an input `Data` frame.
     fn write_pty(&mut self, id: PaneId, bytes: &[u8]) {
         if let Some(t) = self.terms.get_mut(&id) {
@@ -4575,6 +4645,7 @@ impl App {
         for a in actions {
             match a {
                 Action::SetFontFamily(f) => self.set_font_family(f),
+                Action::SetColors(c) => self.set_colors(c),
                 Action::SetFontSize(s) => self.set_font_size(s),
                 Action::ShowSettings => self.show_settings = true,
                 Action::CaptureShortcut(action) => {
