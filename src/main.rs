@@ -1433,6 +1433,8 @@ fn pane_context_menu(
 
 /// The floating Settings window: terminal font size/family plus app hotkeys. Visibility is tied to
 /// `open` (its close button flips it off).
+// too_many_arguments: like `build_ui`, the parameters are the dialog's view model.
+#[allow(clippy::too_many_arguments)]
 fn settings_window(
     ctx: &egui::Context,
     cfg: &Config,
@@ -1475,6 +1477,12 @@ fn settings_window(
                 ui.separator();
                 ui.vertical(|ui| {
                     ui.set_min_width(390.0);
+                    // Both pages lay out in the same fixed-height area so the window keeps one
+                    // height across tabs. Without this the auto-sized window gets stuck small:
+                    // the font list shrinks to the height remembered from the shorter Hotkeys
+                    // page, and the window then re-sizes to the shrunk list.
+                    ui.set_min_height(380.0);
+                    ui.set_max_height(380.0);
                     match *page {
                         SettingsPage::Font => {
                             dialog_caption(ui, "Terminal renderer");
@@ -1500,7 +1508,7 @@ fn settings_window(
                             inset_frame().show(ui, |ui| {
                                 ui.set_min_width((list_width - 20.0).max(260.0));
                                 egui::ScrollArea::vertical()
-                                    .max_height(280.0)
+                                    .auto_shrink([true, false])
                                     .show(ui, |ui| {
                                         if ui
                                             .selectable_label(
@@ -4240,6 +4248,16 @@ impl App {
             if let Some(binding) = self.capture_binding_from_key(ev) {
                 self.set_shortcut(action, binding);
             }
+            return;
+        }
+        // Esc closes the Settings window (during shortcut capture, the branch above eats it
+        // to cancel just the capture). Other keys keep going to the focused pane.
+        if self.show_settings
+            && ev.state == ElementState::Pressed
+            && matches!(ev.logical_key, Key::Named(NamedKey::Escape))
+        {
+            self.show_settings = false;
+            self.request_redraw();
             return;
         }
         if ev.state != ElementState::Pressed || self.terms.is_empty() {
