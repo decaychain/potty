@@ -573,8 +573,12 @@ fn macos_control_click(button: MouseButton, control: bool) -> bool {
     cfg!(target_os = "macos") && matches!(button, MouseButton::Left) && control
 }
 
-fn pane_context_click(button: MouseButton, control: bool) -> bool {
-    matches!(button, MouseButton::Right) || macos_control_click(button, control)
+/// macOS pane context clicks use Potty's deferred popup path. They must be withheld from egui's
+/// native context-menu handling, otherwise one physical right-click opens the same popup through
+/// both paths in the same frame.
+fn macos_pane_context_click(button: MouseButton, control: bool) -> bool {
+    cfg!(target_os = "macos")
+        && (matches!(button, MouseButton::Right) || macos_control_click(button, control))
 }
 
 fn terminal_mouse_claims_context_click(button: MouseButton, report: bool, shift: bool) -> bool {
@@ -1890,7 +1894,21 @@ impl WindowState {
         panes: &[(egui::Rect, u64)],
     ) {
         let (sw, sh) = (self.surface_config.width, self.surface_config.height);
-        let Some(frame) = self.acquire() else { return };
+        // Texture deltas are stateful: the first font-atlas delta allocates the texture, and later
+        // frames usually contain only partial updates. Apply them even when the surface is
+        // temporarily unavailable (common while macOS is occluding/configuring a window), or an
+        // early return would discard the allocation and the next partial update would panic in
+        // egui-wgpu with "texture has not been allocated yet".
+        for (id, delta) in &textures_delta.set {
+            egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let Some(frame) = self.acquire() else {
+            // This frame was not painted, so its no-longer-needed textures can be released now.
+            for id in &textures_delta.free {
+                egui_renderer.free_texture(id);
+            }
+            return;
+        };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
 
         // Pass 1: one submit per pane, each drawing from its cached buffers (already prepared
@@ -1969,9 +1987,6 @@ impl WindowState {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("egui"),
             });
-        for (id, delta) in &textures_delta.set {
-            egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
-        }
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [sw, sh],
             pixels_per_point: ppp,
@@ -4604,7 +4619,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .is_some_and(|id| {
                         let (report, ..) = self.mouse_modes(id);
                         terminal_mouse_claims_context_click(*button, report, shift)
-                            || macos_control_click(*button, control)
+                            || macos_pane_context_click(*button, control)
                     })
             }
             _ => false,
@@ -4688,7 +4703,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let (report, sgr, ..) = self.mouse_modes(id);
                 let pressed = state == ElementState::Pressed;
                 let control = self.mods.state().control_key();
-                let context_click = pane_context_click(button, control);
+                let context_click = macos_pane_context_click(button, control);
                 if context_click && !terminal_mouse_claims_context_click(button, report, shift) {
                     if pressed {
                         self.workspace.focus(id);
@@ -4856,7 +4871,7 @@ fn main() {
 mod tests {
     use super::{
         csi_tilde, cursor_key, ime_commit_needs_text_fallback, macos_control_click,
-        pane_context_click, stale_terminal_ids, terminal_mouse_claims_context_click,
+        macos_pane_context_click, stale_terminal_ids, terminal_mouse_claims_context_click,
         terminal_should_receive_ime_commit, xterm_modifier,
     };
     use std::collections::HashSet;
@@ -4873,15 +4888,18 @@ mod tests {
     }
 
     #[test]
-    fn pane_context_clicks_include_macos_control_click() {
-        assert!(pane_context_click(MouseButton::Right, false));
-        assert!(!pane_context_click(MouseButton::Left, false));
+    fn macos_pane_context_clicks_include_secondary_and_control_click() {
+        assert_eq!(
+            macos_pane_context_click(MouseButton::Right, false),
+            cfg!(target_os = "macos")
+        );
+        assert!(!macos_pane_context_click(MouseButton::Left, false));
         assert_eq!(
             macos_control_click(MouseButton::Left, true),
             cfg!(target_os = "macos")
         );
         assert_eq!(
-            pane_context_click(MouseButton::Left, true),
+            macos_pane_context_click(MouseButton::Left, true),
             cfg!(target_os = "macos")
         );
     }
