@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh::ChannelMsg;
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
@@ -66,7 +67,16 @@ pub trait Authenticator: Send + Sync {
     fn password(&self, _user: &str, _host: &str) -> Option<String> {
         None
     }
+    /// Whether a prompt is currently on screen waiting for the user. While true, the connect
+    /// timeout clock is paused — a host-key dialog can legitimately stay open for minutes.
+    fn prompt_in_flight(&self) -> bool {
+        false
+    }
 }
+
+/// Budget for establishing one SSH connection (TCP + banner + key exchange); see
+/// [`SshConfig::connect_timeout`].
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Where and how to connect.
 pub struct SshConfig {
@@ -84,6 +94,12 @@ pub struct SshConfig {
     pub use_agent: bool,
     /// Explicit agent socket; `None` → `$SSH_AUTH_SOCK` (Unix) / Pageant (Windows).
     pub agent_sock: Option<PathBuf>,
+    /// Budget for establishing one SSH connection (TCP + banner + key exchange); time the user
+    /// spends in authenticator prompts doesn't count. The auth ladder makes a fresh connection
+    /// per method group, and servers that rate-limit after failed logins (fail2ban, sshd
+    /// `PerSourcePenalties`) often silently drop the later ones — without a budget, a connect
+    /// blocks forever and the GUI shows neither an error nor a tab.
+    pub connect_timeout: Duration,
 }
 
 /// A live remote session — just the SSH handle. Keep it alive while the session is in use; dropping
@@ -113,6 +129,24 @@ fn io_err(e: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+/// TEMPORARY DIAGNOSTICS for the silent-connect bug: `POTTY_SSH_DEBUG=1 potty` prints
+/// timestamped connect/auth/channel steps to stderr (never secrets). Grep for `[potty-ssh]`.
+pub fn sshdbg(msg: impl AsRef<str>) {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static ON: OnceLock<bool> = OnceLock::new();
+    static T0: OnceLock<Instant> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("POTTY_SSH_DEBUG").is_some()) {
+        return;
+    }
+    let t0 = *T0.get_or_init(Instant::now);
+    eprintln!(
+        "[potty-ssh {:>9.3}s] {}",
+        t0.elapsed().as_secs_f64(),
+        msg.as_ref()
+    );
+}
+
 /// Verifies host keys against known_hosts, prompting through the [`Authenticator`] for unknown or
 /// changed keys (and recording an accepted unknown key).
 struct ClientHandler {
@@ -131,13 +165,21 @@ impl client::Handler for ClientHandler {
             None => check_known_hosts(&self.host, self.port, key),
         };
         let status = match known {
-            Ok(true) => return Ok(true), // recognised and matches
+            Ok(true) => {
+                sshdbg(format!("{}: host key recognised", self.host));
+                return Ok(true); // recognised and matches
+            }
             Ok(false) => HostKeyStatus::Unknown,
             Err(russh::keys::Error::KeyChanged { .. }) => HostKeyStatus::Changed,
             Err(_) => HostKeyStatus::Unknown, // missing/unreadable known_hosts — let the user decide
         };
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        sshdbg(format!(
+            "{}: host key {status:?} ({fingerprint}) — asking user",
+            self.host
+        ));
         if self.auth.accept_host_key(&self.host, &fingerprint, status) {
+            sshdbg(format!("{}: host key accepted by user", self.host));
             // Record a newly-accepted key so we don't ask again. Best-effort.
             let _ = match &self.known_hosts {
                 Some(p) => {
@@ -147,6 +189,7 @@ impl client::Handler for ClientHandler {
             };
             Ok(true)
         } else {
+            sshdbg(format!("{}: host key REJECTED by user", self.host));
             Ok(false)
         }
     }
@@ -166,6 +209,7 @@ pub async fn connect_and_exec(
     let channel = session.channel_open_session().await.map_err(io_err)?;
     send_env_requests(&channel, &cfg.env).await;
     let command = command_with_env(command, &cfg.env);
+    sshdbg(format!("exec: {command}"));
     channel.exec(true, command).await.map_err(io_err)?;
     let (mut read_half, write_half) = channel.split();
 
@@ -258,6 +302,7 @@ pub async fn shell_session(
                 // panes to restore it will open a fresh one (an `Open`). There is exactly one
                 // client on a plain shell, so it holds focus by construction.
                 Frame::Control(Control::Hello { .. }) => {
+                    sshdbg("shell coordinator: Hello received — greeting client");
                     let _ = in_tx
                         .send(Frame::Control(Control::Welcome {
                             version: crate::proto::PROTOCOL_VERSION,
@@ -273,8 +318,10 @@ pub async fn shell_session(
                 Frame::Control(Control::Open {
                     pane, cols, rows, ..
                 }) => {
+                    sshdbg(format!("pane {pane}: opening shell channel ({cols}x{rows})"));
                     match open_shell_channel(&handle, &env, cols, rows).await {
                         Ok(channel) => {
+                            sshdbg(format!("pane {pane}: shell channel open"));
                             let (mut read, write) = channel.split();
                             panes.insert(pane, write);
                             let _ = in_tx.send(Frame::Control(Control::Opened { pane })).await;
@@ -292,10 +339,12 @@ pub async fn shell_session(
                                         return;
                                     }
                                 }
+                                sshdbg(format!("pane {pane}: channel closed — shell exited"));
                                 let _ = to_gui.send(Frame::Control(Control::Exited { pane })).await;
                             });
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            sshdbg(format!("pane {pane}: OPEN SHELL CHANNEL FAILED: {e}"));
                             let _ = in_tx.send(Frame::Control(Control::Exited { pane })).await;
                         }
                     }
@@ -342,13 +391,21 @@ async fn open_shell_channel(
     cols: u16,
     rows: u16,
 ) -> std::io::Result<russh::Channel<client::Msg>> {
-    let channel = handle.channel_open_session().await.map_err(io_err)?;
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| io_err(format!("channel open: {e}")))?;
+    sshdbg("shell channel: session channel opened, requesting pty");
     send_env_requests(&channel, env).await;
     channel
         .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await
-        .map_err(io_err)?;
-    channel.request_shell(true).await.map_err(io_err)?;
+        .map_err(|e| io_err(format!("pty request: {e}")))?;
+    sshdbg("shell channel: pty requested, starting shell");
+    channel
+        .request_shell(true)
+        .await
+        .map_err(|e| io_err(format!("shell request: {e}")))?;
     Ok(channel)
 }
 
@@ -389,6 +446,12 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// Open a fresh SSH connection (its own `MaxAuthTries` budget) and verify the host key.
+///
+/// The whole attempt runs under [`SshConfig::connect_timeout`]: russh's `connect` is a raw
+/// `TcpStream::connect` plus an unbounded banner read, so a server that accepts TCP but never
+/// speaks (how fail2ban's DROP looks to the client) would otherwise hang the ladder forever.
+/// The clock only advances while no authenticator prompt is on screen, so a host-key dialog
+/// left open doesn't abort the attempt.
 async fn connect_session(
     cfg: &SshConfig,
     auth: &Arc<dyn Authenticator>,
@@ -400,9 +463,45 @@ async fn connect_session(
         auth: auth.clone(),
     };
     let config = Arc::new(client::Config::default());
-    client::connect(config, (cfg.host.as_str(), cfg.port), handler)
-        .await
-        .map_err(io_err)
+    sshdbg(format!(
+        "{}:{}: opening connection (timeout {}s)",
+        cfg.host,
+        cfg.port,
+        cfg.connect_timeout.as_secs()
+    ));
+    let connect = client::connect(config, (cfg.host.as_str(), cfg.port), handler);
+    tokio::pin!(connect);
+    const TICK: Duration = Duration::from_millis(100);
+    let mut left = cfg.connect_timeout;
+    loop {
+        match tokio::time::timeout(TICK, &mut connect).await {
+            Ok(r) => {
+                match &r {
+                    Ok(_) => sshdbg(format!("{}:{}: connected, handshake done", cfg.host, cfg.port)),
+                    Err(e) => sshdbg(format!("{}:{}: connect FAILED: {e}", cfg.host, cfg.port)),
+                }
+                return r.map_err(io_err);
+            }
+            Err(_) if auth.prompt_in_flight() => {} // user is reading a dialog — clock paused
+            Err(_) => {
+                left = left.saturating_sub(TICK);
+                if left.is_zero() {
+                    sshdbg(format!("{}:{}: connect TIMED OUT", cfg.host, cfg.port));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "{}:{} did not respond within {}s — after failed authentication \
+                             attempts, servers often rate-limit new connections (fail2ban, sshd \
+                             penalties); waiting a few minutes usually clears it",
+                            cfg.host,
+                            cfg.port,
+                            cfg.connect_timeout.as_secs()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Authenticate, returning the authenticated session. **Each method group runs on its own fresh
@@ -426,6 +525,7 @@ async fn authenticate(
         #[cfg(windows)]
         let agent = AgentClient::connect_pageant().await.ok();
         if let Some(agent) = agent {
+            sshdbg("auth rung 1: ssh-agent");
             let mut session = connect_session(cfg, auth).await?;
             let rsa_hash = session
                 .best_supported_rsa_hash()
@@ -433,14 +533,24 @@ async fn authenticate(
                 .map_err(io_err)?
                 .flatten();
             // Ok(false)/Err both mean "agent didn't get us in" → reconnect for the next group.
-            if let Ok(true) = agent_auth(&mut session, &cfg.user, agent, rsa_hash).await {
-                return Ok(session);
+            match agent_auth(&mut session, &cfg.user, agent, rsa_hash).await {
+                Ok(true) => {
+                    sshdbg("agent: authenticated");
+                    return Ok(session);
+                }
+                Ok(false) => sshdbg("agent: no key accepted"),
+                Err(Disconnected) => {
+                    sshdbg("agent: server DISCONNECTED mid-auth (attempt cap?)")
+                }
             }
+        } else {
+            sshdbg("auth rung 1: no ssh-agent reachable — skipping");
         }
     }
 
     // 2. Key files.
     if !cfg.keys.is_empty() {
+        sshdbg(format!("auth rung 2: {} key file(s)", cfg.keys.len()));
         let mut session = connect_session(cfg, auth).await?;
         let rsa_hash = session
             .best_supported_rsa_hash()
@@ -449,30 +559,45 @@ async fn authenticate(
             .flatten();
         for key_path in &cfg.keys {
             if try_key(&mut session, &cfg.user, key_path, auth, rsa_hash).await {
+                sshdbg(format!("key file {}: authenticated", key_path.display()));
                 return Ok(session);
             }
+            sshdbg(format!("key file {}: not accepted", key_path.display()));
         }
     }
 
     // 3. Keyboard-interactive (PAM passwords, OTP, SSSD fallback).
     {
+        sshdbg("auth rung 3: keyboard-interactive");
         let mut session = connect_session(cfg, auth).await?;
         if try_keyboard_interactive(&mut session, &cfg.user, auth)
             .await
             .unwrap_or(false)
         {
+            sshdbg("keyboard-interactive: authenticated");
             return Ok(session);
         }
+        sshdbg("keyboard-interactive: not accepted");
     }
 
     // 4. Plain password.
+    sshdbg("auth rung 4: password — prompting user");
     if let Some(pw) = auth.password(&cfg.user, &cfg.host) {
+        sshdbg("password prompt answered — reconnecting");
         let mut session = connect_session(cfg, auth).await?;
-        if matches!(session.authenticate_password(&cfg.user, pw).await, Ok(r) if r.success()) {
-            return Ok(session);
+        match session.authenticate_password(&cfg.user, pw).await {
+            Ok(r) if r.success() => {
+                sshdbg("password: authenticated");
+                return Ok(session);
+            }
+            Ok(r) => sshdbg(format!("password: rejected ({r:?})")),
+            Err(e) => sshdbg(format!("password: transport error: {e}")),
         }
+    } else {
+        sshdbg("password prompt cancelled");
     }
 
+    sshdbg("auth: ALL METHODS FAILED");
     Err(std::io::Error::other("all authentication methods failed"))
 }
 
@@ -500,18 +625,31 @@ where
     R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Ok(identities) = agent.request_identities().await else {
+        sshdbg("agent: request_identities failed");
         return Ok(false);
     };
+    sshdbg(format!("agent: {} identities", identities.len()));
     for id in identities {
         // Certificates are skipped for now; plain keys cover the common case.
         if let AgentIdentity::PublicKey { key, .. } = id {
+            let label = format!(
+                "agent key {} ({})",
+                key.fingerprint(HashAlg::Sha256),
+                key.comment()
+            );
             match session
                 .authenticate_publickey_with(user, key, rsa_hash, &mut agent)
                 .await
             {
-                Ok(result) if result.success() => return Ok(true),
-                Ok(_) => {}                         // rejected — try the next identity
-                Err(_) => return Err(Disconnected), // transport/session gone
+                Ok(result) if result.success() => {
+                    sshdbg(format!("{label}: ACCEPTED"));
+                    return Ok(true);
+                }
+                Ok(r) => sshdbg(format!("{label}: rejected ({r:?})")), // try the next identity
+                Err(e) => {
+                    sshdbg(format!("{label}: transport error: {e}"));
+                    return Err(Disconnected); // transport/session gone
+                }
             }
         }
     }
@@ -550,21 +688,34 @@ async fn try_keyboard_interactive(
     user: &str,
     auth: &Arc<dyn Authenticator>,
 ) -> std::io::Result<bool> {
-    let Ok(mut response) = session
+    let response = match session
         .authenticate_keyboard_interactive_start(user, None::<String>)
         .await
-    else {
-        return Ok(false); // method unavailable or session gone — let the ladder finish cleanly
+    {
+        Ok(r) => r,
+        Err(e) => {
+            sshdbg(format!("keyboard-interactive: start failed: {e}"));
+            return Ok(false); // method unavailable or session gone — let the ladder finish cleanly
+        }
     };
+    let mut response = response;
     loop {
         match response {
             KeyboardInteractiveAuthResponse::Success => return Ok(true),
-            KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
+            KeyboardInteractiveAuthResponse::Failure { .. } => {
+                sshdbg("keyboard-interactive: server says failure");
+                return Ok(false);
+            }
             KeyboardInteractiveAuthResponse::InfoRequest {
                 name,
                 instructions,
                 prompts,
             } => {
+                sshdbg(format!(
+                    "keyboard-interactive: info request name={name:?} ({} prompt(s): {:?})",
+                    prompts.len(),
+                    prompts.iter().map(|p| &p.prompt).collect::<Vec<_>>()
+                ));
                 let infos: Vec<PromptInfo> = prompts
                     .into_iter()
                     .map(|p| PromptInfo {
@@ -573,6 +724,7 @@ async fn try_keyboard_interactive(
                     })
                     .collect();
                 let Some(answers) = auth.answer(&name, &instructions, &infos) else {
+                    sshdbg("keyboard-interactive: prompt cancelled");
                     return Ok(false);
                 };
                 response = session

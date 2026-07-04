@@ -266,6 +266,9 @@ enum AuthPrompt {
 /// user answers. Safe because each connection runs on its own thread (see `connect_remote`).
 struct GuiAuth {
     proxy: EventLoopProxy<UserEvent>,
+    /// True while a prompt sent to the UI is awaiting its answer — pauses the connect timeout
+    /// (see `Authenticator::prompt_in_flight`) so a dialog left open doesn't abort the connect.
+    prompting: std::sync::atomic::AtomicBool,
 }
 
 impl remote::Authenticator for GuiAuth {
@@ -285,7 +288,10 @@ impl remote::Authenticator for GuiAuth {
         if self.proxy.send_event(UserEvent::Auth(ask)).is_err() {
             return false;
         }
-        rx.recv().unwrap_or(false)
+        self.prompting.store(true, std::sync::atomic::Ordering::Relaxed);
+        let answer = rx.recv().unwrap_or(false);
+        self.prompting.store(false, std::sync::atomic::Ordering::Relaxed);
+        answer
     }
 
     fn key_passphrase(&self, path: &str) -> Option<String> {
@@ -317,9 +323,20 @@ impl remote::Authenticator for GuiAuth {
         let fields = prompts.iter().map(|p| (p.prompt.clone(), p.echo)).collect();
         self.text_prompt(title.to_string(), fields)
     }
+
+    fn prompt_in_flight(&self) -> bool {
+        self.prompting.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl GuiAuth {
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self {
+            proxy,
+            prompting: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
     /// Send a text prompt to the UI and block the connection thread until the user answers.
     fn text_prompt(&self, title: String, fields: Vec<(String, bool)>) -> Option<Vec<String>> {
         let (reply, rx) = std::sync::mpsc::channel();
@@ -331,7 +348,10 @@ impl GuiAuth {
         if self.proxy.send_event(UserEvent::Auth(ask)).is_err() {
             return None;
         }
-        rx.recv().unwrap_or(None)
+        self.prompting.store(true, std::sync::atomic::Ordering::Relaxed);
+        let answer = rx.recv().unwrap_or(None);
+        self.prompting.store(false, std::sync::atomic::Ordering::Relaxed);
+        answer
     }
 }
 
@@ -3079,6 +3099,10 @@ impl App {
                 }
             };
             rt.block_on(async move {
+                remote::sshdbg(format!(
+                    "gui: connecting to {}:{} (potty-session: {use_session})",
+                    cfg.host, cfg.port
+                ));
                 let result = if use_session {
                     remote::connect_and_exec(&cfg, auth, &command).await
                 } else {
@@ -3086,6 +3110,7 @@ impl App {
                 };
                 match result {
                     Ok((session, outbound, mut rx)) => {
+                        remote::sshdbg("gui: transport ready — handing to UI thread");
                         // Hand the sole outbound `Sender` to the UI thread. Once it (and the per-pane
                         // clones) drop — the connection's last pane closed — the writer signals EOF
                         // and the remote tears down; this loop then ends as the channel closes.
@@ -3106,10 +3131,16 @@ impl App {
                         let mut greeted = false;
                         while let Some(frame) = rx.recv().await {
                             greeted |= matches!(frame, Frame::Control(Control::Welcome { .. }));
+                            if matches!(frame, Frame::Control(_)) {
+                                remote::sshdbg(format!("gui: recv {frame:?}"));
+                            }
                             if proxy.send_event(UserEvent::RemoteFrame(conn, frame)).is_err() {
                                 break;
                             }
                         }
+                        remote::sshdbg(format!(
+                            "gui: frame stream ended (greeted: {greeted})"
+                        ));
                         if !greeted {
                             let detail = session.stderr();
                             let msg = if detail.is_empty() {
@@ -3132,6 +3163,7 @@ impl App {
                         drop(session); // keep the SSH session alive until the stream ends
                     }
                     Err(e) => {
+                        remote::sshdbg(format!("gui: connect failed: {e}"));
                         let _ = proxy.send_event(UserEvent::RemoteError {
                             conn: Some(conn),
                             msg: e.to_string(),
@@ -3152,6 +3184,9 @@ impl App {
         outbound: tokio::sync::mpsc::Sender<Frame>,
         ephemeral: bool,
     ) {
+        remote::sshdbg(format!(
+            "gui: RemoteConnected (ephemeral: {ephemeral}) — sending Hello"
+        ));
         let _ = outbound.try_send(Frame::Control(Control::Hello {
             version: proto::PROTOCOL_VERSION,
         }));
@@ -3194,6 +3229,9 @@ impl App {
         open: bool,
         cwd_from: Option<u64>,
     ) {
+        remote::sshdbg(format!(
+            "gui: wiring pane local {local} ↔ remote {remote_id} (open: {open})"
+        ));
         let (label, outbound) = match self.connections.get_mut(&conn) {
             Some(c) => {
                 c.routes.insert(remote_id, local);
@@ -3403,6 +3441,7 @@ impl App {
             }
             // Restore burst done: place the restored panes (by layout), or open a fresh pane.
             Frame::Control(Control::Ready) => {
+                remote::sshdbg("gui: Ready — placing panes / opening a fresh one");
                 self.finish_restore(conn);
                 if let Some(c) = self.connections.get_mut(&conn) {
                     c.ready = true;
@@ -3418,6 +3457,9 @@ impl App {
                     .get(&conn)
                     .and_then(|c| c.routes.get(&remote_id))
                     .copied();
+                remote::sshdbg(format!(
+                    "gui: remote pane {remote_id} exited — closing local pane {local:?}"
+                ));
                 if let Some(local) = local {
                     self.close_pane(event_loop, local);
                 }
@@ -3490,14 +3532,17 @@ impl App {
         }
     }
 
-    /// Defensive invariant for persistent remotes: once the handshake reaches Ready, the connection
-    /// must have at least one local tab. This covers a genuinely fresh daemon, an empty daemon after
-    /// all panes died while detached, and stale/empty replayed layouts.
+    /// Once the handshake reaches Ready, the connection must have at least one local tab. For
+    /// persistent remotes this covers a genuinely fresh daemon, an empty daemon after all panes
+    /// died while detached, and stale/empty replayed layouts. For ephemeral (plain-shell)
+    /// connections it opens the one and only pane — they always arrive at Ready with nothing
+    /// restored, so excluding them here (as 97c8847 did) means the connect finishes into thin
+    /// air: no pane, no tab, no error.
     fn ensure_remote_connection_has_tab(&mut self, conn: ConnId) {
         let Some(c) = self.connections.get(&conn) else {
             return;
         };
-        if c.ephemeral || !c.ready {
+        if !c.ready {
             return;
         }
         let owns_tab = self.workspace.tabs.iter().any(|tab| {
@@ -3795,10 +3840,9 @@ impl App {
             known_hosts: None,
             use_agent: true,
             agent_sock: None,
+            connect_timeout: remote::DEFAULT_CONNECT_TIMEOUT,
         };
-        let auth = Arc::new(GuiAuth {
-            proxy: self.proxy.clone(),
-        });
+        let auth = Arc::new(GuiAuth::new(self.proxy.clone()));
         self.connect_remote(cfg, auth, command, display_name, self.connect_use_session);
         self.show_connect = false;
         self.connect_host.clear();
@@ -3919,14 +3963,13 @@ impl App {
             // throwaway sshd (which can exhaust MaxAuthTries before the test key is tried).
             use_agent: std::env::var("POTTY_TEST_AGENT").is_ok(),
             agent_sock: None,
+            connect_timeout: remote::DEFAULT_CONNECT_TIMEOUT,
         };
         let command =
             std::env::var("POTTY_TEST_SESSION_BIN").unwrap_or_else(|_| "potty-session".into());
         self.connect_remote(
             cfg,
-            Arc::new(GuiAuth {
-                proxy: self.proxy.clone(),
-            }),
+            Arc::new(GuiAuth::new(self.proxy.clone())),
             command,
             None,
             true,
@@ -5038,6 +5081,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::RemoteError { conn, msg } => {
+                remote::sshdbg(format!("gui: showing error dialog: {msg}"));
                 // Drop a registered-but-paneless connection (a handshake that never completed), so
                 // it doesn't linger in the map.
                 if let Some(conn) = conn {

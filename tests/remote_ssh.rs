@@ -199,6 +199,7 @@ fn config(
         known_hosts: Some(sshd.dir.join("known_hosts")),
         use_agent,
         agent_sock,
+        connect_timeout: Duration::from_secs(20),
     }
 }
 
@@ -707,6 +708,152 @@ async fn plain_shell_receives_configured_env_when_server_accepts_it() {
         b"ENV=<plain-env-ok>",
     )
     .await;
+}
+
+/// Reproduction for "agent auth fails → password fallback → nothing happens": the whole auth
+/// ladder must terminate — reaching the password prompt and then failing loudly — never hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_agent_auth_falls_back_to_password_and_errors() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let Some(sshd) = start_sshd() else { return };
+    let Some(user) = user() else { return };
+    let (Some(ssh_agent), Some(ssh_add), Some(keygen_bin)) = (
+        which(&["/usr/bin/ssh-agent"]),
+        which(&["/usr/bin/ssh-add"]),
+        which(&["/usr/bin/ssh-keygen", "/bin/ssh-keygen"]),
+    ) else {
+        eprintln!("skipping: ssh-agent/ssh-add/ssh-keygen unavailable");
+        return;
+    };
+
+    // An agent holding only a key the server does NOT accept.
+    let wrong_key = sshd.dir.join("wrongkey");
+    if !keygen(&keygen_bin, &wrong_key) {
+        return;
+    }
+    let sock = sshd.dir.join("agent.sock");
+    let agent = Command::new(&ssh_agent)
+        .args(["-D", "-a"])
+        .arg(&sock)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn ssh-agent");
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _guard = Kill(agent);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !sock.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let added = Command::new(&ssh_add)
+        .arg(&wrong_key)
+        .env("SSH_AUTH_SOCK", &sock)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !added {
+        eprintln!("skipping: ssh-add failed");
+        return;
+    }
+
+    /// Accepts host keys and answers every text prompt, recording what was asked.
+    struct ScriptedAuth {
+        password_calls: AtomicUsize,
+        prompts: Mutex<Vec<String>>,
+    }
+    impl Authenticator for ScriptedAuth {
+        fn accept_host_key(&self, _h: &str, _f: &str, _s: HostKeyStatus) -> bool {
+            true
+        }
+        fn password(&self, _user: &str, _host: &str) -> Option<String> {
+            self.password_calls.fetch_add(1, Ordering::SeqCst);
+            Some("definitely-wrong".into())
+        }
+        fn answer(
+            &self,
+            name: &str,
+            _instructions: &str,
+            prompts: &[potty::remote::PromptInfo],
+        ) -> Option<Vec<String>> {
+            self.prompts.lock().unwrap().push(format!(
+                "{name}: {:?}",
+                prompts.iter().map(|p| p.prompt.clone()).collect::<Vec<_>>()
+            ));
+            Some(vec!["definitely-wrong".into(); prompts.len()])
+        }
+    }
+    let auth = std::sync::Arc::new(ScriptedAuth {
+        password_calls: AtomicUsize::new(0),
+        prompts: Mutex::new(Vec::new()),
+    });
+
+    // Agent only (no key files) — the ladder must fall through agent → kbd-interactive → password
+    // and then fail with an error, within a bounded time.
+    let cfg = config(&sshd, &user, vec![], true, Some(sock));
+    let result = tokio::time::timeout(Duration::from_secs(30), shell_session(&cfg, auth.clone()))
+        .await
+        .expect("auth ladder hung: no error and no session within 30s");
+    assert!(
+        result.is_err(),
+        "auth must fail — the server accepts neither the agent key nor the password"
+    );
+    assert_eq!(
+        auth.password_calls.load(Ordering::SeqCst),
+        1,
+        "the password prompt should have been reached exactly once (kbd-interactive prompts: {:?})",
+        auth.prompts.lock().unwrap()
+    );
+}
+
+/// A server that accepts TCP but never speaks SSH — what fail2ban's DROP (triggered by the
+/// ladder's own earlier failed attempts) looks like from the client. The connect must fail
+/// with a timeout instead of blocking the ladder forever with no error and no tab.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silent_server_times_out_instead_of_hanging() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Accept and hold connections without ever sending a banner. The thread lives until the
+    // test process exits — fine for a test.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => held.push(s),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let cfg = SshConfig {
+        host: "127.0.0.1".into(),
+        port,
+        user: "nobody".into(),
+        env: BTreeMap::new(),
+        keys: vec![],
+        known_hosts: None,
+        use_agent: false,
+        agent_sock: None,
+        connect_timeout: Duration::from_secs(1),
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        shell_session(&cfg, std::sync::Arc::new(AcceptHost(true))),
+    )
+    .await
+    .expect("connect must not hang past its timeout");
+    let err = result.err().expect("a silent server must yield an error");
+    assert!(
+        err.to_string().contains("did not respond"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
