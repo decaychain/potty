@@ -179,7 +179,7 @@ A config file is written on first run; edit it and changes apply live.
 
 The narrow scope is deliberate — it's what keeps the project tractable: no IME, no broad
 multi-compositor support, no exotica (sixel / kitty graphics / ligatures / hyperlinks) until
-they're actually missed. Keyboard shortcuts are intentionally omitted in favour of the mouse.
+they're actually missed.
 
 ## License
 

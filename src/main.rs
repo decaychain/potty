@@ -650,18 +650,25 @@ struct ShortcutDef {
     default_shift: bool,
 }
 
+// On macOS the modifier is Cmd, which the shell doesn't see, so the defaults follow iTerm2
+// (Cmd+D / Cmd+Shift+D splits, Cmd+W close). Everywhere else the modifier is Ctrl, and every
+// plain Ctrl+letter shadows a control character the shell owns (Ctrl+D = EOF, Ctrl+W =
+// delete-word, Ctrl+K = kill-line, Ctrl+S = XOFF), so — like GNOME Terminal, Konsole and
+// Kitty — every letter shortcut takes Shift.
+const MAC: bool = cfg!(target_os = "macos");
+
 const SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef {
         action: MenuAction::NewTab,
         label: "New tab",
         default_key: "T",
-        default_shift: false,
+        default_shift: !MAC,
     },
     ShortcutDef {
         action: MenuAction::SplitRight,
         label: "Split right",
-        default_key: "D",
-        default_shift: false,
+        default_key: if MAC { "D" } else { "R" },
+        default_shift: !MAC,
     },
     ShortcutDef {
         action: MenuAction::SplitDown,
@@ -673,18 +680,19 @@ const SHORTCUTS: &[ShortcutDef] = &[
         action: MenuAction::ClosePane,
         label: "Close pane",
         default_key: "W",
-        default_shift: false,
+        default_shift: !MAC,
     },
     ShortcutDef {
         action: MenuAction::Connect,
         label: "Connect to host",
         default_key: "K",
-        default_shift: false,
+        default_shift: !MAC,
     },
     ShortcutDef {
         action: MenuAction::DetachSession,
         label: "Detach session",
-        default_key: "W",
+        // Cmd+Shift+W on macOS; X elsewhere because Ctrl+Shift+W is taken by Close pane.
+        default_key: if MAC { "W" } else { "X" },
         default_shift: true,
     },
     ShortcutDef {
