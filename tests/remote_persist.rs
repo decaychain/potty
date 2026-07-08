@@ -67,6 +67,7 @@ fn send_note(sock: &Path, session: &str, kind: Kind) {
         host: "remote-test".to_string(),
         pid: Some(std::process::id()),
         pane: Some(1),
+        instance: None,
         zellij: None,
         ts: 1,
     };

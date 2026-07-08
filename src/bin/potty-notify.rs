@@ -18,7 +18,8 @@ use std::path::PathBuf;
 
 use lexopt::prelude::{Long, Short, Value};
 use potty::notify::{
-    ENV_PANE, ENV_SOCK, Kind, Note, SCHEMA_VERSION, Tool, ZellijLoc, default_socket_path,
+    ENV_INSTANCE, ENV_PANE, ENV_SOCK, InstanceMessage, Kind, Note, SCHEMA_VERSION, Tool, ZellijLoc,
+    default_socket_path, instance_socket_paths,
 };
 
 fn main() {
@@ -102,6 +103,7 @@ fn main() {
         serde_json::from_str(payload.trim()).unwrap_or(serde_json::Value::Null);
 
     let host = hostname();
+    let instance = std::env::var(ENV_INSTANCE).ok().filter(|s| !s.is_empty());
     let pane = std::env::var(ENV_PANE)
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
@@ -135,6 +137,7 @@ fn main() {
         host,
         pid: Some(std::process::id()),
         pane,
+        instance,
         zellij: zellij_loc(),
         ts: unix_secs(),
     };
@@ -148,13 +151,34 @@ fn send(note: &Note) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
-    let path = std::env::var_os(ENV_SOCK)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(default_socket_path);
-    let mut stream = UnixStream::connect(path)?;
-    let mut line = serde_json::to_string(note).unwrap_or_default();
-    line.push('\n');
-    stream.write_all(line.as_bytes())
+    fn write_json(
+        path: impl AsRef<std::path::Path>,
+        value: &impl serde::Serialize,
+    ) -> std::io::Result<()> {
+        let mut stream = UnixStream::connect(path)?;
+        let mut line = serde_json::to_string(value).unwrap_or_default();
+        line.push('\n');
+        stream.write_all(line.as_bytes())
+    }
+
+    if let Some(path) = std::env::var_os(ENV_SOCK).map(std::path::PathBuf::from) {
+        return write_json(path, note);
+    }
+
+    let mut sent = false;
+    let msg = InstanceMessage::Note { note: note.clone() };
+    for path in instance_socket_paths() {
+        if write_json(&path, &msg).is_ok() {
+            sent = true;
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    if sent {
+        Ok(())
+    } else {
+        write_json(default_socket_path(), note)
+    }
 }
 
 #[cfg(not(unix))]

@@ -318,7 +318,9 @@ pub async fn shell_session(
                 Frame::Control(Control::Open {
                     pane, cols, rows, ..
                 }) => {
-                    sshdbg(format!("pane {pane}: opening shell channel ({cols}x{rows})"));
+                    sshdbg(format!(
+                        "pane {pane}: opening shell channel ({cols}x{rows})"
+                    ));
                     match open_shell_channel(&handle, &env, cols, rows).await {
                         Ok(channel) => {
                             sshdbg(format!("pane {pane}: shell channel open"));
@@ -477,7 +479,10 @@ async fn connect_session(
         match tokio::time::timeout(TICK, &mut connect).await {
             Ok(r) => {
                 match &r {
-                    Ok(_) => sshdbg(format!("{}:{}: connected, handshake done", cfg.host, cfg.port)),
+                    Ok(_) => sshdbg(format!(
+                        "{}:{}: connected, handshake done",
+                        cfg.host, cfg.port
+                    )),
                     Err(e) => sshdbg(format!("{}:{}: connect FAILED: {e}", cfg.host, cfg.port)),
                 }
                 return r.map_err(io_err);
@@ -539,9 +544,7 @@ async fn authenticate(
                     return Ok(session);
                 }
                 Ok(false) => sshdbg("agent: no key accepted"),
-                Err(Disconnected) => {
-                    sshdbg("agent: server DISCONNECTED mid-auth (attempt cap?)")
-                }
+                Err(Disconnected) => sshdbg("agent: server DISCONNECTED mid-auth (attempt cap?)"),
             }
         } else {
             sshdbg("auth rung 1: no ssh-agent reachable — skipping");

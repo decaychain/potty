@@ -50,7 +50,7 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::Window;
+use winit::window::{UserAttentionType, Window};
 
 use gridr::GridRenderer;
 use workspace::{GAP, PaneId, Split, Workspace};
@@ -96,8 +96,23 @@ enum UserEvent {
     ResetTitle(PaneId),
     /// A pane's shell exited (reader hit EOF) — close the pane.
     PaneExited(PaneId),
-    /// An attention note arrived on the notify socket (from `potty-notify`).
+    /// An attention note arrived from this instance's own helper/socket path.
     Notify(feed::Note),
+    /// A note forwarded by another live potty instance. Already fanned out; don't rebroadcast it.
+    PeerNotify(feed::Note),
+    /// Another instance's feed asked this process to activate one of its notes.
+    PeerFocus {
+        instance: Option<String>,
+        host: String,
+        session: String,
+        pane: Option<PaneId>,
+    },
+    /// Another instance dismissed a feed row; remove the mirrored copy here too.
+    PeerDismiss {
+        instance: Option<String>,
+        host: String,
+        session: String,
+    },
     /// A remote SSH session authenticated and exec'd `potty-session`; carries the connection id,
     /// the target (for matching/labels), and the channel to send it input/resize/close frames.
     RemoteConnected {
@@ -288,9 +303,11 @@ impl remote::Authenticator for GuiAuth {
         if self.proxy.send_event(UserEvent::Auth(ask)).is_err() {
             return false;
         }
-        self.prompting.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.prompting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let answer = rx.recv().unwrap_or(false);
-        self.prompting.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.prompting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         answer
     }
 
@@ -348,9 +365,11 @@ impl GuiAuth {
         if self.proxy.send_event(UserEvent::Auth(ask)).is_err() {
             return None;
         }
-        self.prompting.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.prompting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let answer = rx.recv().unwrap_or(None);
-        self.prompting.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.prompting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         answer
     }
 }
@@ -470,10 +489,10 @@ enum Action {
     ShowSettings,
     CaptureShortcut(MenuAction),
     ResetShortcut(MenuAction),
-    /// Jump to (focus) a pane from the attention feed — selects its tab too.
-    JumpToPane(PaneId),
-    /// Dismiss an attention-feed entry, keyed by (host, session).
-    DismissNote(String, String),
+    /// Activate an attention-feed entry: focus its pane/window if possible, otherwise clear it.
+    ActivateNote(FeedKey, Option<PaneId>),
+    /// Dismiss an attention-feed entry.
+    DismissNote(FeedKey),
     /// Show or hide the attention-feed overlay (bell toggle / overlay close button).
     ShowFeed(bool),
     /// Dismiss the feed entirely: un-latch the tab bar (so it disappears again with a lone tab).
@@ -511,9 +530,28 @@ enum AuthView {
     },
 }
 
+/// Internal attention-feed key. `instance` matters because pane ids and synthesized fallback
+/// session ids are process-local.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FeedKey {
+    instance: Option<String>,
+    host: String,
+    session: String,
+}
+
+impl FeedKey {
+    fn from_note(note: &feed::Note) -> Self {
+        Self {
+            instance: note.instance.clone(),
+            host: note.host.clone(),
+            session: note.session.clone(),
+        }
+    }
+}
+
 /// A session currently waiting for the user, as tracked by the attention feed. Keyed in `App`
-/// by `(host, session)`; a `raise` note inserts/refreshes it, a `clear` (or the user landing on
-/// its pane) removes it.
+/// by `FeedKey`; a `raise` note inserts/refreshes it, a `clear` (or the user landing on its pane)
+/// removes it.
 struct Pending {
     tool: feed::Tool,
     message: String,
@@ -528,7 +566,7 @@ struct Pending {
 
 /// A flattened, display-ready attention-feed row handed to the chrome.
 struct FeedItem {
-    key: (String, String),
+    key: FeedKey,
     tool: feed::Tool,
     /// Pre-formatted "where": host (if remote) + cwd basename + Zellij hint.
     label: String,
@@ -536,6 +574,7 @@ struct FeedItem {
     /// Pre-formatted age, e.g. "12s", "4m", "2h".
     age: String,
     pane: Option<PaneId>,
+    can_activate: bool,
 }
 
 struct ConnectProfileView {
@@ -575,8 +614,8 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::ShowSettings
         | Action::CaptureShortcut(_)
         | Action::ResetShortcut(_)
-        | Action::JumpToPane(_)
-        | Action::DismissNote(..)
+        | Action::ActivateNote(..)
+        | Action::DismissNote(_)
         | Action::ShowFeed(_)
         | Action::DismissFeed
         | Action::AuthAnswer(_)
@@ -1290,7 +1329,7 @@ fn profile_row(ui: &mut egui::Ui, profile: &ConnectProfileView) -> egui::Respons
 /// A full-width attention-feed card. The card itself jumps to the pane; the dismiss target is a
 /// separate, later interaction so its click cannot leak through and activate the card beneath it.
 fn feed_row(ui: &mut egui::Ui, item: &FeedItem) -> (bool, bool) {
-    let can_jump = item.pane.is_some();
+    let can_jump = item.can_activate;
     let width = ui.available_width().max(300.0);
     let height = if item.message.is_empty() { 44.0 } else { 62.0 };
     let (rect, card) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
@@ -1915,10 +1954,9 @@ fn build_ui(
                         ui.add_space(3.0);
                         let (jump, dismiss) = feed_row(ui, item);
                         if dismiss {
-                            actions
-                                .push(Action::DismissNote(item.key.0.clone(), item.key.1.clone()));
-                        } else if jump && let Some(pane) = item.pane {
-                            actions.push(Action::JumpToPane(pane));
+                            actions.push(Action::DismissNote(item.key.clone()));
+                        } else if jump {
+                            actions.push(Action::ActivateNote(item.key.clone(), item.pane));
                         }
                     }
                 });
@@ -2387,6 +2425,12 @@ impl WindowState {
 
 struct App {
     proxy: EventLoopProxy<UserEvent>,
+    /// Unique id for this GUI process. Used to route broadcast feed clicks back to the owner.
+    instance_id: String,
+    /// The per-instance socket exported to child shells as `$POTTY_NOTIFY`.
+    notify_sock: PathBuf,
+    /// Socket paths this process owns, removed on exit where possible.
+    notify_paths: Vec<PathBuf>,
     state: Option<WindowState>,
     /// One live terminal per leaf pane, keyed by PaneId (across all tabs).
     terms: HashMap<PaneId, Terminal>,
@@ -2454,9 +2498,9 @@ struct App {
     blink_on: bool,
     blink_next: Option<Instant>,
 
-    /// Attention feed: sessions waiting for the user, keyed by `(host, session)`. Fed by the
-    /// notify socket (`UserEvent::Notify`); rendered as a floating overlay in the chrome.
-    pending: HashMap<(String, String), Pending>,
+    /// Attention feed: sessions waiting for the user. Fed by the notify sockets and mirrored
+    /// between live potty instances; rendered as a floating overlay in the chrome.
+    pending: HashMap<FeedKey, Pending>,
 
     /// Panes whose backend is a remote session — `reconcile_terms` must not spawn a local PTY for
     /// them, and closing them sends a `Close` frame rather than dropping a PTY.
@@ -2495,9 +2539,17 @@ struct App {
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        instance_id: String,
+        notify_sock: PathBuf,
+        notify_paths: Vec<PathBuf>,
+    ) -> Self {
         Self {
             proxy,
+            instance_id,
+            notify_sock,
+            notify_paths,
             state: None,
             terms: HashMap::new(),
             mods: Modifiers::default(),
@@ -2569,15 +2621,53 @@ impl App {
         self.blink_next = None;
     }
 
+    /// A first-hop note belongs to this GUI process unless the sender already stamped it. Apply it
+    /// locally and mirror it to sibling potty instances.
+    fn on_local_note(&mut self, note: feed::Note) {
+        let note = self.owned_note(note);
+        self.apply_note(note.clone());
+        self.broadcast_instance_message(&feed::InstanceMessage::Note { note });
+    }
+
+    /// A note forwarded by another potty process: apply it only. Rebroadcasting would loop.
+    fn on_peer_note(&mut self, note: feed::Note) {
+        if note.kind == feed::Kind::Raise
+            && self.pending.keys().any(|key| {
+                self.key_is_local(key) && key.host == note.host && key.session == note.session
+            })
+        {
+            return;
+        }
+        self.apply_note(note);
+    }
+
+    fn owned_note(&self, mut note: feed::Note) -> feed::Note {
+        if note.instance.is_none() {
+            note.instance = Some(self.instance_id.clone());
+        }
+        note
+    }
+
     /// Fold an attention note into the feed: a `raise` inserts/refreshes the session, a `clear`
-    /// removes it. Keyed by `(host, session)` so re-raises update in place rather than pile up.
-    fn on_note(&mut self, note: feed::Note) {
-        let key = (note.host.clone(), note.session.clone());
+    /// removes it. Keyed by `FeedKey` so re-raises update in place rather than pile up.
+    fn apply_note(&mut self, note: feed::Note) {
+        let key = FeedKey::from_note(&note);
         match note.kind {
             feed::Kind::Raise => {
                 // A fresh wave (nothing was waiting) pops the feed open; mid-wave re-raises don't
                 // re-pop it if the user has hidden it. Either way the tab bar latches on.
                 let was_empty = self.pending.is_empty();
+                if self.key_is_local(&key) {
+                    let self_id = self.instance_id.as_str();
+                    self.pending.retain(|other, _| {
+                        other.host != key.host
+                            || other.session != key.session
+                            || other
+                                .instance
+                                .as_deref()
+                                .is_none_or(|instance| instance == self_id)
+                    });
+                }
                 self.pending.insert(
                     key,
                     Pending {
@@ -2596,25 +2686,50 @@ impl App {
                 }
             }
             feed::Kind::Clear => {
-                self.pending.remove(&key);
-                if self.pending.is_empty() {
-                    self.feed_open = false;
-                }
+                self.remove_pending_key(&key);
             }
         }
         self.request_redraw();
     }
 
-    /// Drop any feed entries owned by `pane` (the user landed on it, so it no longer needs
-    /// flagging). Returns whether anything was removed.
-    fn clear_pending_for_pane(&mut self, pane: PaneId) -> bool {
-        let before = self.pending.len();
-        self.pending.retain(|_, p| p.pane != Some(pane));
-        let changed = self.pending.len() != before;
+    fn key_is_local(&self, key: &FeedKey) -> bool {
+        key.instance
+            .as_deref()
+            .is_none_or(|instance| instance == self.instance_id)
+    }
+
+    fn remove_pending_key(&mut self, key: &FeedKey) -> bool {
+        let changed = self.pending.remove(key).is_some();
         if changed && self.pending.is_empty() {
             self.feed_open = false;
         }
         changed
+    }
+
+    fn dismiss_note(&mut self, key: FeedKey, broadcast: bool) {
+        let changed = self.remove_pending_key(&key);
+        if broadcast {
+            self.broadcast_dismiss(&key);
+        }
+        if changed {
+            self.request_redraw();
+        }
+    }
+
+    /// Drop any feed entries owned by `pane` (the user landed on it, so it no longer needs
+    /// flagging). Returns whether anything was removed.
+    fn clear_pending_for_pane(&mut self, pane: PaneId) -> bool {
+        let keys: Vec<FeedKey> = self
+            .pending
+            .iter()
+            .filter(|(key, pending)| self.key_is_local(key) && pending.pane == Some(pane))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &keys {
+            self.remove_pending_key(key);
+            self.broadcast_dismiss(key);
+        }
+        !keys.is_empty()
     }
 
     /// Build the display-ready feed rows for the chrome, newest first.
@@ -2623,16 +2738,21 @@ impl App {
         let mut rows: Vec<(Instant, FeedItem)> = self
             .pending
             .iter()
-            .map(|((h, s), p)| {
+            .map(|(key, p)| {
                 (
                     p.since,
                     FeedItem {
-                        key: (h.clone(), s.clone()),
+                        key: key.clone(),
                         tool: p.tool,
                         label: feed_label(&p.host, &p.cwd, p.zellij.as_ref()),
                         message: p.message.clone(),
                         age: human_age(now.saturating_duration_since(p.since)),
                         pane: p.pane,
+                        can_activate: p.pane.is_some()
+                            || key
+                                .instance
+                                .as_deref()
+                                .is_some_and(|instance| instance != self.instance_id),
                     },
                 )
             })
@@ -2753,13 +2873,118 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Focus a pane from the feed: select its tab, focus it, and clear its note.
-    fn jump_to_pane(&mut self, pane: PaneId) {
-        if let Some(i) = self.workspace.tab_of(pane) {
+    /// Activate a feed row clicked in this process. If the owner is another live potty instance,
+    /// ask it to focus its own pane/window; if the owner socket is stale, clear the mirrored row.
+    fn activate_note(&mut self, key: FeedKey, pane: Option<PaneId>) {
+        if let Some(owner) = key.instance.as_deref()
+            && owner != self.instance_id
+        {
+            let sent = self.send_instance_message_to(
+                owner,
+                &feed::InstanceMessage::Focus {
+                    instance: key.instance.clone(),
+                    host: key.host.clone(),
+                    session: key.session.clone(),
+                    pane,
+                },
+            );
+            if !sent {
+                self.dismiss_note(key, true);
+            }
+            return;
+        }
+        self.activate_local_note(key, pane, true);
+    }
+
+    /// Focus a local pane/window for a feed row. If the pane no longer exists, the row is still
+    /// cleared; otherwise stale pane ids become impossible to remove by clicking the card.
+    fn activate_local_note(&mut self, key: FeedKey, pane: Option<PaneId>, broadcast: bool) {
+        if let Some(pane) = pane
+            && let Some(i) = self.workspace.tab_of(pane)
+        {
             self.workspace.active = i;
             self.workspace.tabs[i].focus = pane;
-            self.clear_pending_for_pane(pane);
-            self.request_redraw();
+        }
+        self.raise_window();
+        self.dismiss_note(key, broadcast);
+        self.request_redraw();
+    }
+
+    fn on_peer_focus(
+        &mut self,
+        instance: Option<String>,
+        host: String,
+        session: String,
+        pane: Option<PaneId>,
+    ) {
+        let key = FeedKey {
+            instance,
+            host,
+            session,
+        };
+        let pane = pane.or_else(|| self.pending.get(&key).and_then(|pending| pending.pane));
+        self.activate_local_note(key, pane, true);
+    }
+
+    fn on_peer_dismiss(&mut self, instance: Option<String>, host: String, session: String) {
+        self.dismiss_note(
+            FeedKey {
+                instance,
+                host,
+                session,
+            },
+            false,
+        );
+    }
+
+    fn raise_window(&self) {
+        if let Some(state) = self.state.as_ref() {
+            state.window.set_minimized(false);
+            state.window.focus_window();
+            state
+                .window
+                .request_user_attention(Some(UserAttentionType::Informational));
+        }
+    }
+
+    fn broadcast_dismiss(&self, key: &FeedKey) {
+        self.broadcast_instance_message(&feed::InstanceMessage::Dismiss {
+            instance: key.instance.clone(),
+            host: key.host.clone(),
+            session: key.session.clone(),
+        });
+    }
+
+    fn broadcast_instance_message(&self, msg: &feed::InstanceMessage) {
+        #[cfg(unix)]
+        {
+            for path in feed::instance_socket_paths() {
+                if self.notify_paths.iter().any(|owned| owned == &path) {
+                    continue;
+                }
+                if send_instance_message(&path, msg).is_err() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = msg;
+    }
+
+    fn send_instance_message_to(&self, instance: &str, msg: &feed::InstanceMessage) -> bool {
+        #[cfg(unix)]
+        {
+            let path = feed::instance_socket_path(instance);
+            let sent = send_instance_message(&path, msg).is_ok();
+            if !sent {
+                let _ = std::fs::remove_file(path);
+            }
+            sent
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (instance, msg);
+            false
         }
     }
 
@@ -2835,8 +3060,9 @@ impl App {
         // which pane they live in (for exact jump-to-focus). Unix-only — the listener is a UDS.
         #[cfg(unix)]
         {
-            cmd.env(feed::ENV_SOCK, feed::default_socket_path());
+            cmd.env(feed::ENV_SOCK, &self.notify_sock);
             cmd.env(feed::ENV_PANE, id.to_string());
+            cmd.env(feed::ENV_INSTANCE, &self.instance_id);
         }
         if let Some(cwd) = &cwd {
             cmd.cwd(cwd.as_os_str());
@@ -3479,7 +3705,12 @@ impl App {
                             .get(&conn)
                             .and_then(|c| c.routes.get(&remote_id).copied())
                     });
-                    self.on_note(note);
+                    note.instance = Some(self.instance_id.clone());
+                    if self.conn_focused(conn) {
+                        self.on_local_note(note);
+                    } else {
+                        self.apply_note(note);
+                    }
                 }
             }
             // Welcome / Opened: nothing to do.
@@ -4704,14 +4935,8 @@ impl App {
                     self.request_redraw();
                 }
                 Action::ResetShortcut(action) => self.reset_shortcut(action),
-                Action::JumpToPane(p) => self.jump_to_pane(p),
-                Action::DismissNote(host, session) => {
-                    self.pending.remove(&(host, session));
-                    if self.pending.is_empty() {
-                        self.feed_open = false;
-                    }
-                    self.request_redraw();
-                }
+                Action::ActivateNote(key, pane) => self.activate_note(key, pane),
+                Action::DismissNote(key) => self.dismiss_note(key, true),
                 Action::ShowFeed(open) => {
                     self.feed_open = open;
                     self.request_redraw();
@@ -4973,6 +5198,9 @@ impl ApplicationHandler<UserEvent> for App {
         // Drop the clipboard before the Wayland connection is torn down — its worker thread
         // holds the wl_display, and using it after teardown segfaults.
         self.clipboard = None;
+        for path in &self.notify_paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Drive the cursor blink. We otherwise wait idle (everything else is redraw-on-demand), so
@@ -5061,7 +5289,19 @@ impl ApplicationHandler<UserEvent> for App {
             // A shell exited — close its pane. Exit the app once no terminals remain.
             UserEvent::PaneExited(id) => self.close_pane(event_loop, id),
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
-            UserEvent::Notify(note) => self.on_note(note),
+            UserEvent::Notify(note) => self.on_local_note(note),
+            UserEvent::PeerNotify(note) => self.on_peer_note(note),
+            UserEvent::PeerFocus {
+                instance,
+                host,
+                session,
+                pane,
+            } => self.on_peer_focus(instance, host, session, pane),
+            UserEvent::PeerDismiss {
+                instance,
+                host,
+                session,
+            } => self.on_peer_dismiss(instance, host, session),
             // A remote session connected — give it a tab with one shell pane.
             UserEvent::RemoteConnected {
                 conn,
@@ -5325,59 +5565,149 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-/// Listen on the attention-feed socket and forward each note into the event loop. One note per
-/// connection, newline-terminated. Best-effort: if the socket can't be bound (e.g. another potty
-/// already owns it), the feature is simply off this run. Unix-only — the transport is a UDS.
+/// Listen on this instance's attention-feed sockets and forward each message into the event loop.
+/// Raw `Note` JSON is the public helper contract; wrapped `InstanceMessage` JSON is the private
+/// fan-out/focus protocol between live GUI instances. Unix-only — the transport is a UDS.
 #[cfg(unix)]
-fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>) {
+fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>, instance_path: &Path) -> Vec<PathBuf> {
     use std::io::{BufRead, BufReader, Read};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
 
-    let path = feed::default_socket_path();
-    if let Some(dir) = path.parent() {
+    fn prepare_socket_dir(path: &Path) {
+        let Some(dir) = path.parent() else {
+            return;
+        };
         let _ = std::fs::create_dir_all(dir);
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-    // A stale socket from a previous run would make bind() fail with "address in use".
-    let _ = std::fs::remove_file(&path);
-    let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "potty: attention feed disabled (socket {}: {e})",
-                path.display()
-            );
-            return;
-        }
-    };
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            // Cap the read so a rogue client can't make us allocate unbounded.
-            let mut line = String::new();
-            if BufReader::new(stream.take(64 * 1024))
-                .read_line(&mut line)
-                .is_err()
-            {
-                continue;
-            }
-            if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim())
-                && note.v == feed::SCHEMA_VERSION
-            {
-                let _ = proxy.send_event(UserEvent::Notify(note));
+
+    fn bind_unique(path: &Path) -> Option<UnixListener> {
+        prepare_socket_dir(path);
+        let _ = std::fs::remove_file(path);
+        match UnixListener::bind(path) {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                eprintln!(
+                    "potty: attention feed disabled (socket {}: {err})",
+                    path.display()
+                );
+                None
             }
         }
-    });
+    }
+
+    fn bind_compat(path: &Path) -> Option<UnixListener> {
+        prepare_socket_dir(path);
+        match UnixListener::bind(path) {
+            Ok(listener) => Some(listener),
+            Err(_) if UnixStream::connect(path).is_ok() => None,
+            Err(_) => {
+                let _ = std::fs::remove_file(path);
+                UnixListener::bind(path).ok()
+            }
+        }
+    }
+
+    fn spawn_acceptor(proxy: EventLoopProxy<UserEvent>, listener: UnixListener) {
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                // Cap the read so a rogue client can't make us allocate unbounded.
+                let mut line = String::new();
+                if BufReader::new(stream.take(64 * 1024))
+                    .read_line(&mut line)
+                    .is_err()
+                {
+                    continue;
+                }
+                handle_notify_line(&proxy, line.trim());
+            }
+        });
+    }
+
+    let mut owned = Vec::new();
+    if let Some(listener) = bind_unique(instance_path) {
+        owned.push(instance_path.to_path_buf());
+        spawn_acceptor(proxy.clone(), listener);
+    }
+
+    // Compatibility path for older shells/hooks that still target the fixed default socket. Only
+    // bind it if no live process answers there; do not steal it from another running instance.
+    let compat = feed::default_socket_path();
+    if let Some(listener) = bind_compat(&compat) {
+        owned.push(compat);
+        spawn_acceptor(proxy, listener);
+    }
+    owned
 }
 
 #[cfg(not(unix))]
-fn spawn_notify_listener(_proxy: EventLoopProxy<UserEvent>) {}
+fn spawn_notify_listener(_proxy: EventLoopProxy<UserEvent>, _instance_path: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn handle_notify_line(proxy: &EventLoopProxy<UserEvent>, line: &str) {
+    if let Ok(msg) = serde_json::from_str::<feed::InstanceMessage>(line) {
+        let event = match msg {
+            feed::InstanceMessage::Note { note } => UserEvent::PeerNotify(note),
+            feed::InstanceMessage::Focus {
+                instance,
+                host,
+                session,
+                pane,
+            } => UserEvent::PeerFocus {
+                instance,
+                host,
+                session,
+                pane,
+            },
+            feed::InstanceMessage::Dismiss {
+                instance,
+                host,
+                session,
+            } => UserEvent::PeerDismiss {
+                instance,
+                host,
+                session,
+            },
+        };
+        let _ = proxy.send_event(event);
+        return;
+    }
+
+    if let Ok(note) = serde_json::from_str::<feed::Note>(line)
+        && note.v == feed::SCHEMA_VERSION
+    {
+        let _ = proxy.send_event(UserEvent::Notify(note));
+    }
+}
+
+#[cfg(unix)]
+fn send_instance_message(path: &Path, msg: &feed::InstanceMessage) -> std::io::Result<()> {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(path)?;
+    let mut line = serde_json::to_string(msg).map_err(std::io::Error::other)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())
+}
+
+fn new_instance_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
 
 fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
-    spawn_notify_listener(proxy.clone());
-    let mut app = App::new(proxy);
+    let instance_id = new_instance_id();
+    let notify_sock = feed::instance_socket_path(&instance_id);
+    let notify_paths = spawn_notify_listener(proxy.clone(), &notify_sock);
+    let mut app = App::new(proxy, instance_id, notify_sock, notify_paths);
     event_loop.run_app(&mut app).unwrap();
 }
 

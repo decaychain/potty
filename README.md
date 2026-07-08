@@ -88,7 +88,8 @@ When you run several agentic CLIs at once they spend a lot of time *blocked on y
 prompt, a plan to approve. potty collects those into one floating list (top-right) so you never
 babysit a pane to check "is it waiting yet?". The signal comes from the tool's own notification
 hook via a tiny helper (`potty-notify`) over a Unix socket — **not** by watching the terminal
-output — so a session in an unfocused pane still shows up. Click an entry to jump straight to it.
+output — so a session in an unfocused pane still shows up. Open Potty windows in the same user
+session mirror the feed; click an entry to jump straight to the owning pane/window.
 
 Wire it up once (the `potty` package installs `potty-notify` on `PATH`) — let the helper edit the
 configs for you (idempotent, won't clobber existing settings):

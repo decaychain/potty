@@ -104,16 +104,18 @@ a new `UserEvent` — exactly how the PTY reader and child-exit threads already 
 }
 ```
 
-**Local sessions.** potty injects two env vars into every child shell it spawns
-(`spawn_terminal`, alongside the existing `cmd.env("TERM", …)` at `src/main.rs:812`):
+**Local sessions.** potty injects three env vars into every child shell it spawns:
 
 ```
-POTTY_NOTIFY = /run/user/<uid>/potty/notify.sock   # the listener
-POTTY_PANE   = <PaneId>                              # which pane this shell lives in
+POTTY_NOTIFY   = /run/user/<uid>/potty/instances/<instance>.sock
+POTTY_PANE     = <PaneId>       # which pane this shell lives in
+POTTY_INSTANCE = <instance>     # which GUI process owns that pane id
 ```
 
 Because `POTTY_PANE` rides the local process tree, a local Claude Code's helper reports its exact
 pane. **Local correlation is exact** — "click to focus" lands on the right pane every time.
+The receiving instance mirrors notes to sibling Potty windows through their per-instance sockets,
+and a click in a mirrored feed sends a focus request back to the owner window.
 
 **Built-in `potty-session` SSH (native path).** The remote daemon binds its own Unix socket and
 injects that path as `$POTTY_NOTIFY` into every remote pane, alongside `$POTTY_PANE` for the daemon
@@ -167,7 +169,7 @@ same-host sessions coexist (verified). Outside potty the wrapper is plain `ssh`.
 
 ### 4. The UI — the attention feed
 
-State lives in `App` as a registry keyed by `(host, session)`:
+State lives in `App` as a registry keyed by `(instance, host, session)`:
 
 ```rust
 struct Pending {
@@ -176,6 +178,7 @@ struct Pending {
     cwd: String,
     host: String,
     potty_pane: Option<PaneId>,   // Some → exact local jump
+    instance: Option<String>,     // owning GUI process, if known
     zellij: Option<ZellijLoc>,    // shown so you know where it is remotely
     since: Instant,
 }
@@ -186,9 +189,10 @@ struct Pending {
   - **Tab-bar badge** — a count of waiting sessions, and a per-tab dot when a tab owns one.
   - **A global overlay / palette** (e.g. `Alt+`\`) listing every pending session: tool · host ·
     cwd · message · age, newest first.
-  - **Select to jump.** If `potty_pane` is known, focus that pane (and its tab). For remote
-    sessions we focus the potty pane holding the SSH connection and *display* the Zellij
-    coordinates so you can finish the last hop yourself.
+  - **Select to jump.** If the owning instance is this process, focus that pane (and its tab); if
+    the owner is another live Potty process, send it a focus request. For remote sessions we focus
+    the potty pane holding the SSH connection and *display* the Zellij coordinates so you can finish
+    the last hop yourself.
 
 ## Lifecycle / clearing
 
@@ -289,8 +293,9 @@ For plain/manual `ssh`, `potty-notify --print-ssh-config <host>` still emits the
 
 ## Open questions
 
-- **Socket path on the local side** — fixed `notify.sock` (simplest; pane comes from
-  `$POTTY_PANE`) vs per-pane sockets. Leaning fixed: one listener, pane identity in the payload.
+- **Socket path on the local side** — local panes now use per-instance sockets under
+  `$XDG_RUNTIME_DIR/potty/instances/`, with the fixed `notify.sock` kept as a compatibility entry
+  point when no live instance already owns it.
 - **Overlay vs reusing the existing menu chrome** for the feed UI — TBD against the egui layer.
 </content>
 </invoke>
