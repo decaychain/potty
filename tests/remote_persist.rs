@@ -56,8 +56,8 @@ fn notify_socket(sock: &Path) -> std::path::PathBuf {
     sock.with_extension("notify.sock")
 }
 
-fn send_note(sock: &Path, session: &str, kind: Kind) {
-    let note = Note {
+fn note(session: &str, kind: Kind) -> Note {
+    Note {
         v: SCHEMA_VERSION,
         tool: Tool::Codex,
         kind,
@@ -70,7 +70,11 @@ fn send_note(sock: &Path, session: &str, kind: Kind) {
         instance: None,
         zellij: None,
         ts: 1,
-    };
+    }
+}
+
+fn send_note(sock: &Path, session: &str, kind: Kind) {
+    let note = note(session, kind);
     let mut stream = UnixStream::connect(notify_socket(sock)).expect("connect notify socket");
     let mut line = serde_json::to_string(&note).expect("serialize note");
     line.push('\n');
@@ -819,6 +823,136 @@ fn notify_socket_replays_detached_clear_on_reattach() {
     assert!(
         got_clear,
         "reattach did not replay detached native notify clear"
+    );
+}
+
+#[test]
+fn client_notify_clear_removes_pending_note_on_reattach() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-notify-client-clear-{tag}.sock"));
+    let daemon = start_daemon(&sock);
+
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 2 }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Opened { pane: 1 }))
+    }));
+
+    send_note(&sock, "client-clear", Kind::Raise);
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Notify { json } if json.contains("client-clear") && json.contains("\"kind\":\"raise\"")))
+    }));
+
+    let clear = note("client-clear", Kind::Clear);
+    let json = serde_json::to_string(&clear).expect("serialize clear note");
+    c1.send(Frame::Control(Control::Notify { json }));
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Notify { json } if json.contains("client-clear") && json.contains("\"kind\":\"clear\"")))
+    }));
+    c1.disconnect();
+
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c2.wait(|_, ctrl| ctrl.iter().any(|m| matches!(m, Control::Ready))));
+    let replayed = {
+        let g = c2.collected.lock().unwrap();
+        g.1.iter().any(|m| {
+            matches!(
+                m,
+                Control::Notify { json }
+                    if json.contains("client-clear") && json.contains("\"kind\":\"raise\"")
+            )
+        })
+    };
+
+    c2.disconnect();
+    cleanup(daemon, &sock);
+    assert!(
+        !replayed,
+        "client-side clear did not remove the daemon's pending note"
+    );
+}
+
+#[test]
+fn pane_close_clears_pending_note_for_that_pane() {
+    let tag = std::process::id();
+    let sock = std::env::temp_dir().join(format!("potty-notify-pane-close-{tag}.sock"));
+    let daemon = start_daemon(&sock);
+
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 2 }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 2,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Opened { pane: 1 }))
+            && ctrl
+                .iter()
+                .any(|m| matches!(m, Control::Opened { pane: 2 }))
+    }));
+
+    send_note(&sock, "pane-close-clear", Kind::Raise);
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Notify { json } if json.contains("pane-close-clear") && json.contains("\"kind\":\"raise\"")))
+    }));
+
+    c1.send(Frame::Control(Control::Close { pane: 1 }));
+    let cleared = c1.wait(|_, ctrl| {
+        ctrl.iter().any(|m| {
+            matches!(
+                m,
+                Control::Notify { json }
+                    if json.contains("pane-close-clear")
+                        && json.contains("\"kind\":\"clear\"")
+            )
+        })
+    });
+    c1.disconnect();
+
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c2.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|m| matches!(m, Control::Restore { pane: 2 }))
+            && ctrl.iter().any(|m| matches!(m, Control::Ready))
+    }));
+    let replayed = {
+        let g = c2.collected.lock().unwrap();
+        g.1.iter().any(|m| {
+            matches!(
+                m,
+                Control::Notify { json }
+                    if json.contains("pane-close-clear") && json.contains("\"kind\":\"raise\"")
+            )
+        })
+    };
+
+    c2.disconnect();
+    cleanup(daemon, &sock);
+    assert!(cleared, "pane close did not broadcast a clear note");
+    assert!(
+        !replayed,
+        "pane close did not remove the daemon's pending note"
     );
 }
 

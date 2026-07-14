@@ -241,6 +241,26 @@ mod imp {
         }
     }
 
+    fn clear_notes_for_pane(session: &Session, pane: PaneId) {
+        let notes: Vec<feed::Note> = {
+            let mut pending = session.pending_notes.lock().unwrap();
+            let notes = pending
+                .values()
+                .filter(|note| note.kind == feed::Kind::Raise && note.pane == Some(pane))
+                .map(|note| {
+                    let mut note = note.clone();
+                    note.kind = feed::Kind::Clear;
+                    note
+                })
+                .collect();
+            pending.retain(|_, note| note.pane != Some(pane));
+            notes
+        };
+        for note in notes {
+            send_note(session, &note);
+        }
+    }
+
     /// Replay stored notes to the client that just attached.
     fn replay_pending_notes(session: &Session, client_id: u64) {
         let notes: Vec<feed::Note> = {
@@ -413,6 +433,7 @@ mod imp {
             let _ = child.wait();
             broadcast(&wait, Frame::Control(Control::Exited { pane }), None);
             wait.panes.lock().unwrap().remove(&pane);
+            clear_notes_for_pane(&wait, pane);
             let idle =
                 wait.panes.lock().unwrap().is_empty() && wait.clients.lock().unwrap().is_empty();
             if idle {
@@ -563,7 +584,15 @@ mod imp {
                 Frame::Control(Control::Close { pane }) => {
                     take_focus(session, client_id);
                     if let Some(mut p) = session.panes.lock().unwrap().remove(&pane) {
+                        clear_notes_for_pane(session, pane);
                         let _ = p.killer.kill();
+                    }
+                }
+                Frame::Control(Control::Notify { json }) => {
+                    if let Ok(note) = serde_json::from_str::<feed::Note>(&json)
+                        && note.v == feed::SCHEMA_VERSION
+                    {
+                        handle_note(session, note);
                     }
                 }
                 Frame::Data { pane, bytes } => {

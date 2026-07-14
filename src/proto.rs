@@ -74,9 +74,10 @@ pub enum Control {
     /// changes; S→C during the attach restore burst (before `Ready`) and live whenever the stored
     /// layout changes. Carries the tree as JSON (`Layout`) — the daemon stores it opaquely.
     LayoutTree { json: String },
-    /// S→C: an attention-feed note captured by the remote `potty-session` daemon. The payload is a
-    /// `notify::Note` JSON object; keeping it opaque here avoids coupling the terminal protocol to
-    /// the attention-feed schema.
+    /// S→C: an attention-feed note captured by the remote `potty-session` daemon. C→S: a feed
+    /// update from the GUI, currently used to clear a daemon-persisted pending note after the user
+    /// dismisses it locally. The payload is a `notify::Note` JSON object; keeping it opaque here
+    /// avoids coupling the terminal protocol to the attention-feed schema.
     Notify { json: String },
 }
 

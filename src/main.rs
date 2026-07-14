@@ -560,8 +560,17 @@ struct Pending {
     /// The owning potty pane, for exact jump-to-focus (local sessions only).
     pane: Option<PaneId>,
     zellij: Option<feed::ZellijLoc>,
+    /// Remote daemon that owns this note, if it came from `potty-session`. Used so manual dismiss
+    /// and "jump to stale pane" can clear the daemon's persisted pending-note store too.
+    remote_origin: Option<RemoteNoteOrigin>,
     /// When it was last raised — drives newest-first ordering and the age label.
     since: Instant,
+}
+
+#[derive(Clone)]
+struct RemoteNoteOrigin {
+    conn: ConnId,
+    note: feed::Note,
 }
 
 /// A flattened, display-ready attention-feed row handed to the chrome.
@@ -2625,7 +2634,7 @@ impl App {
     /// locally and mirror it to sibling potty instances.
     fn on_local_note(&mut self, note: feed::Note) {
         let note = self.owned_note(note);
-        self.apply_note(note.clone());
+        self.apply_note(note.clone(), None);
         self.broadcast_instance_message(&feed::InstanceMessage::Note { note });
     }
 
@@ -2638,7 +2647,7 @@ impl App {
         {
             return;
         }
-        self.apply_note(note);
+        self.apply_note(note, None);
     }
 
     fn owned_note(&self, mut note: feed::Note) -> feed::Note {
@@ -2650,7 +2659,7 @@ impl App {
 
     /// Fold an attention note into the feed: a `raise` inserts/refreshes the session, a `clear`
     /// removes it. Keyed by `FeedKey` so re-raises update in place rather than pile up.
-    fn apply_note(&mut self, note: feed::Note) {
+    fn apply_note(&mut self, note: feed::Note, remote_origin: Option<RemoteNoteOrigin>) {
         let key = FeedKey::from_note(&note);
         match note.kind {
             feed::Kind::Raise => {
@@ -2677,6 +2686,7 @@ impl App {
                         cwd: note.cwd,
                         pane: note.pane,
                         zellij: note.zellij,
+                        remote_origin,
                         since: Instant::now(),
                     },
                 );
@@ -2707,12 +2717,35 @@ impl App {
     }
 
     fn dismiss_note(&mut self, key: FeedKey, broadcast: bool) {
+        self.clear_remote_note_for_key(&key);
         let changed = self.remove_pending_key(&key);
         if broadcast {
             self.broadcast_dismiss(&key);
         }
         if changed {
             self.request_redraw();
+        }
+    }
+
+    fn clear_remote_note_for_key(&self, key: &FeedKey) {
+        let Some(origin) = self
+            .pending
+            .get(key)
+            .and_then(|pending| pending.remote_origin.clone())
+        else {
+            return;
+        };
+        let Some(outbound) = self
+            .connections
+            .get(&origin.conn)
+            .map(|conn| conn.outbound.clone())
+        else {
+            return;
+        };
+        let mut note = origin.note;
+        note.kind = feed::Kind::Clear;
+        if let Ok(json) = serde_json::to_string(&note) {
+            let _ = outbound.try_send(Frame::Control(Control::Notify { json }));
         }
     }
 
@@ -2726,6 +2759,7 @@ impl App {
             .map(|(key, _)| key.clone())
             .collect();
         for key in &keys {
+            self.clear_remote_note_for_key(key);
             self.remove_pending_key(key);
             self.broadcast_dismiss(key);
         }
@@ -3691,9 +3725,10 @@ impl App {
                 }
             }
             Frame::Control(Control::Notify { json }) => {
-                if let Ok(mut note) = serde_json::from_str::<feed::Note>(&json)
-                    && note.v == feed::SCHEMA_VERSION
+                if let Ok(remote_note) = serde_json::from_str::<feed::Note>(&json)
+                    && remote_note.v == feed::SCHEMA_VERSION
                 {
+                    let mut note = remote_note.clone();
                     if note.host.is_empty()
                         && let Some(host) =
                             self.connections.get(&conn).map(|c| c.target.host.clone())
@@ -3706,10 +3741,16 @@ impl App {
                             .and_then(|c| c.routes.get(&remote_id).copied())
                     });
                     note.instance = Some(self.instance_id.clone());
+                    let remote_origin = Some(RemoteNoteOrigin {
+                        conn,
+                        note: remote_note,
+                    });
                     if self.conn_focused(conn) {
-                        self.on_local_note(note);
+                        let note = self.owned_note(note);
+                        self.apply_note(note.clone(), remote_origin);
+                        self.broadcast_instance_message(&feed::InstanceMessage::Note { note });
                     } else {
-                        self.apply_note(note);
+                        self.apply_note(note, remote_origin);
                     }
                 }
             }

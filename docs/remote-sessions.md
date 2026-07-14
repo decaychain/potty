@@ -87,7 +87,7 @@ payload= [u8 tag][...]
 | `Exited { pane }` | S→C | a pane's shell exited |
 | `Restore { pane }` | S→C | adopt an existing pane (attach burst, or another client opened it) |
 | `LayoutTree { json }` | C→S from the owner; S→C on attach and mirrored live (v2) |
-| `Notify { json }` | S→C | attention-feed note passthrough |
+| `Notify { json }` | S→C note passthrough; C→S feed update | attention-feed note JSON |
 | `Ready` | S→C | end of the attach restore burst |
 
 Pane ids are assigned by the client (`next_remote_id` is seeded past restored ids). Terminal I/O

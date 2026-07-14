@@ -204,6 +204,10 @@ A pending entry clears on the first of (all implemented):
 3. A manual dismiss — the `×` on a feed row. (No time-based TTL: a prompt can legitimately wait
    indefinitely, so dismiss is explicit rather than automatic.)
 
+For built-in SSH sessions, local dismiss/jump clears are sent back to `potty-session` as `Notify`
+clear updates, so daemon-persisted remote notes do not reappear on the next attach. The daemon also
+clears any pending note tied to a pane when that pane exits or is closed.
+
 When the last entry clears the overlay auto-hides; the tab-bar bell stays (the chrome latches on
 for the session so content doesn't jump), and clicking it with nothing waiting dismisses the bell.
 
