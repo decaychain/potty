@@ -45,6 +45,7 @@ mod imp {
     use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
     use potty::notify as feed;
     use potty::proto::{Control, Frame, PROTOCOL_VERSION, PaneId};
+    use potty::term_env;
 
     /// The daemon's socket, remembered so threads can remove it on exit.
     static SOCK: OnceLock<PathBuf> = OnceLock::new();
@@ -63,7 +64,7 @@ mod imp {
         /// Shell PID fallback for cwd inheritance if the PTY foreground process group is unknown.
         child_pid: Option<u32>,
         /// Recent raw output (capped at `REPLAY_CAP`), replayed when a client (re)attaches.
-        buffer: Arc<Mutex<Vec<u8>>>,
+        buffer: Arc<Mutex<ReplayBuffer>>,
         /// Current PTY size, replayed to late-joining clients so their grids match the PTY.
         size: (u16, u16), // (cols, rows)
     }
@@ -96,6 +97,172 @@ mod imp {
 
     fn shell() -> String {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReplayState {
+        Ground,
+        Esc,
+        Csi,
+        Osc,
+        OscEsc,
+        Dcs,
+        DcsEsc,
+        String,
+        StringEsc,
+    }
+
+    impl ReplayState {
+        fn is_ground(self) -> bool {
+            self == Self::Ground
+        }
+
+        fn advance(self, byte: u8) -> Self {
+            match self {
+                Self::Ground => match byte {
+                    0x1b => Self::Esc,
+                    0x90 => Self::Dcs,
+                    0x9b => Self::Csi,
+                    0x9d => Self::Osc,
+                    0x98 | 0x9e | 0x9f => Self::String,
+                    _ => Self::Ground,
+                },
+                Self::Esc => match byte {
+                    b'[' => Self::Csi,
+                    b']' => Self::Osc,
+                    b'P' => Self::Dcs,
+                    b'X' | b'^' | b'_' => Self::String,
+                    0x1b => Self::Esc,
+                    0x90 => Self::Dcs,
+                    0x9b => Self::Csi,
+                    0x9d => Self::Osc,
+                    0x98 | 0x9e | 0x9f => Self::String,
+                    0x20..=0x2f => Self::Esc,
+                    0x30..=0x7e => Self::Ground,
+                    _ => Self::Ground,
+                },
+                Self::Csi => match byte {
+                    0x1b => Self::Esc,
+                    0x40..=0x7e => Self::Ground,
+                    _ => Self::Csi,
+                },
+                Self::Osc => match byte {
+                    0x07 | 0x9c => Self::Ground,
+                    0x1b => Self::OscEsc,
+                    _ => Self::Osc,
+                },
+                Self::OscEsc => match byte {
+                    b'\\' => Self::Ground,
+                    0x1b => Self::OscEsc,
+                    _ => Self::Osc,
+                },
+                Self::Dcs => match byte {
+                    0x9c => Self::Ground,
+                    0x1b => Self::DcsEsc,
+                    _ => Self::Dcs,
+                },
+                Self::DcsEsc => match byte {
+                    b'\\' => Self::Ground,
+                    0x1b => Self::DcsEsc,
+                    _ => Self::Dcs,
+                },
+                Self::String => match byte {
+                    0x9c => Self::Ground,
+                    0x1b => Self::StringEsc,
+                    _ => Self::String,
+                },
+                Self::StringEsc => match byte {
+                    b'\\' => Self::Ground,
+                    0x1b => Self::StringEsc,
+                    _ => Self::String,
+                },
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReplayBuffer {
+        data: Vec<u8>,
+        discard: ReplayState,
+    }
+
+    impl Default for ReplayBuffer {
+        fn default() -> Self {
+            Self {
+                data: Vec::new(),
+                discard: ReplayState::Ground,
+            }
+        }
+    }
+
+    impl ReplayBuffer {
+        fn push(&mut self, bytes: &[u8]) {
+            let mut start = 0;
+            if !self.discard.is_ground() {
+                let mut state = self.discard;
+                for (idx, byte) in bytes.iter().copied().enumerate() {
+                    state = state.advance(byte);
+                    if state.is_ground() {
+                        start = idx + 1;
+                        break;
+                    }
+                }
+                self.discard = state;
+                if !self.discard.is_ground() {
+                    return;
+                }
+            }
+
+            self.data.extend_from_slice(&bytes[start..]);
+            self.trim();
+        }
+
+        fn replay(&self) -> Vec<u8> {
+            let mut state = ReplayState::Ground;
+            let mut last_safe = 0;
+            for (idx, byte) in self.data.iter().copied().enumerate() {
+                state = state.advance(byte);
+                let boundary = idx + 1;
+                if state.is_ground() && is_utf8_boundary(&self.data, boundary) {
+                    last_safe = boundary;
+                }
+            }
+            self.data[..last_safe].to_vec()
+        }
+
+        fn trim(&mut self) {
+            if self.data.len() <= REPLAY_CAP {
+                return;
+            }
+
+            let target = self.data.len() - REPLAY_CAP;
+            let mut state = ReplayState::Ground;
+            let mut last_safe_before_target = 0;
+
+            for (idx, byte) in self.data.iter().copied().enumerate() {
+                state = state.advance(byte);
+                let boundary = idx + 1;
+                if !state.is_ground() || !is_utf8_boundary(&self.data, boundary) {
+                    continue;
+                }
+                if boundary >= target {
+                    self.data.drain(..boundary);
+                    return;
+                }
+                last_safe_before_target = boundary;
+            }
+
+            if self.data.len() - last_safe_before_target <= REPLAY_CAP {
+                self.data.drain(..last_safe_before_target);
+            } else {
+                self.data.clear();
+                self.discard = state;
+            }
+        }
+    }
+
+    fn is_utf8_boundary(bytes: &[u8], idx: usize) -> bool {
+        idx >= bytes.len() || bytes[idx] & 0b1100_0000 != 0b1000_0000
     }
 
     fn process_cwd(pid: u32) -> Option<PathBuf> {
@@ -349,7 +516,8 @@ mod imp {
             Err(_) => return fail(session),
         };
         let mut cmd = CommandBuilder::new(shell());
-        cmd.env("TERM", "xterm-256color");
+        cmd.env(term_env::TERM_VAR, term_env::TERM_VALUE);
+        cmd.env(term_env::COLORTERM_VAR, term_env::COLORTERM_VALUE);
         cmd.env(feed::ENV_SOCK, &session.notify_sock);
         cmd.env(feed::ENV_PANE, pane.to_string());
         if let Some(cwd) = cwd.as_deref().filter(|path| valid_cwd(path)) {
@@ -371,7 +539,7 @@ mod imp {
             Err(_) => return fail(session),
         };
 
-        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let buffer = Arc::new(Mutex::new(ReplayBuffer::default()));
 
         session.panes.lock().unwrap().insert(
             pane,
@@ -416,12 +584,7 @@ mod imp {
                     break;
                 }
                 {
-                    let mut b = out_buf.lock().unwrap();
-                    b.extend_from_slice(&buf[..n]);
-                    if b.len() > REPLAY_CAP {
-                        let excess = b.len() - REPLAY_CAP;
-                        b.drain(..excess);
-                    }
+                    out_buf.lock().unwrap().push(&buf[..n]);
                 }
                 broadcast_data(&out, pane, buf[..n].to_vec());
             }
@@ -480,7 +643,7 @@ mod imp {
                         let panes = session.panes.lock().unwrap();
                         panes
                             .iter()
-                            .map(|(id, p)| (*id, p.buffer.lock().unwrap().clone(), p.size))
+                            .map(|(id, p)| (*id, p.buffer.lock().unwrap().replay(), p.size))
                             .collect()
                     };
                     for (id, buf, (cols, rows)) in restores {
@@ -773,6 +936,58 @@ mod imp {
             notify_sock: inline_notify_socket_path(),
         });
         serve(&session, 1, std::io::stdin().lock());
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{REPLAY_CAP, ReplayBuffer, ReplayState};
+
+        #[test]
+        fn replay_trim_skips_leading_csi_fragment() {
+            let mut buffer = ReplayBuffer::default();
+            let prefix = b"12345";
+            let seq = b"\x1b[38;2;1;2;3m";
+            let tail = b"VISIBLE";
+            let inside_seq = 5;
+            let filler = vec![b'A'; REPLAY_CAP + inside_seq - seq.len() - tail.len()];
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(prefix);
+            bytes.extend_from_slice(seq);
+            bytes.extend_from_slice(&filler);
+            bytes.extend_from_slice(tail);
+            buffer.push(&bytes);
+
+            let replay = buffer.replay();
+            assert!(replay.len() <= REPLAY_CAP);
+            assert!(replay.ends_with(tail));
+            assert_eq!(replay.first(), Some(&b'A'));
+            assert!(!replay.windows(b"38;2".len()).any(|w| w == b"38;2"));
+        }
+
+        #[test]
+        fn replay_snapshot_drops_incomplete_trailing_sequence() {
+            let mut buffer = ReplayBuffer::default();
+            buffer.push(b"VISIBLE\x1b]0;unterminated title");
+
+            assert_eq!(buffer.replay(), b"VISIBLE");
+        }
+
+        #[test]
+        fn replay_trim_discards_oversized_osc_until_terminator() {
+            let mut buffer = ReplayBuffer::default();
+            let mut bytes = b"\x1b]52;c;".to_vec();
+            bytes.extend(std::iter::repeat(b'x').take(REPLAY_CAP + 32));
+            buffer.push(&bytes);
+
+            assert!(buffer.replay().is_empty());
+            assert_eq!(buffer.discard, ReplayState::Osc);
+
+            buffer.push(b"\x07VISIBLE");
+
+            assert_eq!(buffer.replay(), b"VISIBLE");
+            assert_eq!(buffer.discard, ReplayState::Ground);
+        }
     }
 
     pub fn main() {

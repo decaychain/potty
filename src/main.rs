@@ -2899,12 +2899,17 @@ impl App {
     }
 
     fn remote_env_for(&self, target: &RemoteTarget) -> std::collections::BTreeMap<String, String> {
-        self.config
+        let mut env = potty::term_env::defaults();
+        if let Some(profile_env) = self
+            .config
             .profiles
             .iter()
             .find(|p| p.user == target.user && p.host == target.host && p.port == target.port)
             .map(|p| p.env.clone())
-            .unwrap_or_default()
+        {
+            env.extend(profile_env);
+        }
+        env
     }
 
     /// Activate a feed row clicked in this process. If the owner is another live potty instance,
@@ -3088,8 +3093,13 @@ impl App {
             .to_string();
         let mut cmd = portable_pty::CommandBuilder::new(shell);
         // Declare what we actually emulate so terminfo-driven apps (mc, ncurses) agree with
-        // the escape sequences we send (e.g. application cursor keys).
-        cmd.env("TERM", "xterm-256color");
+        // the escape sequences we send (e.g. application cursor keys). COLORTERM is the widely
+        // used true-color hint for apps that keep TERM at xterm-256color.
+        cmd.env(potty::term_env::TERM_VAR, potty::term_env::TERM_VALUE);
+        cmd.env(
+            potty::term_env::COLORTERM_VAR,
+            potty::term_env::COLORTERM_VALUE,
+        );
         // Attention feed: tell child tools where to send notes (`potty-notify` connects here) and
         // which pane they live in (for exact jump-to-focus). Unix-only — the listener is a UDS.
         #[cfg(unix)]

@@ -8,6 +8,7 @@
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use potty::notify::{Kind, Note, SCHEMA_VERSION, Tool};
@@ -17,6 +18,15 @@ use potty::proto::{Control, Frame, Layout, LayoutNode, LayoutTab};
 /// control frame in arrival order.
 type Collected =
     std::sync::Arc<std::sync::Mutex<(std::collections::HashMap<u64, Vec<u8>>, Vec<Control>)>>;
+
+fn tag() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 fn have(bin: &str) -> bool {
     Command::new(bin)
@@ -237,7 +247,7 @@ fn shell_survives_client_disconnect() {
         eprintln!("skipping: pgrep unavailable");
         return;
     }
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-persist-{tag}.sock"));
     let marker = format!("8{tag}"); // `sleep 8<pid>` — grep-able, unique, valid
     let daemon = start_daemon(&sock);
@@ -279,7 +289,7 @@ fn relay_detach_keeps_foreground_process_and_reattaches() {
         eprintln!("skipping: pgrep unavailable");
         return;
     }
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-relay-persist-{tag}.sock"));
     let marker = format!("POTTY_RELAY_MARKER_{tag}");
     let _ = std::fs::remove_file(&sock);
@@ -331,7 +341,7 @@ fn relay_detach_keeps_foreground_process_and_reattaches() {
 
 #[test]
 fn reattach_restores_and_replays() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-reattach-{tag}.sock"));
     let marker = format!("REATTACH_MARKER_{tag}");
     let daemon = start_daemon(&sock);
@@ -373,8 +383,38 @@ fn reattach_restores_and_replays() {
 }
 
 #[test]
+fn remote_pane_advertises_truecolor_env() {
+    let tag = tag();
+    let sock = std::env::temp_dir().join(format!("potty-env-{tag}.sock"));
+    let marker = format!("POTTY_ENV_MARKER_{tag}");
+    let daemon = start_daemon(&sock);
+
+    let mut client = Client::connect(&sock);
+    client.send(Frame::Control(Control::Hello { version: 1 }));
+    client.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    client.send(Frame::Data {
+        pane: 1,
+        bytes: format!("printf '{marker}:%s:%s\\n' \"$COLORTERM\" \"$TERM\"\r").into_bytes(),
+    });
+    let expected = format!("{marker}:truecolor:xterm-256color");
+    let advertised = client.wait(|out, _| {
+        out.get(&1)
+            .is_some_and(|o| contains(o, expected.as_bytes()))
+    });
+    client.disconnect();
+    cleanup(daemon, &sock);
+
+    assert!(advertised, "remote shell did not advertise true color");
+}
+
+#[test]
 fn second_attach_joins_without_evicting_first() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-multi-{tag}.sock"));
     let marker = format!("MULTI_ATTACH_MARKER_{tag}");
     let marker2 = format!("MULTI_ATTACH_SECOND_{tag}");
@@ -433,7 +473,7 @@ fn second_attach_joins_without_evicting_first() {
 
 #[test]
 fn focus_follows_input_and_gates_layout_and_resize() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-focus-{tag}.sock"));
     let daemon = start_daemon(&sock);
 
@@ -551,7 +591,7 @@ fn focus_follows_input_and_gates_layout_and_resize() {
 
 #[test]
 fn pane_opened_by_one_client_is_announced_to_the_other() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-announce-{tag}.sock"));
     let marker = format!("ANNOUNCE_MARKER_{tag}");
     let daemon = start_daemon(&sock);
@@ -605,7 +645,7 @@ fn pane_opened_by_one_client_is_announced_to_the_other() {
 
 #[test]
 fn reattach_replays_layout() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-layout-{tag}.sock"));
     let daemon = start_daemon(&sock);
 
@@ -676,7 +716,7 @@ fn reattach_replays_layout() {
 
 #[test]
 fn daemon_exits_after_last_pane_closed() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-close-{tag}.sock"));
     let mut daemon = start_daemon(&sock);
 
@@ -718,7 +758,7 @@ fn daemon_exits_after_last_pane_closed() {
 
 #[test]
 fn notify_socket_forwards_notes_to_attached_client() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-notify-attached-{tag}.sock"));
     let daemon = start_daemon(&sock);
 
@@ -742,7 +782,7 @@ fn notify_socket_forwards_notes_to_attached_client() {
 
 #[test]
 fn notify_socket_replays_pending_notes_on_reattach() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-notify-reattach-{tag}.sock"));
     let daemon = start_daemon(&sock);
 
@@ -780,7 +820,7 @@ fn notify_socket_replays_pending_notes_on_reattach() {
 
 #[test]
 fn notify_socket_replays_detached_clear_on_reattach() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-notify-clear-{tag}.sock"));
     let daemon = start_daemon(&sock);
 
@@ -828,7 +868,7 @@ fn notify_socket_replays_detached_clear_on_reattach() {
 
 #[test]
 fn client_notify_clear_removes_pending_note_on_reattach() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-notify-client-clear-{tag}.sock"));
     let daemon = start_daemon(&sock);
 
@@ -884,7 +924,7 @@ fn client_notify_clear_removes_pending_note_on_reattach() {
 
 #[test]
 fn pane_close_clears_pending_note_for_that_pane() {
-    let tag = std::process::id();
+    let tag = tag();
     let sock = std::env::temp_dir().join(format!("potty-notify-pane-close-{tag}.sock"));
     let daemon = start_daemon(&sock);
 

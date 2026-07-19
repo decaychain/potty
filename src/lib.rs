@@ -1,9 +1,9 @@
 //! Library surface shared between the `potty` binary and the `potty-notify` helper.
 //!
-//! Only the attention-feed wire contract lives here — everything else is private to the binary
-//! (`src/main.rs` and its `mod`s). Keeping the contract in one place means the listener and the
-//! sender can never drift out of sync.
+//! The attention-feed wire contract, remote protocol, SSH client, and small cross-binary helpers
+//! live here so `potty`, `potty-session`, and `potty-notify` can share them without drift.
 
 pub mod notify;
 pub mod proto;
 pub mod remote;
+pub mod term_env;
