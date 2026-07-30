@@ -53,6 +53,8 @@ pub struct Config {
     /// How much text in unfocused panes dims (0.0 disables; 0.15 = 15% darker). Transitions
     /// are eased, ~150 ms.
     pub focus_dim: f32,
+    /// Scrollback scrolling glides instead of jumping line-by-line.
+    pub smooth_scroll: bool,
     /// Command run on a remote host by "Connect to host…" to start the multiplexer backend. Must
     /// be on the remote's PATH, or an absolute path (until bootstrapping installs it for you).
     pub remote_command: String,
@@ -205,6 +207,7 @@ impl Default for Config {
             phosphor: true,
             cursor_smear: false,
             focus_dim: 0.15,
+            smooth_scroll: true,
             remote_command: "potty-session".into(),
             profiles: Vec::new(),
             hotkeys: BTreeMap::new(),
