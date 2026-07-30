@@ -938,6 +938,17 @@ mod imp {
         serve(&session, 1, std::io::stdin().lock());
     }
 
+    pub fn main() {
+        let mut args = std::env::args().skip(1);
+        match args.next().as_deref() {
+            Some("--daemon") => {
+                run_daemon(args.next().map(PathBuf::from).unwrap_or_else(socket_path))
+            }
+            _ if std::env::var_os("POTTY_SESSION_NODAEMON").is_some() => run_inline(),
+            _ => attach(socket_path()),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{REPLAY_CAP, ReplayBuffer, ReplayState};
@@ -977,7 +988,7 @@ mod imp {
         fn replay_trim_discards_oversized_osc_until_terminator() {
             let mut buffer = ReplayBuffer::default();
             let mut bytes = b"\x1b]52;c;".to_vec();
-            bytes.extend(std::iter::repeat(b'x').take(REPLAY_CAP + 32));
+            bytes.extend(std::iter::repeat_n(b'x', REPLAY_CAP + 32));
             buffer.push(&bytes);
 
             assert!(buffer.replay().is_empty());
@@ -987,17 +998,6 @@ mod imp {
 
             assert_eq!(buffer.replay(), b"VISIBLE");
             assert_eq!(buffer.discard, ReplayState::Ground);
-        }
-    }
-
-    pub fn main() {
-        let mut args = std::env::args().skip(1);
-        match args.next().as_deref() {
-            Some("--daemon") => {
-                run_daemon(args.next().map(PathBuf::from).unwrap_or_else(socket_path))
-            }
-            _ if std::env::var_os("POTTY_SESSION_NODAEMON").is_some() => run_inline(),
-            _ => attach(socket_path()),
         }
     }
 } // mod imp

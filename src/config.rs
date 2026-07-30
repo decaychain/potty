@@ -41,6 +41,18 @@ pub struct Config {
     /// Thickness of the underline/beam cursor as a fraction of the cell (height for underline,
     /// width for beam). Bump it for a fatter underscore. Ignored for the block cursor.
     pub cursor_thickness: f32,
+    /// Fade glyphs in/out as they appear/disappear (a quick, slightly overshooting pop on the
+    /// way in). Bulk changes — scrolling, full redraws, resizes — are never animated.
+    pub text_fade: bool,
+    /// Departing glyphs decay like CRT phosphor: cooling toward an amber afterglow with a
+    /// longer tail, instead of the plain quick fade. Only meaningful while `text_fade` is on.
+    pub phosphor: bool,
+    /// The cursor leaves a brief comet trail when it jumps to a new position. Off by default —
+    /// a matter of taste.
+    pub cursor_smear: bool,
+    /// How much text in unfocused panes dims (0.0 disables; 0.15 = 15% darker). Transitions
+    /// are eased, ~150 ms.
+    pub focus_dim: f32,
     /// Command run on a remote host by "Connect to host…" to start the multiplexer backend. Must
     /// be on the remote's PATH, or an absolute path (until bootstrapping installs it for you).
     pub remote_command: String,
@@ -189,6 +201,10 @@ impl Default for Config {
             cursor_shape: "block".into(),
             cursor_blink: false,
             cursor_thickness: 0.15,
+            text_fade: true,
+            phosphor: true,
+            cursor_smear: false,
+            focus_dim: 0.15,
             remote_command: "potty-session".into(),
             profiles: Vec::new(),
             hotkeys: BTreeMap::new(),

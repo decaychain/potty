@@ -13,8 +13,10 @@
 //! these sizes, the next perf step).
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
@@ -24,6 +26,51 @@ use cosmic_text::{
 use wgpu::util::DeviceExt;
 
 const ATLAS: u32 = 1024;
+
+/// Glyph fade animation. Kept fast so the terminal never feels laggy — a fade-in is done
+/// around the time the next keystroke lands at normal typing speed; the fade-out lingers
+/// slightly longer since departing text blocks nothing.
+const FADE_IN: Duration = Duration::from_millis(120);
+const FADE_OUT: Duration = Duration::from_millis(150);
+
+/// If more than this fraction of a pane's cells change glyphs in a single frame, it's a bulk
+/// update (scroll, `clear`, opening a full-screen app, resize) — animate none of it. Fading a
+/// whole scrolling screen reads as smear, and the effect is meant for keystroke-scale change.
+const BULK_FRACTION: f32 = 0.25;
+
+/// Phosphor mode: departing glyphs cool toward this glow (amber, like an old tube) while a
+/// cubic alpha decay gives them a long faint tail.
+const PHOSPHOR_DECAY: Duration = Duration::from_millis(400);
+const PHOSPHOR_GLOW: Rgb = Rgb {
+    r: 0xff,
+    g: 0xb0,
+    b: 0x00,
+};
+
+/// Cursor smear: when the cursor jumps, a comet trail of fading cursor copies collapses from
+/// the old position into the new one.
+const SMEAR: Duration = Duration::from_millis(110);
+const SMEAR_COPIES: usize = 6;
+/// Peak trail opacity (the copy nearest the cursor; older copies fall off quadratically).
+const SMEAR_ALPHA: f32 = 0.4;
+
+/// Focus dimming eases exponentially with this time constant (~95% settled in 3τ ≈ 150 ms).
+const DIM_TAU: f32 = 0.05;
+
+/// Ease-out-back: rises from 0, overshoots 1 by ~10% around t≈0.63, settles to 1. The classic
+/// c1 = 1.70158 gives the "little overshoot" without looking springy.
+fn ease_out_back(t: f32) -> f32 {
+    const C1: f32 = 1.70158;
+    const C3: f32 = C1 + 1.0;
+    let u = t - 1.0;
+    1.0 + C3 * u * u * u + C1 * u * u
+}
+
+/// Plain ease-out: fast start, gentle landing.
+fn ease_out_cubic(t: f32) -> f32 {
+    let u = 1.0 - t;
+    1.0 - u * u * u
+}
 
 /// Selection highlight background (could become a palette entry later).
 const SELECTION_BG: Rgb = Rgb {
@@ -124,6 +171,65 @@ struct FgInstance {
     color: [f32; 4],
 }
 
+/// What a cell displays, as far as fading cares: which atlas glyph it resolves to.
+#[derive(Clone, Copy, PartialEq)]
+struct CellKey {
+    c: char,
+    bold: bool,
+    italic: bool,
+}
+
+/// A glyph that just vanished from its cell, still being drawn while its alpha decays.
+#[derive(Clone, Copy)]
+struct Ghost {
+    key: CellKey,
+    fg: Rgb,
+    since: Instant,
+}
+
+/// Per-cell fade state, remembered between frames (grid-shaped, row-major).
+#[derive(Clone, Copy, Default)]
+struct CellRec {
+    key: Option<CellKey>,
+    /// Last drawn fg color — what a ghost fades out in.
+    fg: Rgb,
+    /// When the current glyph appeared; None once the fade-in has settled.
+    born: Option<Instant>,
+    ghost: Option<Ghost>,
+}
+
+/// A cursor jump being animated: the trail's tail eases from `from` to `to` while the real
+/// cursor sits at `to` — a comet collapsing into its destination.
+#[derive(Clone, Copy)]
+struct Smear {
+    from: (f32, f32),
+    to: (f32, f32),
+    since: Instant,
+}
+
+/// A pane's animation state, remembered between frames (fades, cursor smear, focus dim).
+#[derive(Default)]
+struct PaneAnim {
+    /// Per-cell fade records (row-major, `cols`×`rows`); rebuilt from scratch when the grid
+    /// resizes (no animations across a resize — drag-resizing must not shimmer).
+    cells: Vec<CellRec>,
+    cols: usize,
+    rows: usize,
+    /// Cell origin (px) where the cursor last drew, for detecting jumps.
+    cursor_px: Option<(f32, f32)>,
+    smear: Option<Smear>,
+    /// Pane origin and display offset at the last prepare — when either shifts, the cursor
+    /// "moved" because the view did, not because it travelled: update silently, no smear.
+    origin: (f32, f32),
+    doff: i32,
+    /// Focus dim level, eased toward 0 (focused, bright) or 1 (unfocused): the fraction of
+    /// `focus_dim` currently applied.
+    dim: f32,
+    /// When this pane last prepared — the dim easing needs a per-pane dt, since panes are
+    /// only rebuilt when dirty.
+    last_prep: Option<Instant>,
+}
+
 /// Simple shelf packer over one atlas texture.
 struct Atlas {
     texture: wgpu::Texture,
@@ -162,6 +268,7 @@ struct PaneBuffers {
     fg_buf: wgpu::Buffer,
     bg_cap: usize,
     fg_cap: usize,
+    anim: PaneAnim,
 }
 
 impl PaneBuffers {
@@ -174,6 +281,7 @@ impl PaneBuffers {
             fg_buf: inst_buf(device, "fg-inst", cap * std::mem::size_of::<FgInstance>()),
             bg_cap: cap,
             fg_cap: cap,
+            anim: PaneAnim::default(),
         }
     }
 }
@@ -186,6 +294,14 @@ pub struct GridRenderer {
     family: Option<String>,
     palette: Palette,
     families: Vec<String>,
+    /// Animate glyph appearance/disappearance (config `text_fade`).
+    fade: bool,
+    /// Departing glyphs decay through the phosphor glow instead of the plain quick fade.
+    phosphor: bool,
+    /// The cursor leaves a collapsing comet trail when it jumps (config `cursor_smear`).
+    smear: bool,
+    /// Brightness fraction unfocused panes lose (config `focus_dim`; 0 disables).
+    focus_dim: f32,
 
     atlas: Atlas,
     /// Rasterized-glyph cache, keyed by (char, bold, italic).
@@ -448,6 +564,10 @@ impl GridRenderer {
             family: None,
             palette: Palette::default(),
             families,
+            fade: true,
+            phosphor: true,
+            smear: false,
+            focus_dim: 0.15,
             atlas: Atlas {
                 texture,
                 x: 0,
@@ -476,6 +596,23 @@ impl GridRenderer {
 
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
+    }
+
+    pub fn set_fade(&mut self, fade: bool) {
+        self.fade = fade;
+    }
+
+    pub fn set_phosphor(&mut self, phosphor: bool) {
+        self.phosphor = phosphor;
+    }
+
+    pub fn set_smear(&mut self, smear: bool) {
+        self.smear = smear;
+    }
+
+    pub fn set_focus_dim(&mut self, dim: f32) {
+        // Clamped so a wild config value can't invert or black out colors.
+        self.focus_dim = dim.clamp(0.0, 0.9);
     }
 
     /// Switch font (family = None → generic monospace) and/or size. Re-measures the cell,
@@ -569,7 +706,9 @@ impl GridRenderer {
 
     /// Rebuild a pane's instance data, positioned within the pane at `origin` (px). Only called
     /// for panes flagged dirty; clean panes keep their cached buffers from a previous call.
-    // too_many_arguments: one over the limit, and each parameter is genuinely per-call render
+    /// Returns true while an animation (glyph fade, cursor smear, focus-dim transition) is
+    /// still in flight — the caller must keep the pane dirty and frames coming until it settles.
+    // too_many_arguments: over the limit, but each parameter is genuinely per-call render
     // state; a params struct would be built fresh at the sole call site anyway.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare<L: EventListener>(
@@ -584,21 +723,53 @@ impl GridRenderer {
         show_cursor: bool,
         // Underline/beam thickness as a fraction of the cell.
         cursor_thickness: f32,
-    ) {
+        // One timestamp for every animation decision this frame.
+        now: Instant,
+        // Whether this pane holds keyboard focus (drives focus dimming).
+        focused: bool,
+    ) -> bool {
         queue.write_buffer(
             &self.screen_buf,
             0,
             bytemuck::cast_slice(&[screen.0, screen.1, 0.0, 0.0]),
         );
 
-        // Detach this pane's vectors (reusing their capacity) so the loop can also borrow
-        // `self` mutably for glyph rasterization.
-        let (mut bg, mut fg) = match self.panes.get_mut(&pane) {
-            Some(pb) => (std::mem::take(&mut pb.bg), std::mem::take(&mut pb.fg)),
-            None => (Vec::new(), Vec::new()),
+        // Detach this pane's vectors and animation state (reusing their capacity) so the loop
+        // can also borrow `self` mutably for glyph rasterization.
+        let (mut bg, mut fg, mut anim) = match self.panes.get_mut(&pane) {
+            Some(pb) => (
+                std::mem::take(&mut pb.bg),
+                std::mem::take(&mut pb.fg),
+                std::mem::take(&mut pb.anim),
+            ),
+            None => (Vec::new(), Vec::new(), PaneAnim::default()),
         };
         bg.clear();
         fg.clear();
+
+        let fade_on = self.fade;
+        let phosphor_on = self.phosphor;
+        let (cols, rows) = (term.columns(), term.screen_lines());
+        let grid_changed = anim.cols != cols || anim.rows != rows;
+        anim.cols = cols;
+        anim.rows = rows;
+        // Reset the fade records when the grid resizes — silently, so drag-resizing a pane
+        // doesn't shimmer with re-fading content.
+        let mut fresh = false;
+        if fade_on {
+            if grid_changed || anim.cells.len() != cols * rows {
+                anim.cells.clear();
+                anim.cells.resize(cols * rows, CellRec::default());
+                fresh = true;
+            }
+        } else {
+            anim.cells.clear(); // drop stale state; re-enabling resets via the resize path above
+        }
+        // Which fg instance draws each cell's glyph (-1: none), so fades can adjust its color
+        // after the build loop; and this frame's glyph changes (old key + old fg), so the
+        // bulk-vs-animate decision can be made once the full count is known.
+        let mut fg_ix = vec![-1i32; anim.cells.len()];
+        let mut changes: Vec<(usize, Option<CellKey>, Rgb)> = Vec::new();
 
         let palette = self.palette; // Copy — frees `self` for self.glyph() below
         let content = term.renderable_content();
@@ -702,11 +873,33 @@ impl GridRenderer {
             }
 
             let c = cell.c;
-            if c != ' '
+            let key = (c != ' '
                 && c != '\0'
-                && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN)
-                && let Some(g) = self.glyph(queue, c, bold, italic)
+                && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN))
+            .then_some(CellKey { c, bold, italic });
+
+            // Record glyph changes for the fade pass below.
+            let ri = point.line.0 + off;
+            let idx = (fade_on && point.column.0 < cols && ri >= 0 && (ri as usize) < rows)
+                .then(|| ri as usize * cols + point.column.0);
+            if let Some(idx) = idx {
+                let rec = &mut anim.cells[idx];
+                if rec.key != key {
+                    if !fresh {
+                        changes.push((idx, rec.key, rec.fg));
+                    }
+                    rec.key = key;
+                    rec.born = None; // (re)started below if this change animates
+                }
+                rec.fg = fg_col;
+            }
+
+            if let Some(k) = key
+                && let Some(g) = self.glyph(queue, k.c, k.bold, k.italic)
             {
+                if let Some(idx) = idx {
+                    fg_ix[idx] = fg.len() as i32;
+                }
                 fg.push(FgInstance {
                     pos: [x + g.offset[0], y + asc - g.offset[1]],
                     size: g.size,
@@ -714,6 +907,196 @@ impl GridRenderer {
                     uv1: g.uv1,
                     color: rgba(fg_col, 1.0),
                 });
+            }
+        }
+
+        // Fade bookkeeping. A bulk update (scroll, `clear`, a full-screen app repaint, the
+        // first frame after a resize) commits silently; keystroke-scale changes start fades.
+        let mut animating = false;
+        if fade_on {
+            let bulk = (changes.len() as f32) > anim.cells.len() as f32 * BULK_FRACTION;
+            for (idx, old_key, old_fg) in changes {
+                let rec = &mut anim.cells[idx];
+                if bulk {
+                    rec.ghost = None;
+                } else {
+                    rec.ghost = old_key.map(|key| Ghost {
+                        key,
+                        fg: old_fg,
+                        since: now,
+                    });
+                    rec.born = rec.key.is_some().then_some(now);
+                }
+            }
+            // Apply the active fades: scale appearing glyphs' instances, draw departing ghosts.
+            for (idx, rec) in anim.cells.iter_mut().enumerate() {
+                if let Some(born) = rec.born {
+                    let t = (now - born).as_secs_f32() / FADE_IN.as_secs_f32();
+                    if t >= 1.0 {
+                        rec.born = None;
+                    } else {
+                        animating = true;
+                        let s = ease_out_back(t);
+                        // Alpha caps at 1; the overshoot goes into brightness instead — doubled
+                        // (≈20% peak; 30% read as too stark, 10% as invisible), because a bump
+                        // in linear light barely registers after sRGB encoding.
+                        let bright = if s > 1.0 { 1.0 + (s - 1.0) * 2.0 } else { s };
+                        if fg_ix[idx] >= 0 {
+                            let color = &mut fg[fg_ix[idx] as usize].color;
+                            color[0] *= bright;
+                            color[1] *= bright;
+                            color[2] *= bright;
+                            color[3] *= s.clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                if let Some(ghost) = rec.ghost {
+                    let decay = if phosphor_on { PHOSPHOR_DECAY } else { FADE_OUT };
+                    let t = (now - ghost.since).as_secs_f32() / decay.as_secs_f32();
+                    if t >= 1.0 {
+                        rec.ghost = None;
+                    } else {
+                        animating = true;
+                        if let Some(g) =
+                            self.glyph(queue, ghost.key.c, ghost.key.bold, ghost.key.italic)
+                        {
+                            let x = origin.0 + (idx % cols) as f32 * cw;
+                            let y = origin.1 + (idx / cols) as f32 * ch;
+                            let color = if phosphor_on {
+                                // Phosphor decay: cool from the glyph's own color toward the
+                                // amber glow while a cubic falloff leaves a long faint tail.
+                                let a = (1.0 - t) * (1.0 - t) * (1.0 - t);
+                                let m = (t * 1.8).min(1.0);
+                                let c = rgba(ghost.fg, a);
+                                let glow = rgba(PHOSPHOR_GLOW, a);
+                                [
+                                    c[0] + (glow[0] - c[0]) * m,
+                                    c[1] + (glow[1] - c[1]) * m,
+                                    c[2] + (glow[2] - c[2]) * m,
+                                    a,
+                                ]
+                            } else {
+                                rgba(ghost.fg, (1.0 - t) * (1.0 - t)) // fast drop, soft tail
+                            };
+                            fg.push(FgInstance {
+                                pos: [x + g.offset[0], y + asc - g.offset[1]],
+                                size: g.size,
+                                uv0: g.uv0,
+                                uv1: g.uv1,
+                                color,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cursor smear. A jump starts (or retargets) the trail; when the *view* shifted under
+        // the cursor (pane moved, resize, scrollback) the position change isn't travel — update
+        // silently instead of smearing across the screen.
+        let cursor_px = (cursor_on
+            && matches!(
+                cursor_shape,
+                CursorShape::Block | CursorShape::Underline | CursorShape::Beam
+            ))
+        .then(|| {
+            let (c, r) = (cursor_point.column.0, cursor_point.line.0 + off);
+            (r >= 0 && (r as usize) < rows && c < cols)
+                .then_some((origin.0 + c as f32 * cw, origin.1 + r as f32 * ch))
+        })
+        .flatten();
+        let view_shifted = fresh || grid_changed || anim.origin != origin || anim.doff != off;
+        if view_shifted {
+            anim.smear = None;
+        } else if self.smear
+            && let (Some(prev), Some(cur)) = (anim.cursor_px, cursor_px)
+            && prev != cur
+        {
+            // Retargeting mid-flight continues from the current tail, keeping the trail whole.
+            let from = match anim.smear {
+                Some(s) => {
+                    let t = ((now - s.since).as_secs_f32() / SMEAR.as_secs_f32()).min(1.0);
+                    let e = ease_out_cubic(t);
+                    (
+                        s.from.0 + (s.to.0 - s.from.0) * e,
+                        s.from.1 + (s.to.1 - s.from.1) * e,
+                    )
+                }
+                None => prev,
+            };
+            anim.smear = Some(Smear {
+                from,
+                to: cur,
+                since: now,
+            });
+        }
+        anim.cursor_px = cursor_px;
+        anim.origin = origin;
+        anim.doff = off;
+
+        if let Some(s) = anim.smear {
+            let t = (now - s.since).as_secs_f32() / SMEAR.as_secs_f32();
+            if t >= 1.0 || !self.smear || !cursor_on {
+                anim.smear = None;
+            } else {
+                animating = true;
+                let e = ease_out_cubic(t);
+                let tail = (
+                    s.from.0 + (s.to.0 - s.from.0) * e,
+                    s.from.1 + (s.to.1 - s.from.1) * e,
+                );
+                // Trail copies mirror the cursor's shape, fading off toward the tail. They sit
+                // in the bg pass, so text stays crisp above the streak.
+                let (w, h, dx, dy) = match cursor_shape {
+                    CursorShape::Underline => {
+                        let th = (ch * cursor_thickness).max(1.0);
+                        (cw, th, 0.0, ch - th)
+                    }
+                    CursorShape::Beam => {
+                        let th = (cw * cursor_thickness).max(1.0);
+                        (th, ch, 0.0, 0.0)
+                    }
+                    _ => (cw, ch, 0.0, 0.0), // Block
+                };
+                for i in 0..SMEAR_COPIES {
+                    let f = (i as f32 + 1.0) / SMEAR_COPIES as f32;
+                    let p = (tail.0 + (s.to.0 - tail.0) * f, tail.1 + (s.to.1 - tail.1) * f);
+                    bg.push(BgInstance {
+                        pos: [p.0 + dx, p.1 + dy],
+                        size: [w, h],
+                        color: rgba(palette.cursor, SMEAR_ALPHA * f * f),
+                    });
+                }
+            }
+        }
+
+        // Focus dim: ease toward this pane's focus state, then darken every instance (fades,
+        // ghosts and smear included) so the whole pane reads as one surface.
+        let target = if focused { 0.0 } else { 1.0 };
+        if self.focus_dim > 0.0 {
+            let dt = anim.last_prep.map_or(0.0, |p| (now - p).as_secs_f32());
+            anim.dim += (target - anim.dim) * (1.0 - (-dt / DIM_TAU).exp());
+            if (anim.dim - target).abs() < 0.01 {
+                anim.dim = target;
+            } else {
+                animating = true;
+            }
+        } else {
+            anim.dim = target; // feature off: track silently so enabling it doesn't animate
+        }
+        anim.last_prep = Some(now);
+        let dim = self.focus_dim * anim.dim;
+        if dim > 0.0 {
+            let f = 1.0 - dim;
+            for i in &mut bg {
+                i.color[0] *= f;
+                i.color[1] *= f;
+                i.color[2] *= f;
+            }
+            for i in &mut fg {
+                i.color[0] *= f;
+                i.color[1] *= f;
+                i.color[2] *= f;
             }
         }
 
@@ -740,6 +1123,8 @@ impl GridRenderer {
         );
         pb.bg = bg;
         pb.fg = fg;
+        pb.anim = anim;
+        animating
     }
 
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, pane: u64) {

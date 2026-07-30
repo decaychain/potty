@@ -2266,6 +2266,8 @@ impl WindowState {
     }
 
     /// Rebuild one pane's cached instance buffers (only the App's dirty panes call this).
+    /// Returns true while the pane's animations (fades, smear, dim) are still running.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_pane(
         &mut self,
         pane: u64,
@@ -2274,7 +2276,9 @@ impl WindowState {
         screen: (f32, f32),
         show_cursor: bool,
         cursor_thickness: f32,
-    ) {
+        now: Instant,
+        focused: bool,
+    ) -> bool {
         self.grid.prepare(
             &self.device,
             &self.queue,
@@ -2284,7 +2288,9 @@ impl WindowState {
             screen,
             show_cursor,
             cursor_thickness,
-        );
+            now,
+            focused,
+        )
     }
 
     fn render(
@@ -2506,6 +2512,13 @@ struct App {
     /// while the focused pane's cursor blinks and is idle — see `about_to_wait`.
     blink_on: bool,
     blink_next: Option<Instant>,
+    /// Panes with animations in flight (glyph fades, cursor smear, focus-dim transitions).
+    /// While non-empty, `about_to_wait` keeps them dirty and frames coming (vsync-paced by
+    /// the Fifo surface) until the animations settle.
+    animating: std::collections::HashSet<PaneId>,
+    /// The focused pane at the last redraw — a change re-prepares both sides of the move so
+    /// focus dimming can animate.
+    last_focus: PaneId,
 
     /// Attention feed: sessions waiting for the user. Fed by the notify sockets and mirrored
     /// between live potty instances; rendered as a floating overlay in the chrome.
@@ -2595,6 +2608,8 @@ impl App {
             divider_px: Vec::new(),
             blink_on: true,
             blink_next: None,
+            animating: std::collections::HashSet::new(),
+            last_focus: 0,
             pending: HashMap::new(),
             feed_open: false,
             chrome_latched: false,
@@ -4282,6 +4297,10 @@ impl App {
         let line = self.line_px(size);
         if let Some(state) = self.state.as_mut() {
             state.grid.set_palette(palette);
+            state.grid.set_fade(self.config.text_fade);
+            state.grid.set_phosphor(self.config.phosphor);
+            state.grid.set_smear(self.config.cursor_smear);
+            state.grid.set_focus_dim(self.config.focus_dim);
             if font_changed {
                 state.grid.set_font(family, size * scale, line);
                 let m = state.grid.metrics();
@@ -5103,7 +5122,16 @@ impl App {
             )
         };
         let focus = self.focus();
+        // A focus move re-prepares both panes involved so focus dimming can transition.
+        if self.last_focus != focus {
+            if self.terms.contains_key(&self.last_focus) {
+                self.dirty.insert(self.last_focus);
+            }
+            self.dirty.insert(focus);
+            self.last_focus = focus;
+        }
         let cursor_thickness = self.config.cursor_thickness;
+        let now = Instant::now();
         for (id, r) in &leaves {
             if self.dirty.remove(id)
                 && let Some(term) = self.arc(*id)
@@ -5112,16 +5140,25 @@ impl App {
                 // Only the focused pane's cursor blinks; suppress it during the off phase.
                 let show_cursor = *id != focus || self.blink_on;
                 let guard = term.lock().unwrap();
-                self.state.as_mut().unwrap().prepare_pane(
+                let anim = self.state.as_mut().unwrap().prepare_pane(
                     *id,
                     &guard,
                     origin,
                     (sw, sh),
                     show_cursor,
                     cursor_thickness,
+                    now,
+                    *id == focus,
                 );
+                if anim {
+                    self.animating.insert(*id);
+                } else {
+                    self.animating.remove(id);
+                }
             }
         }
+        // A pane that went off-screen mid-fade would otherwise pin the frame loop forever.
+        self.animating.retain(|id| self.visible.contains(id));
 
         let panes: Vec<(egui::Rect, u64)> = leaves.iter().map(|(id, r)| (*r, (*id))).collect();
         let renderer = self.egui_renderer.as_mut().unwrap();
@@ -5164,6 +5201,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.config = Config::load(&self.config_path);
         state.grid.set_palette(self.config.palette());
+        state.grid.set_fade(self.config.text_fade);
+        state.grid.set_phosphor(self.config.phosphor);
+        state.grid.set_smear(self.config.cursor_smear);
+        state.grid.set_focus_dim(self.config.focus_dim);
         state.grid.set_font(
             self.config.font_family.clone(),
             self.config.font_size * scale,
@@ -5264,8 +5305,9 @@ impl ApplicationHandler<UserEvent> for App {
         if self.state.is_none() || self.terms.is_empty() {
             return;
         }
+        let now = Instant::now();
+        let mut deadline: Option<Instant> = None;
         if self.focused_cursor_blinks() {
-            let now = Instant::now();
             let next = *self.blink_next.get_or_insert(now + BLINK_INTERVAL);
             if now >= next {
                 self.blink_on = !self.blink_on;
@@ -5274,19 +5316,29 @@ impl ApplicationHandler<UserEvent> for App {
                 self.dirty.insert(focus);
                 self.request_redraw();
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(
-                self.blink_next.unwrap_or(now + BLINK_INTERVAL),
-            ));
+            deadline = Some(self.blink_next.unwrap_or(now + BLINK_INTERVAL));
         } else {
-            // Not blinking: make sure the cursor is shown, then go fully idle.
+            // Not blinking: make sure the cursor is shown.
             if !self.blink_on {
                 self.blink_on = true;
                 self.dirty.insert(self.focus());
                 self.request_redraw();
             }
             self.blink_next = None;
-            event_loop.set_control_flow(ControlFlow::Wait);
         }
+        // Glyph fades in flight: keep those panes re-preparing every frame. The redraw request
+        // is what actually paces the loop (vsync via Fifo); the timer is only a fallback wake.
+        if !self.animating.is_empty() {
+            self.animating.retain(|id| self.terms.contains_key(id));
+            self.dirty.extend(self.animating.iter().copied());
+            self.request_redraw();
+            let anim_next = now + Duration::from_millis(8);
+            deadline = Some(deadline.map_or(anim_next, |d| d.min(anim_next)));
+        }
+        event_loop.set_control_flow(match deadline {
+            Some(d) => ControlFlow::WaitUntil(d),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
