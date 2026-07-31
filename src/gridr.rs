@@ -234,6 +234,8 @@ struct PaneAnim {
     /// Positive = showing newer content than the viewport (the view just scrolled into
     /// history and is still gliding there).
     debt: f32,
+    /// Previous frame's per-row content signatures, for detecting whole-viewport shifts.
+    row_hash: Vec<u64>,
     /// Focus dim level, eased toward 0 (focused, bright) or 1 (unfocused): the fraction of
     /// `focus_dim` currently applied.
     dim: f32,
@@ -984,11 +986,21 @@ impl GridRenderer {
         // When scrolled into history, display_iter yields negative line numbers; shift them
         // back into the 0..screen_lines viewport so scrollback renders in place.
         let off = content.display_offset as i32;
+        let grid = term.grid();
+        let hist = (grid.total_lines() - grid.screen_lines()) as i32;
+        let smooth_on = self.smooth;
+        // Per-row content signatures (glyphs + colors, before cursor/selection decoration).
+        // Comparing them against the previous frame's detects whole-viewport shifts — how
+        // output scrolling at the live bottom is recognized — and whether the view moved at
+        // all (alacritty anchors display_offset when output arrives while scrolled back).
+        let mut row_hashes = vec![0u64; if smooth_on { rows } else { 0 }];
 
         for cell in content.display_iter {
             let point = cell.point;
+            let vr = point.line.0 + off; // viewport row
+            let in_view = point.column.0 < cols && vr >= 0 && (vr as usize) < rows;
             let col = point.column.0 as f32;
-            let row = (point.line.0 + off) as f32;
+            let row = vr as f32;
             let x = origin.0 + col * cw;
             let y = origin.1 + row * ch;
 
@@ -1000,6 +1012,19 @@ impl GridRenderer {
             let mut bg_col = resolve(cell.bg, colors, &palette, false);
             if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
                 std::mem::swap(&mut fg_col, &mut bg_col);
+            }
+            if smooth_on && in_view {
+                const FNV: u64 = 0x0000_0100_0000_01b3;
+                let h = &mut row_hashes[vr as usize];
+                *h = (*h ^ ((cell.c as u64) | ((bold as u64) << 32) | ((italic as u64) << 33)))
+                    .wrapping_mul(FNV);
+                let color_bits = (fg_col.r as u64)
+                    | ((fg_col.g as u64) << 8)
+                    | ((fg_col.b as u64) << 16)
+                    | ((bg_col.r as u64) << 24)
+                    | ((bg_col.g as u64) << 32)
+                    | ((bg_col.b as u64) << 40);
+                *h = (*h ^ color_bits).wrapping_mul(FNV);
             }
             let mut draw_bg = bg_col != palette.bg;
             if selection.as_ref().is_some_and(|r| r.contains(point)) {
@@ -1078,9 +1103,7 @@ impl GridRenderer {
             .then_some(CellKey { c, bold, italic });
 
             // Record glyph changes for the fade pass below.
-            let ri = point.line.0 + off;
-            let idx = (fade_on && point.column.0 < cols && ri >= 0 && (ri as usize) < rows)
-                .then(|| ri as usize * cols + point.column.0);
+            let idx = (fade_on && in_view).then(|| vr as usize * cols + point.column.0);
             if let Some(idx) = idx {
                 let rec = &mut anim.cells[idx];
                 if rec.key != key {
@@ -1112,9 +1135,7 @@ impl GridRenderer {
         // Overdraw: draw up to MARGIN_ROWS of adjacent history above and below the viewport
         // into the backbuffer margins, so a scroll glide reveals real content instead of
         // blanks. No cursor/selection/fade handling here — margins only show mid-glide.
-        if self.smooth {
-            let grid = term.grid();
-            let hist = (grid.total_lines() - grid.screen_lines()) as i32;
+        if smooth_on {
             let m = MARGIN_ROWS as i32;
             for vrow in (-m..0).chain(rows as i32..rows as i32 + m) {
                 let line = vrow - off;
@@ -1160,10 +1181,12 @@ impl GridRenderer {
 
         let mut animating = false;
 
-        // Smooth scroll: a display-offset jump becomes debt that the composite window pays
-        // off. `changes` empty means the view didn't actually move (alacritty anchors the
-        // offset when output arrives while scrolled back) — those must not glide. Decay uses
-        // the previous frame's debt only, so a jump after a long idle isn't eaten by a huge dt.
+        // Smooth scroll: view movement becomes debt that the composite window pays off. Two
+        // sources: a display-offset jump (wheel scrollback), and — when the offset is still —
+        // the whole viewport's rows shifting up (output scrolling at the live bottom),
+        // detected by matching this frame's row signatures against the previous frame's.
+        // Row hashes also tell whether the view moved at all: alacritty anchors the offset
+        // when output arrives while scrolled back, and those frames must not glide.
         let dt = anim.last_prep.map_or(0.0, |p| (now - p).as_secs_f32());
         let scrolled_by = if fresh || grid_changed {
             0
@@ -1171,14 +1194,46 @@ impl GridRenderer {
             off - anim.doff
         };
         anim.doff = off;
+        let comparable = !fresh && !grid_changed && anim.row_hash.len() == row_hashes.len();
+        let content_changed = comparable && anim.row_hash != row_hashes;
+        // Rows shifted up by n: today's row r matches yesterday's r+n. The bottom 2n rows are
+        // excluded from the comparison — a scroll of n lines brings n fresh rows in, and the
+        // text that *caused* the scroll was written into the previous bottom rows as they
+        // shifted (a `tail -f` line lands on the old cursor row and then scrolls), so those
+        // don't match either. Bursts beyond the margin match nothing and snap — the torrent
+        // guard. `hist >= n` keeps a glide from revealing blank margins (alt screen), and a
+        // minimum of compared rows keeps tiny panes from matching by coincidence.
+        let mut shifted = 0usize;
+        if smooth_on && scrolled_by == 0 && content_changed {
+            for n in 1..=MARGIN_ROWS.min(rows.saturating_sub(1)) {
+                let end = rows.saturating_sub(2 * n);
+                if end >= 4
+                    && hist >= n as i32
+                    && (0..end).all(|r| row_hashes[r] == anim.row_hash[r + n])
+                {
+                    shifted = n;
+                    break;
+                }
+            }
+        }
+        anim.row_hash = row_hashes;
+        // Decay uses the previous frame's debt only, so a jump after a long idle isn't eaten
+        // by a huge dt.
         if anim.debt != 0.0 {
             anim.debt *= (-dt / SCROLL_TAU).exp();
             if anim.debt.abs() < 0.5 {
                 anim.debt = 0.0;
             }
         }
-        if self.smooth && scrolled_by != 0 && !changes.is_empty() {
-            anim.debt = (anim.debt + scrolled_by as f32 * ch).clamp(-margin_px, margin_px);
+        if smooth_on && content_changed {
+            let lines = if scrolled_by != 0 {
+                scrolled_by // wheel: positive = into history, window starts below center
+            } else {
+                -(shifted as i32) // output: content moved up, window starts above center
+            };
+            if lines != 0 {
+                anim.debt = (anim.debt + lines as f32 * ch).clamp(-margin_px, margin_px);
+            }
         }
         if anim.debt != 0.0 {
             animating = true;
@@ -1188,6 +1243,7 @@ impl GridRenderer {
         // first frame after a resize) commits silently; keystroke-scale changes start fades.
         if fade_on {
             let bulk = scrolled_by != 0
+                || shifted != 0
                 || (changes.len() as f32) > anim.cells.len() as f32 * BULK_FRACTION;
             for (idx, old_key, old_fg) in changes {
                 let rec = &mut anim.cells[idx];
@@ -1279,7 +1335,7 @@ impl GridRenderer {
                 .then_some((origin.0 + c as f32 * cw, origin.1 + r as f32 * ch))
         })
         .flatten();
-        let view_shifted = fresh || grid_changed || scrolled_by != 0;
+        let view_shifted = fresh || grid_changed || scrolled_by != 0 || shifted != 0;
         if view_shifted {
             anim.smear = None;
         } else if self.smear
