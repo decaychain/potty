@@ -55,8 +55,9 @@ const SMEAR_COPIES: usize = 6;
 /// Peak trail opacity (the copy nearest the cursor; older copies fall off quadratically).
 const SMEAR_ALPHA: f32 = 0.4;
 
-/// Focus dimming eases exponentially with this time constant (~95% settled in 3τ ≈ 150 ms).
-const DIM_TAU: f32 = 0.05;
+/// Focus dimming eases exponentially with this time constant (~95% settled in 3τ ≈ 300 ms) —
+/// slow enough to read as a gentle animated fade, fast enough not to lag focus changes.
+const DIM_TAU: f32 = 0.1;
 
 /// Smooth scrolling: each pane renders into a backbuffer with this many rows of adjacent
 /// history drawn above and below the viewport, and the composite pass samples a viewport-sized
@@ -344,7 +345,8 @@ struct PaneBuffers {
     /// Per-pane screen uniform (the backbuffer's dimensions) for the grid pipelines.
     screen_buf: wgpu::Buffer,
     screen_bg: wgpu::BindGroup,
-    /// Vertex buffer for this pane's composite quad (6 verts × pos+uv), rewritten per frame.
+    /// Vertex buffer for this pane's composite quad (6 verts × pos+uv+filter), rewritten per
+    /// frame.
     comp_buf: wgpu::Buffer,
     /// The pane's on-screen (viewport) pixel size.
     view_px: (u32, u32),
@@ -371,7 +373,7 @@ impl PaneBuffers {
         });
         let comp_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pane-composite-quad"),
-            size: (6 * 4 * std::mem::size_of::<f32>()) as u64,
+            size: (6 * 8 * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -407,7 +409,9 @@ pub struct GridRenderer {
     phosphor: bool,
     /// The cursor leaves a collapsing comet trail when it jumps (config `cursor_smear`).
     smear: bool,
-    /// Brightness fraction unfocused panes lose (config `focus_dim`; 0 disables).
+    /// How strongly unfocused panes fade (config `focus_dim`; 0 disables). Applied at composite
+    /// time: chrominance drains toward gray at twice this strength, contrast compresses toward
+    /// the theme background at this strength.
     focus_dim: f32,
     /// Scrollback scrolling glides instead of jumping (config `smooth_scroll`).
     smooth: bool,
@@ -674,7 +678,8 @@ impl GridRenderer {
             bind_group_layouts: &[Some(&common_layout), Some(&atlas_layout)],
             immediate_size: 0,
         });
-        let comp_attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+        let comp_attrs =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
         let comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("composite"),
             layout: Some(&comp_pl),
@@ -682,7 +687,7 @@ impl GridRenderer {
                 module: &comp_shader,
                 entry_point: Some("vs"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 16,
+                    array_stride: 32,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &comp_attrs,
                 }],
@@ -776,7 +781,7 @@ impl GridRenderer {
     }
 
     pub fn set_focus_dim(&mut self, dim: f32) {
-        // Clamped so a wild config value can't invert or black out colors.
+        // Clamped so a wild config value can't flatten unfocused panes into the background.
         self.focus_dim = dim.clamp(0.0, 0.9);
     }
 
@@ -1398,8 +1403,10 @@ impl GridRenderer {
             }
         }
 
-        // Focus dim: ease toward this pane's focus state, then darken every instance (fades,
-        // ghosts and smear included) so the whole pane reads as one surface.
+        // Focus dim: ease toward this pane's focus state. The dimming itself is applied at
+        // composite time as a per-pixel filter on the backbuffer (desaturate + pull toward the
+        // theme background), so instances are built at full brightness here — only the eased
+        // level is bookkept.
         let target = if focused { 0.0 } else { 1.0 };
         if self.focus_dim > 0.0 {
             let dt = anim.last_prep.map_or(0.0, |p| (now - p).as_secs_f32());
@@ -1413,20 +1420,6 @@ impl GridRenderer {
             anim.dim = target; // feature off: track silently so enabling it doesn't animate
         }
         anim.last_prep = Some(now);
-        let dim = self.focus_dim * anim.dim;
-        if dim > 0.0 {
-            let f = 1.0 - dim;
-            for i in &mut bg {
-                i.color[0] *= f;
-                i.color[1] *= f;
-                i.color[2] *= f;
-            }
-            for i in &mut fg {
-                i.color[0] *= f;
-                i.color[1] *= f;
-                i.color[2] *= f;
-            }
-        }
 
         // Store the rebuilt vectors back and upload them (growing the GPU buffers if needed).
         let pb = self.panes.get_mut(&pane).expect("ensured above");
@@ -1505,14 +1498,17 @@ impl GridRenderer {
         let (x, y) = (pos.0.round(), pos.1.round());
         let (u0, v0) = (0.0, win_y / th);
         let (u1, v1) = (vw / tw, (win_y + vh) / th);
+        // Unfocused-pane fade, applied per-pixel while blitting: rgb is the (linear) theme
+        // background the filter pulls contrast toward, a is the eased dim strength.
+        let [br, bg, bb, dim] = rgba(self.palette.bg, self.focus_dim * pb.anim.dim);
         #[rustfmt::skip]
-        let verts: [f32; 24] = [
-            x,      y,      u0, v0,
-            x + vw, y,      u1, v0,
-            x,      y + vh, u0, v1,
-            x,      y + vh, u0, v1,
-            x + vw, y,      u1, v0,
-            x + vw, y + vh, u1, v1,
+        let verts: [f32; 48] = [
+            x,      y,      u0, v0, br, bg, bb, dim,
+            x + vw, y,      u1, v0, br, bg, bb, dim,
+            x,      y + vh, u0, v1, br, bg, bb, dim,
+            x,      y + vh, u0, v1, br, bg, bb, dim,
+            x + vw, y,      u1, v0, br, bg, bb, dim,
+            x + vw, y + vh, u1, v1, br, bg, bb, dim,
         ];
         queue.write_buffer(&pb.comp_buf, 0, bytemuck::cast_slice(&verts));
         pass.set_pipeline(&self.comp_pipeline);
@@ -1710,15 +1706,32 @@ struct Screen { size: vec2<f32> };
 @group(0) @binding(0) var<uniform> screen: Screen;
 @group(1) @binding(0) var pane_tex: texture_2d<f32>;
 @group(1) @binding(1) var pane_smp: sampler;
-struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VsOut {
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  // rgb: linear theme background (the contrast pivot), a: dim strength (0 = focused).
+  @location(1) filt: vec4<f32>,
+};
+@vertex fn vs(
+  @location(0) pos: vec2<f32>,
+  @location(1) uv: vec2<f32>,
+  @location(2) filt: vec4<f32>,
+) -> VsOut {
   let ndc = vec2<f32>(pos.x / screen.size.x * 2.0 - 1.0, 1.0 - pos.y / screen.size.y * 2.0);
   var o: VsOut;
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
   o.uv = uv;
+  o.filt = filt;
   return o;
 }
 @fragment fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  return textureSample(pane_tex, pane_smp, in.uv);
+  let c = textureSample(pane_tex, pane_smp, in.uv).rgb;
+  // Unfocused-pane fade: drain chrominance toward gray (twice the strength), then compress
+  // contrast toward the theme background. All in linear light; a no-op at dim = 0.
+  let dim = in.filt.a;
+  let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let desat = mix(c, vec3<f32>(luma), min(dim * 2.0, 1.0));
+  let faded = mix(desat, in.filt.rgb, dim);
+  return vec4<f32>(faded, 1.0);
 }
 "#;

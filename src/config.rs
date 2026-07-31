@@ -50,8 +50,9 @@ pub struct Config {
     /// The cursor leaves a brief comet trail when it jumps to a new position. Off by default —
     /// a matter of taste.
     pub cursor_smear: bool,
-    /// How much text in unfocused panes dims (0.0 disables; 0.15 = 15% darker). Transitions
-    /// are eased, ~150 ms.
+    /// How strongly unfocused panes fade (0.0 disables). A per-pixel filter on the pane, not a
+    /// text-color tweak: colors desaturate (2× this) and contrast compresses toward the
+    /// background (1× this) — 0.15 reads as a gentle recede. Transitions are eased, ~300 ms.
     pub focus_dim: f32,
     /// Scrolling glides instead of jumping line-by-line — both scrollback (wheel) and output
     /// scrolling at the live bottom. Bursts bigger than a few lines snap instantly.
