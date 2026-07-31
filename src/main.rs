@@ -2266,14 +2266,13 @@ impl WindowState {
     }
 
     /// Rebuild one pane's cached instance buffers (only the App's dirty panes call this).
-    /// Returns true while the pane's animations (fades, smear, dim) are still running.
+    /// Returns true while the pane's animations (fades, smear, dim, glide) are still running.
     #[allow(clippy::too_many_arguments)]
     fn prepare_pane(
         &mut self,
         pane: u64,
         term: &Term<EventProxy>,
-        origin: (f32, f32),
-        screen: (f32, f32),
+        view_px: (u32, u32),
         show_cursor: bool,
         cursor_thickness: f32,
         now: Instant,
@@ -2284,8 +2283,7 @@ impl WindowState {
             &self.queue,
             pane,
             term,
-            origin,
-            screen,
+            view_px,
             show_cursor,
             cursor_thickness,
             now,
@@ -2300,6 +2298,8 @@ impl WindowState {
         prims: &[egui::ClippedPrimitive],
         ppp: f32,
         panes: &[(egui::Rect, u64)],
+        // Panes whose backbuffer must be re-rendered (their content was rebuilt this frame).
+        rendered: &[u64],
     ) {
         let (sw, sh) = (self.surface_config.width, self.surface_config.height);
         // Texture deltas are stateful: the first font-atlas delta allocates the texture, and later
@@ -2318,60 +2318,44 @@ impl WindowState {
             return;
         };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        self.grid.set_surface_size(&self.queue, sw as f32, sh as f32);
 
-        // Pass 1: one submit per pane, each drawing from its cached buffers (already prepared
-        // for dirty panes). The first clears the whole surface — including inter-pane gaps —
-        // then each draw is scissored to its rect.
-        let mut first = true;
-        for (rect, pane) in panes {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("terminal"),
-                });
-            {
-                let load = if first {
-                    LoadOp::Clear(BG_CLEAR)
-                } else {
-                    LoadOp::Load
-                };
-                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("terminal"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: Operations {
-                            load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                let x = (rect.min.x * ppp).max(0.0) as u32;
-                let y = (rect.min.y * ppp).max(0.0) as u32;
-                let w = ((rect.width() * ppp) as u32).min(sw.saturating_sub(x));
-                let h = ((rect.height() * ppp) as u32).min(sh.saturating_sub(y));
-                if w > 0 && h > 0 {
-                    pass.set_scissor_rect(x, y, w, h);
-                    self.grid.render(&mut pass, *pane);
-                }
-            }
-            self.queue.submit(std::iter::once(encoder.finish()));
-            first = false;
+        // Pass 1: re-render the backbuffer of every pane whose content was rebuilt this frame
+        // (the rest keep their previous backbuffer — a scroll glide re-composites without
+        // touching them).
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("pane-content"),
+            });
+        for pane in rendered {
+            let Some(tex_view) = self.grid.backbuffer_view(*pane) else {
+                continue;
+            };
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("pane-content"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: tex_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(BG_CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.grid.render(&mut pass, *pane);
         }
-        if first {
-            // No panes (shouldn't happen) — still clear the surface so egui has a backdrop.
-            let mut encoder = self
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("clear"),
-                });
-            encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("clear"),
+
+        // Pass 2: clear the surface (covers inter-pane gaps) and composite every visible
+        // pane's viewport window onto it.
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("composite"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -2386,8 +2370,16 @@ impl WindowState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.queue.submit(std::iter::once(encoder.finish()));
+            for (rect, pane) in panes {
+                self.grid.composite(
+                    &self.queue,
+                    &mut pass,
+                    *pane,
+                    (rect.min.x * ppp, rect.min.y * ppp),
+                );
+            }
         }
+        self.queue.submit(std::iter::once(encoder.finish()));
 
         // Pass 2: egui chrome on top.
         let mut encoder = self
@@ -4301,6 +4293,7 @@ impl App {
             state.grid.set_phosphor(self.config.phosphor);
             state.grid.set_smear(self.config.cursor_smear);
             state.grid.set_focus_dim(self.config.focus_dim);
+            state.grid.set_smooth_scroll(self.config.smooth_scroll);
             if font_changed {
                 state.grid.set_font(family, size * scale, line);
                 let m = state.grid.metrics();
@@ -5114,13 +5107,6 @@ impl App {
 
         // Damage tracking: re-prepare only the visible panes flagged dirty; the rest render from
         // their cached buffers. We lock each dirty pane just long enough to rebuild it.
-        let (sw, sh) = {
-            let s = self.state.as_ref().unwrap();
-            (
-                s.surface_config.width as f32,
-                s.surface_config.height as f32,
-            )
-        };
         let focus = self.focus();
         // A focus move re-prepares both panes involved so focus dimming can transition.
         if self.last_focus != focus {
@@ -5132,24 +5118,29 @@ impl App {
         }
         let cursor_thickness = self.config.cursor_thickness;
         let now = Instant::now();
+        // Panes whose content was rebuilt this frame — their backbuffers need re-rendering.
+        let mut rendered: Vec<u64> = Vec::new();
         for (id, r) in &leaves {
             if self.dirty.remove(id)
                 && let Some(term) = self.arc(*id)
             {
-                let origin = (r.min.x * ppp, r.min.y * ppp);
+                let view_px = (
+                    (r.width() * ppp).round().max(1.0) as u32,
+                    (r.height() * ppp).round().max(1.0) as u32,
+                );
                 // Only the focused pane's cursor blinks; suppress it during the off phase.
                 let show_cursor = *id != focus || self.blink_on;
                 let guard = term.lock().unwrap();
                 let anim = self.state.as_mut().unwrap().prepare_pane(
                     *id,
                     &guard,
-                    origin,
-                    (sw, sh),
+                    view_px,
                     show_cursor,
                     cursor_thickness,
                     now,
                     *id == focus,
                 );
+                rendered.push(*id);
                 if anim {
                     self.animating.insert(*id);
                 } else {
@@ -5163,7 +5154,7 @@ impl App {
         let panes: Vec<(egui::Rect, u64)> = leaves.iter().map(|(id, r)| (*r, (*id))).collect();
         let renderer = self.egui_renderer.as_mut().unwrap();
         if let Some(state) = self.state.as_mut() {
-            state.render(renderer, &textures_delta, &prims, ppp, &panes);
+            state.render(renderer, &textures_delta, &prims, ppp, &panes, &rendered);
         }
     }
 }
@@ -5205,6 +5196,7 @@ impl ApplicationHandler<UserEvent> for App {
         state.grid.set_phosphor(self.config.phosphor);
         state.grid.set_smear(self.config.cursor_smear);
         state.grid.set_focus_dim(self.config.focus_dim);
+        state.grid.set_smooth_scroll(self.config.smooth_scroll);
         state.grid.set_font(
             self.config.font_family.clone(),
             self.config.font_size * scale,

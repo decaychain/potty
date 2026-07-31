@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
@@ -56,6 +57,14 @@ const SMEAR_ALPHA: f32 = 0.4;
 
 /// Focus dimming eases exponentially with this time constant (~95% settled in 3τ ≈ 150 ms).
 const DIM_TAU: f32 = 0.05;
+
+/// Smooth scrolling: each pane renders into a backbuffer with this many rows of adjacent
+/// history drawn above and below the viewport, and the composite pass samples a viewport-sized
+/// window whose offset ("scroll debt") eases back to center. A KDE wheel notch is 3 lines, so
+/// one notch animates fully; bigger jumps clamp to the margin and finish the rest instantly.
+const MARGIN_ROWS: usize = 3;
+/// Scroll-debt decay time constant (~settled in 200 ms from a full notch).
+const SCROLL_TAU: f32 = 0.045;
 
 /// Ease-out-back: rises from 0, overshoots 1 by ~10% around t≈0.63, settles to 1. The classic
 /// c1 = 1.70158 gives the "little overshoot" without looking springy.
@@ -215,13 +224,18 @@ struct PaneAnim {
     cells: Vec<CellRec>,
     cols: usize,
     rows: usize,
-    /// Cell origin (px) where the cursor last drew, for detecting jumps.
+    /// Cell origin (backbuffer px) where the cursor last drew, for detecting jumps.
     cursor_px: Option<(f32, f32)>,
     smear: Option<Smear>,
-    /// Pane origin and display offset at the last prepare — when either shifts, the cursor
-    /// "moved" because the view did, not because it travelled: update silently, no smear.
-    origin: (f32, f32),
+    /// Display offset at the last prepare — when it shifts, the cursor "moved" because the
+    /// view did, not because it travelled: update silently, no smear.
     doff: i32,
+    /// Smooth-scroll debt (px): how far the composited window sits from center, easing to 0.
+    /// Positive = showing newer content than the viewport (the view just scrolled into
+    /// history and is still gliding there).
+    debt: f32,
+    /// Previous frame's per-row content signatures, for detecting whole-viewport shifts.
+    row_hash: Vec<u64>,
     /// Focus dim level, eased toward 0 (focused, bright) or 1 (unfocused): the fraction of
     /// `focus_dim` currently applied.
     dim: f32,
@@ -261,6 +275,62 @@ impl Atlas {
 /// Per-pane instance data + GPU buffers. Built by `prepare` and kept between frames so a pane
 /// that didn't change is rendered straight from its cache (no rebuild) — the heart of damage
 /// tracking. `bg`/`fg` are retained to reuse their allocation across rebuilds.
+/// A pane's offscreen render target: the grid draws here (viewport plus overdraw margins),
+/// and the composite pass samples a viewport-sized window from it onto the surface.
+struct BackTex {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Bind group for the composite pass (this texture + the shared nearest sampler).
+    comp_bg: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+impl BackTex {
+    fn new(
+        device: &wgpu::Device,
+        tex_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pane-backbuffer"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let comp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pane-composite"),
+            layout: tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        Self {
+            _texture: texture,
+            view,
+            comp_bg,
+            size,
+        }
+    }
+}
+
 struct PaneBuffers {
     bg: Vec<BgInstance>,
     fg: Vec<FgInstance>,
@@ -269,11 +339,42 @@ struct PaneBuffers {
     bg_cap: usize,
     fg_cap: usize,
     anim: PaneAnim,
+    /// Offscreen target the grid renders into; recreated when the pane's pixel size changes.
+    tex: Option<BackTex>,
+    /// Per-pane screen uniform (the backbuffer's dimensions) for the grid pipelines.
+    screen_buf: wgpu::Buffer,
+    screen_bg: wgpu::BindGroup,
+    /// Vertex buffer for this pane's composite quad (6 verts × pos+uv), rewritten per frame.
+    comp_buf: wgpu::Buffer,
+    /// The pane's on-screen (viewport) pixel size.
+    view_px: (u32, u32),
+    /// Overdraw margin height in px (`MARGIN_ROWS` cells, rounded).
+    margin_px: f32,
 }
 
 impl PaneBuffers {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, common_layout: &wgpu::BindGroupLayout) -> Self {
         let cap = 1024;
+        let screen_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pane-screen"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pane-screen"),
+            layout: common_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: screen_buf.as_entire_binding(),
+            }],
+        });
+        let comp_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pane-composite-quad"),
+            size: (6 * 4 * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             bg: Vec::new(),
             fg: Vec::new(),
@@ -282,6 +383,12 @@ impl PaneBuffers {
             bg_cap: cap,
             fg_cap: cap,
             anim: PaneAnim::default(),
+            tex: None,
+            screen_buf,
+            screen_bg,
+            comp_buf,
+            view_px: (0, 0),
+            margin_px: 0.0,
         }
     }
 }
@@ -302,17 +409,27 @@ pub struct GridRenderer {
     smear: bool,
     /// Brightness fraction unfocused panes lose (config `focus_dim`; 0 disables).
     focus_dim: f32,
+    /// Scrollback scrolling glides instead of jumping (config `smooth_scroll`).
+    smooth: bool,
 
     atlas: Atlas,
     /// Rasterized-glyph cache, keyed by (char, bold, italic).
     glyphs: HashMap<(char, bool, bool), Option<Glyph>>,
 
+    /// Surface-sized screen uniform, used by the composite pass (per-pane grid passes use
+    /// their own backbuffer-sized uniform in `PaneBuffers`).
     screen_buf: wgpu::Buffer,
     common_bg: wgpu::BindGroup,
     atlas_bg: wgpu::BindGroup,
     bg_pipeline: wgpu::RenderPipeline,
     fg_pipeline: wgpu::RenderPipeline,
+    comp_pipeline: wgpu::RenderPipeline,
     quad: wgpu::Buffer,
+    /// Kept for creating per-pane resources after startup.
+    common_layout: wgpu::BindGroupLayout,
+    tex_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    format: wgpu::TextureFormat,
 
     /// Cached instance buffers, one set per pane (keyed by PaneId as a u64).
     panes: HashMap<u64, PaneBuffers>,
@@ -546,6 +663,48 @@ impl GridRenderer {
             cache: None,
         });
 
+        // Composite: one textured quad per pane, blitting a window of its backbuffer onto the
+        // surface. Vertices carry explicit pos+uv (rewritten per frame for the scroll offset).
+        let comp_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("composite"),
+            source: wgpu::ShaderSource::Wgsl(COMP_WGSL.into()),
+        });
+        let comp_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("composite"),
+            bind_group_layouts: &[Some(&common_layout), Some(&atlas_layout)],
+            immediate_size: 0,
+        });
+        let comp_attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+        let comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("composite"),
+            layout: Some(&comp_pl),
+            vertex: wgpu::VertexState {
+                module: &comp_shader,
+                entry_point: Some("vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &comp_attrs,
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &comp_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None, // opaque copy
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Unit quad (two triangles), top-left origin in [0,1].
         let verts: [[f32; 2]; 6] = [[0., 0.], [1., 0.], [0., 1.], [0., 1.], [1., 0.], [1., 1.]];
         let quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -568,6 +727,7 @@ impl GridRenderer {
             phosphor: true,
             smear: false,
             focus_dim: 0.15,
+            smooth: true,
             atlas: Atlas {
                 texture,
                 x: 0,
@@ -580,7 +740,12 @@ impl GridRenderer {
             atlas_bg,
             bg_pipeline,
             fg_pipeline,
+            comp_pipeline,
             quad,
+            common_layout,
+            tex_layout: atlas_layout,
+            sampler,
+            format,
             panes: HashMap::new(),
         }
     }
@@ -613,6 +778,15 @@ impl GridRenderer {
     pub fn set_focus_dim(&mut self, dim: f32) {
         // Clamped so a wild config value can't invert or black out colors.
         self.focus_dim = dim.clamp(0.0, 0.9);
+    }
+
+    pub fn set_smooth_scroll(&mut self, smooth: bool) {
+        self.smooth = smooth;
+    }
+
+    /// Update the composite pass's screen uniform to the surface size (once per frame).
+    pub fn set_surface_size(&self, queue: &wgpu::Queue, w: f32, h: f32) {
+        queue.write_buffer(&self.screen_buf, 0, bytemuck::cast_slice(&[w, h, 0.0, 0.0]));
     }
 
     /// Switch font (family = None → generic monospace) and/or size. Re-measures the cell,
@@ -704,10 +878,11 @@ impl GridRenderer {
         })
     }
 
-    /// Rebuild a pane's instance data, positioned within the pane at `origin` (px). Only called
-    /// for panes flagged dirty; clean panes keep their cached buffers from a previous call.
-    /// Returns true while an animation (glyph fade, cursor smear, focus-dim transition) is
-    /// still in flight — the caller must keep the pane dirty and frames coming until it settles.
+    /// Rebuild a pane's instance data, positioned in its backbuffer (viewport at y =
+    /// `margin_px`, overdraw margins above and below). Only called for panes flagged dirty;
+    /// clean panes keep their cached buffers from a previous call. Returns true while an
+    /// animation (glyph fade, cursor smear, focus dim, scroll glide) is still in flight —
+    /// the caller must keep the pane dirty and frames coming until it settles.
     // too_many_arguments: over the limit, but each parameter is genuinely per-call render
     // state; a params struct would be built fresh at the sole call site anyway.
     #[allow(clippy::too_many_arguments)]
@@ -717,8 +892,8 @@ impl GridRenderer {
         queue: &wgpu::Queue,
         pane: u64,
         term: &Term<L>,
-        origin: (f32, f32),
-        screen: (f32, f32),
+        // The pane's on-screen size in physical px (the backbuffer adds overdraw margins).
+        view_px: (u32, u32),
         // Whether to draw the cursor this frame (false during a blink's "off" phase).
         show_cursor: bool,
         // Underline/beam thickness as a fraction of the cell.
@@ -728,21 +903,49 @@ impl GridRenderer {
         // Whether this pane holds keyboard focus (drives focus dimming).
         focused: bool,
     ) -> bool {
-        queue.write_buffer(
-            &self.screen_buf,
-            0,
-            bytemuck::cast_slice(&[screen.0, screen.1, 0.0, 0.0]),
+        let (cw, ch, asc) = (self.metrics.w, self.metrics.h, self.metrics.ascent);
+        let margin_px = (MARGIN_ROWS as f32 * ch).round();
+        let tex_size = (
+            view_px.0.max(1),
+            view_px.1.max(1) + 2 * margin_px as u32,
         );
+        // Ensure the pane's buffers and a correctly-sized backbuffer exist up front.
+        {
+            let Self {
+                panes,
+                common_layout,
+                tex_layout,
+                sampler,
+                format,
+                ..
+            } = &mut *self;
+            let pb = panes
+                .entry(pane)
+                .or_insert_with(|| PaneBuffers::new(device, common_layout));
+            if pb.tex.as_ref().map(|t| t.size) != Some(tex_size) {
+                pb.tex = Some(BackTex::new(device, tex_layout, sampler, *format, tex_size));
+                queue.write_buffer(
+                    &pb.screen_buf,
+                    0,
+                    bytemuck::cast_slice(&[tex_size.0 as f32, tex_size.1 as f32, 0.0, 0.0]),
+                );
+            }
+            pb.view_px = view_px;
+            pb.margin_px = margin_px;
+        }
+        // Everything below draws in backbuffer coordinates: the viewport starts below the
+        // top overdraw margin.
+        let origin = (0.0f32, margin_px);
 
         // Detach this pane's vectors and animation state (reusing their capacity) so the loop
         // can also borrow `self` mutably for glyph rasterization.
-        let (mut bg, mut fg, mut anim) = match self.panes.get_mut(&pane) {
-            Some(pb) => (
+        let (mut bg, mut fg, mut anim) = {
+            let pb = self.panes.get_mut(&pane).expect("ensured above");
+            (
                 std::mem::take(&mut pb.bg),
                 std::mem::take(&mut pb.fg),
                 std::mem::take(&mut pb.anim),
-            ),
-            None => (Vec::new(), Vec::new(), PaneAnim::default()),
+            )
         };
         bg.clear();
         fg.clear();
@@ -783,13 +986,21 @@ impl GridRenderer {
         // When scrolled into history, display_iter yields negative line numbers; shift them
         // back into the 0..screen_lines viewport so scrollback renders in place.
         let off = content.display_offset as i32;
-
-        let (cw, ch, asc) = (self.metrics.w, self.metrics.h, self.metrics.ascent);
+        let grid = term.grid();
+        let hist = (grid.total_lines() - grid.screen_lines()) as i32;
+        let smooth_on = self.smooth;
+        // Per-row content signatures (glyphs + colors, before cursor/selection decoration).
+        // Comparing them against the previous frame's detects whole-viewport shifts — how
+        // output scrolling at the live bottom is recognized — and whether the view moved at
+        // all (alacritty anchors display_offset when output arrives while scrolled back).
+        let mut row_hashes = vec![0u64; if smooth_on { rows } else { 0 }];
 
         for cell in content.display_iter {
             let point = cell.point;
+            let vr = point.line.0 + off; // viewport row
+            let in_view = point.column.0 < cols && vr >= 0 && (vr as usize) < rows;
             let col = point.column.0 as f32;
-            let row = (point.line.0 + off) as f32;
+            let row = vr as f32;
             let x = origin.0 + col * cw;
             let y = origin.1 + row * ch;
 
@@ -801,6 +1012,19 @@ impl GridRenderer {
             let mut bg_col = resolve(cell.bg, colors, &palette, false);
             if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
                 std::mem::swap(&mut fg_col, &mut bg_col);
+            }
+            if smooth_on && in_view {
+                const FNV: u64 = 0x0000_0100_0000_01b3;
+                let h = &mut row_hashes[vr as usize];
+                *h = (*h ^ ((cell.c as u64) | ((bold as u64) << 32) | ((italic as u64) << 33)))
+                    .wrapping_mul(FNV);
+                let color_bits = (fg_col.r as u64)
+                    | ((fg_col.g as u64) << 8)
+                    | ((fg_col.b as u64) << 16)
+                    | ((bg_col.r as u64) << 24)
+                    | ((bg_col.g as u64) << 32)
+                    | ((bg_col.b as u64) << 40);
+                *h = (*h ^ color_bits).wrapping_mul(FNV);
             }
             let mut draw_bg = bg_col != palette.bg;
             if selection.as_ref().is_some_and(|r| r.contains(point)) {
@@ -879,9 +1103,7 @@ impl GridRenderer {
             .then_some(CellKey { c, bold, italic });
 
             // Record glyph changes for the fade pass below.
-            let ri = point.line.0 + off;
-            let idx = (fade_on && point.column.0 < cols && ri >= 0 && (ri as usize) < rows)
-                .then(|| ri as usize * cols + point.column.0);
+            let idx = (fade_on && in_view).then(|| vr as usize * cols + point.column.0);
             if let Some(idx) = idx {
                 let rec = &mut anim.cells[idx];
                 if rec.key != key {
@@ -910,11 +1132,119 @@ impl GridRenderer {
             }
         }
 
+        // Overdraw: draw up to MARGIN_ROWS of adjacent history above and below the viewport
+        // into the backbuffer margins, so a scroll glide reveals real content instead of
+        // blanks. No cursor/selection/fade handling here — margins only show mid-glide.
+        if smooth_on {
+            let m = MARGIN_ROWS as i32;
+            for vrow in (-m..0).chain(rows as i32..rows as i32 + m) {
+                let line = vrow - off;
+                if line < -hist || line >= rows as i32 {
+                    continue; // beyond scrollback / below the live screen
+                }
+                let y = origin.1 + vrow as f32 * ch;
+                for c in 0..cols {
+                    let cell = &grid[Line(line)][Column(c)];
+                    let flags = cell.flags;
+                    let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
+                    let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
+                    let mut fg_col = resolve(cell.fg, colors, &palette, bold);
+                    let mut bg_col = resolve(cell.bg, colors, &palette, false);
+                    if flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
+                        std::mem::swap(&mut fg_col, &mut bg_col);
+                    }
+                    let x = origin.0 + c as f32 * cw;
+                    if bg_col != palette.bg {
+                        bg.push(BgInstance {
+                            pos: [x, y],
+                            size: [cw, ch],
+                            color: rgba(bg_col, 1.0),
+                        });
+                    }
+                    let cc = cell.c;
+                    if cc != ' '
+                        && cc != '\0'
+                        && !flags.contains(alacritty_terminal::term::cell::Flags::HIDDEN)
+                        && let Some(g) = self.glyph(queue, cc, bold, italic)
+                    {
+                        fg.push(FgInstance {
+                            pos: [x + g.offset[0], y + asc - g.offset[1]],
+                            size: g.size,
+                            uv0: g.uv0,
+                            uv1: g.uv1,
+                            color: rgba(fg_col, 1.0),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut animating = false;
+
+        // Smooth scroll: view movement becomes debt that the composite window pays off. Two
+        // sources: a display-offset jump (wheel scrollback), and — when the offset is still —
+        // the whole viewport's rows shifting up (output scrolling at the live bottom),
+        // detected by matching this frame's row signatures against the previous frame's.
+        // Row hashes also tell whether the view moved at all: alacritty anchors the offset
+        // when output arrives while scrolled back, and those frames must not glide.
+        let dt = anim.last_prep.map_or(0.0, |p| (now - p).as_secs_f32());
+        let scrolled_by = if fresh || grid_changed {
+            0
+        } else {
+            off - anim.doff
+        };
+        anim.doff = off;
+        let comparable = !fresh && !grid_changed && anim.row_hash.len() == row_hashes.len();
+        let content_changed = comparable && anim.row_hash != row_hashes;
+        // Rows shifted up by n: today's row r matches yesterday's r+n. The bottom 2n rows are
+        // excluded from the comparison — a scroll of n lines brings n fresh rows in, and the
+        // text that *caused* the scroll was written into the previous bottom rows as they
+        // shifted (a `tail -f` line lands on the old cursor row and then scrolls), so those
+        // don't match either. Bursts beyond the margin match nothing and snap — the torrent
+        // guard. `hist >= n` keeps a glide from revealing blank margins (alt screen), and a
+        // minimum of compared rows keeps tiny panes from matching by coincidence.
+        let mut shifted = 0usize;
+        if smooth_on && scrolled_by == 0 && content_changed {
+            for n in 1..=MARGIN_ROWS.min(rows.saturating_sub(1)) {
+                let end = rows.saturating_sub(2 * n);
+                if end >= 4
+                    && hist >= n as i32
+                    && (0..end).all(|r| row_hashes[r] == anim.row_hash[r + n])
+                {
+                    shifted = n;
+                    break;
+                }
+            }
+        }
+        anim.row_hash = row_hashes;
+        // Decay uses the previous frame's debt only, so a jump after a long idle isn't eaten
+        // by a huge dt.
+        if anim.debt != 0.0 {
+            anim.debt *= (-dt / SCROLL_TAU).exp();
+            if anim.debt.abs() < 0.5 {
+                anim.debt = 0.0;
+            }
+        }
+        if smooth_on && content_changed {
+            let lines = if scrolled_by != 0 {
+                scrolled_by // wheel: positive = into history, window starts below center
+            } else {
+                -(shifted as i32) // output: content moved up, window starts above center
+            };
+            if lines != 0 {
+                anim.debt = (anim.debt + lines as f32 * ch).clamp(-margin_px, margin_px);
+            }
+        }
+        if anim.debt != 0.0 {
+            animating = true;
+        }
+
         // Fade bookkeeping. A bulk update (scroll, `clear`, a full-screen app repaint, the
         // first frame after a resize) commits silently; keystroke-scale changes start fades.
-        let mut animating = false;
         if fade_on {
-            let bulk = (changes.len() as f32) > anim.cells.len() as f32 * BULK_FRACTION;
+            let bulk = scrolled_by != 0
+                || shifted != 0
+                || (changes.len() as f32) > anim.cells.len() as f32 * BULK_FRACTION;
             for (idx, old_key, old_fg) in changes {
                 let rec = &mut anim.cells[idx];
                 if bulk {
@@ -1005,7 +1335,7 @@ impl GridRenderer {
                 .then_some((origin.0 + c as f32 * cw, origin.1 + r as f32 * ch))
         })
         .flatten();
-        let view_shifted = fresh || grid_changed || anim.origin != origin || anim.doff != off;
+        let view_shifted = fresh || grid_changed || scrolled_by != 0 || shifted != 0;
         if view_shifted {
             anim.smear = None;
         } else if self.smear
@@ -1031,8 +1361,6 @@ impl GridRenderer {
             });
         }
         anim.cursor_px = cursor_px;
-        anim.origin = origin;
-        anim.doff = off;
 
         if let Some(s) = anim.smear {
             let t = (now - s.since).as_secs_f32() / SMEAR.as_secs_f32();
@@ -1101,10 +1429,7 @@ impl GridRenderer {
         }
 
         // Store the rebuilt vectors back and upload them (growing the GPU buffers if needed).
-        let pb = self
-            .panes
-            .entry(pane)
-            .or_insert_with(|| PaneBuffers::new(device));
+        let pb = self.panes.get_mut(&pane).expect("ensured above");
         upload(
             device,
             queue,
@@ -1127,25 +1452,74 @@ impl GridRenderer {
         animating
     }
 
+    /// Draw a pane's grid content into the given pass — which must target its backbuffer
+    /// (the instance positions and screen uniform are in backbuffer coordinates).
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, pane: u64) {
         let Some(pb) = self.panes.get(&pane) else {
             return;
         };
         if !pb.bg.is_empty() {
             pass.set_pipeline(&self.bg_pipeline);
-            pass.set_bind_group(0, &self.common_bg, &[]);
+            pass.set_bind_group(0, &pb.screen_bg, &[]);
             pass.set_vertex_buffer(0, self.quad.slice(..));
             pass.set_vertex_buffer(1, pb.bg_buf.slice(..));
             pass.draw(0..6, 0..pb.bg.len() as u32);
         }
         if !pb.fg.is_empty() {
             pass.set_pipeline(&self.fg_pipeline);
-            pass.set_bind_group(0, &self.common_bg, &[]);
+            pass.set_bind_group(0, &pb.screen_bg, &[]);
             pass.set_bind_group(1, &self.atlas_bg, &[]);
             pass.set_vertex_buffer(0, self.quad.slice(..));
             pass.set_vertex_buffer(1, pb.fg_buf.slice(..));
             pass.draw(0..6, 0..pb.fg.len() as u32);
         }
+    }
+
+    /// The pane's offscreen render target for the content pass (None until first prepared).
+    pub fn backbuffer_view(&self, pane: u64) -> Option<&wgpu::TextureView> {
+        self.panes
+            .get(&pane)
+            .and_then(|pb| pb.tex.as_ref())
+            .map(|t| &t.view)
+    }
+
+    /// Blit the pane's viewport-sized window — shifted by any scroll debt — from its
+    /// backbuffer onto the surface at `pos` (physical px).
+    pub fn composite(
+        &self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        pane: u64,
+        pos: (f32, f32),
+    ) {
+        let Some(pb) = self.panes.get(&pane) else {
+            return;
+        };
+        let Some(tex) = pb.tex.as_ref() else {
+            return;
+        };
+        let (tw, th) = (tex.size.0 as f32, tex.size.1 as f32);
+        let (vw, vh) = (pb.view_px.0 as f32, pb.view_px.1 as f32);
+        // Whole-pixel window offset keeps the 1:1 nearest sampling exact (no half-texel blur).
+        let win_y = (pb.margin_px + pb.anim.debt).round().clamp(0.0, th - vh);
+        let (x, y) = (pos.0.round(), pos.1.round());
+        let (u0, v0) = (0.0, win_y / th);
+        let (u1, v1) = (vw / tw, (win_y + vh) / th);
+        #[rustfmt::skip]
+        let verts: [f32; 24] = [
+            x,      y,      u0, v0,
+            x + vw, y,      u1, v0,
+            x,      y + vh, u0, v1,
+            x,      y + vh, u0, v1,
+            x + vw, y,      u1, v0,
+            x + vw, y + vh, u1, v1,
+        ];
+        queue.write_buffer(&pb.comp_buf, 0, bytemuck::cast_slice(&verts));
+        pass.set_pipeline(&self.comp_pipeline);
+        pass.set_bind_group(0, &self.common_bg, &[]);
+        pass.set_bind_group(1, &tex.comp_bg, &[]);
+        pass.set_vertex_buffer(0, pb.comp_buf.slice(..));
+        pass.draw(0..6, 0..1);
     }
 
     /// Drop a closed pane's cached buffers.
@@ -1328,5 +1702,23 @@ struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @l
 @fragment fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let a = textureSample(atlas_tex, atlas_smp, in.uv).r;
   return vec4<f32>(in.color.rgb, in.color.a * a);
+}
+"#;
+
+const COMP_WGSL: &str = r#"
+struct Screen { size: vec2<f32> };
+@group(0) @binding(0) var<uniform> screen: Screen;
+@group(1) @binding(0) var pane_tex: texture_2d<f32>;
+@group(1) @binding(1) var pane_smp: sampler;
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VsOut {
+  let ndc = vec2<f32>(pos.x / screen.size.x * 2.0 - 1.0, 1.0 - pos.y / screen.size.y * 2.0);
+  var o: VsOut;
+  o.pos = vec4<f32>(ndc, 0.0, 1.0);
+  o.uv = uv;
+  return o;
+}
+@fragment fn fs(in: VsOut) -> @location(0) vec4<f32> {
+  return textureSample(pane_tex, pane_smp, in.uv);
 }
 "#;
