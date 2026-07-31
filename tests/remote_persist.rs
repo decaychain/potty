@@ -382,6 +382,56 @@ fn reattach_restores_and_replays() {
     );
 }
 
+/// End-to-end version of the hx bug: output painted on the alt screen before detach must not
+/// resurface in the reattach snapshot (raw-buffer replay used to leak it once trimming cut off
+/// the alt-screen entry sequence).
+#[test]
+fn reattach_snapshot_drops_finished_alt_screen_junk() {
+    let tag = tag();
+    let sock = std::env::temp_dir().join(format!("potty-altjunk-{tag}.sock"));
+    let done = format!("ALTDONE_{tag}");
+    let daemon = start_daemon(&sock);
+
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 1 }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    // Paint on the alt screen, leave it, then print a completion marker. printf assembles the
+    // junk marker ("ALT" + "JUNKPAYLOAD") so the echoed command line never contains it whole.
+    c1.send(Frame::Data {
+        pane: 1,
+        bytes: format!("printf '\\033[?1049hALT%s\\033[?1049l{done}\\n' JUNKPAYLOAD\r")
+            .into_bytes(),
+    });
+    assert!(
+        c1.wait(|out, _| out.get(&1).is_some_and(|o| contains(o, done.as_bytes()))),
+        "completion marker never reached client #1"
+    );
+    c1.disconnect();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 1 }));
+    let restored = c2.wait(|out, ctrl| {
+        ctrl.iter().any(|m| matches!(m, Control::Ready))
+            && out.get(&1).is_some_and(|o| contains(o, done.as_bytes()))
+    });
+    let leaked = {
+        let g = c2.collected.lock().unwrap();
+        g.0.get(&1)
+            .is_some_and(|o| contains(o, b"ALTJUNKPAYLOAD"))
+    };
+    c2.disconnect();
+    cleanup(daemon, &sock);
+
+    assert!(restored, "reattach did not replay the primary screen");
+    assert!(!leaked, "alt-screen junk leaked into the reattach snapshot");
+}
+
 #[test]
 fn remote_pane_advertises_truecolor_env() {
     let tag = tag();

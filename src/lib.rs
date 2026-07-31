@@ -6,4 +6,5 @@
 pub mod notify;
 pub mod proto;
 pub mod remote;
+pub mod snapshot;
 pub mod term_env;
