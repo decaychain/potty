@@ -85,6 +85,8 @@ enum UserEvent {
     Wake(PaneId),
     /// The pane's program rang BEL — flash the visual bell.
     Bell(PaneId),
+    /// A shell-integrated command finished (OSC 133 `D`) with this exit code.
+    CommandExit(PaneId, i32),
     ReloadConfig,
     /// OSC 52 store (app writes the system clipboard). Targets the clipboard selection.
     ClipboardStore(String),
@@ -459,6 +461,9 @@ enum Backend {
         /// pane is fed from the main loop, so it owns its parser here. Boxed: the parser dwarfs
         /// every other field, and `Backend` lives inside each `Terminal`.
         parser: Box<Processor<StdSyncHandler>>,
+        /// OSC 133 tap on the same byte stream (exit-status aura); local panes keep theirs in
+        /// the reader thread.
+        osc: potty::osc133::Scanner,
     },
 }
 
@@ -3045,6 +3050,14 @@ impl App {
         }
     }
 
+    /// A shell-integrated command finished (OSC 133) — pulse the pane's exit-status aura.
+    fn on_command_exit(&mut self, id: PaneId, code: i32) {
+        if let Some(state) = self.state.as_mut() {
+            state.grid.exit_pulse(id, code == 0);
+        }
+        self.touch(id);
+    }
+
     /// Physical line height for a logical point size.
     fn line_px(&self, size: f32) -> f32 {
         size * 1.2 * self.scale
@@ -3133,6 +3146,7 @@ impl App {
         let reader_wake = wake_pending.clone();
         thread::spawn(move || {
             let mut parser = Processor::<StdSyncHandler>::new();
+            let mut osc = potty::osc133::Scanner::default();
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
@@ -3141,6 +3155,9 @@ impl App {
                         {
                             let mut t = reader_term.lock().unwrap();
                             parser.advance(&mut *t, &buf[..n]);
+                        }
+                        for code in osc.scan(&buf[..n]) {
+                            let _ = proxy.send_event(UserEvent::CommandExit(id, code));
                         }
                         // Only wake the main loop if it hasn't an unhandled wake already —
                         // a flooding program (e.g. `yes`) thus can't spam it one event per read.
@@ -3544,6 +3561,7 @@ impl App {
                     label,
                     outbound: outbound.clone(),
                     parser: Box::new(Processor::new()),
+                    osc: potty::osc133::Scanner::default(),
                 },
                 dims,
                 title: "shell".into(),
@@ -3642,11 +3660,17 @@ impl App {
                     .and_then(|c| c.routes.get(&remote_id))
                     .copied();
                 if let Some(local) = local {
+                    let mut codes = Vec::new();
                     if let Some(t) = self.terms.get_mut(&local)
-                        && let Backend::Remote { parser, .. } = &mut t.backend
+                        && let Backend::Remote { parser, osc, .. } = &mut t.backend
                     {
                         let mut term = t.term.lock().unwrap();
                         parser.advance(&mut *term, &bytes);
+                        drop(term);
+                        codes = osc.scan(&bytes);
+                    }
+                    for code in codes {
+                        self.on_command_exit(local, code);
                     }
                     self.touch(local);
                 }
@@ -4302,6 +4326,7 @@ impl App {
                 .set_crt(self.config.crt_scanlines, self.config.crt_glow);
             state.grid.set_visual_bell(self.config.visual_bell);
             state.grid.set_copy_flash(self.config.copy_flash);
+            state.grid.set_exit_aura(self.config.exit_aura);
             if font_changed {
                 state.grid.set_font(family, size * scale, line);
                 let m = state.grid.metrics();
@@ -5224,6 +5249,7 @@ impl ApplicationHandler<UserEvent> for App {
             .set_crt(self.config.crt_scanlines, self.config.crt_glow);
         state.grid.set_visual_bell(self.config.visual_bell);
         state.grid.set_copy_flash(self.config.copy_flash);
+        state.grid.set_exit_aura(self.config.exit_aura);
         state.grid.set_font(
             self.config.font_family.clone(),
             self.config.font_size * scale,
@@ -5381,6 +5407,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.touch(id);
             }
+            UserEvent::CommandExit(id, code) => self.on_command_exit(id, code),
             UserEvent::ReloadConfig => {
                 let cfg = Config::load(&self.config_path);
                 self.apply_config(cfg);

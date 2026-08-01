@@ -4,6 +4,7 @@
 //! live here so `potty`, `potty-session`, and `potty-notify` can share them without drift.
 
 pub mod notify;
+pub mod osc133;
 pub mod proto;
 pub mod remote;
 pub mod snapshot;

@@ -69,6 +69,11 @@ const BELL_TAU: f32 = 0.12;
 const FLASH: Duration = Duration::from_millis(250);
 const FLASH_ALPHA: f32 = 0.35;
 
+/// Exit-status aura: the edge glow decays exponentially with this time constant — a touch
+/// slower than the bell, so a red edge lingers just long enough to catch out of the corner
+/// of an eye.
+const AURA_TAU: f32 = 0.18;
+
 /// Smooth scrolling: each pane renders into a backbuffer with this many rows of adjacent
 /// history drawn above and below the viewport, and the composite pass samples a viewport-sized
 /// window whose offset ("scroll debt") eases back to center. A KDE wheel notch is 3 lines, so
@@ -262,6 +267,9 @@ struct PaneAnim {
     bell: f32,
     /// A just-copied selection being flashed: the range plus when the copy happened.
     flash: Option<(SelectionRange, Instant)>,
+    /// Exit-status aura level (decaying edge glow) and its color (red/green at pulse time).
+    aura: f32,
+    aura_col: Rgb,
     /// When this pane last prepared — the dim easing needs a per-pane dt, since panes are
     /// only rebuilt when dirty.
     last_prep: Option<Instant>,
@@ -400,7 +408,7 @@ impl PaneBuffers {
         });
         let comp_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pane-composite-quad"),
-            size: (6 * 20 * std::mem::size_of::<f32>()) as u64,
+            size: (6 * 24 * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -450,6 +458,8 @@ pub struct GridRenderer {
     crt_glow: f32,
     /// Visual bell peak flash strength (config `visual_bell`; 0 disables).
     visual_bell: f32,
+    /// Exit-status aura peak strength (config `exit_aura`; 0 disables).
+    exit_aura: f32,
     /// Flash the just-copied selection as feedback (config `copy_flash`).
     copy_flash: bool,
 
@@ -739,7 +749,7 @@ impl GridRenderer {
         });
         let comp_attrs = wgpu::vertex_attr_array![
             0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4,
-            5 => Float32x4
+            5 => Float32x4, 6 => Float32x4
         ];
         let comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("composite"),
@@ -748,7 +758,7 @@ impl GridRenderer {
                 module: &comp_shader,
                 entry_point: Some("vs"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 80,
+                    array_stride: 96,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &comp_attrs,
                 }],
@@ -797,6 +807,7 @@ impl GridRenderer {
             crt_scanlines: 0.0,
             crt_glow: 0.0,
             visual_bell: 0.03,
+            exit_aura: 0.15,
             copy_flash: true,
             atlas: Atlas {
                 texture,
@@ -868,6 +879,22 @@ impl GridRenderer {
 
     pub fn set_copy_flash(&mut self, on: bool) {
         self.copy_flash = on;
+    }
+
+    pub fn set_exit_aura(&mut self, strength: f32) {
+        self.exit_aura = strength.clamp(0.0, 1.0);
+    }
+
+    /// Pulse the exit-status aura: a brief glow hugging the pane edges after a command
+    /// finishes — ANSI red for failure, a much quieter green for success. Failure is the
+    /// signal worth noticing; success is only a nod.
+    pub fn exit_pulse(&mut self, pane: u64, success: bool) {
+        if self.exit_aura > 0.0
+            && let Some(pb) = self.panes.get_mut(&pane)
+        {
+            pb.anim.aura = if success { 0.25 } else { 1.0 };
+            pb.anim.aura_col = self.palette.ansi[if success { 2 } else { 1 }];
+        }
     }
 
     /// Ring the visual bell on a pane: the composite filter flashes it briefly toward white.
@@ -1556,6 +1583,15 @@ impl GridRenderer {
                 animating = true;
             }
         }
+        // Exit-status aura: same idea, its own (slower) clock.
+        if anim.aura > 0.0 {
+            anim.aura *= (-dt / AURA_TAU).exp();
+            if anim.aura < 0.02 {
+                anim.aura = 0.0;
+            } else {
+                animating = true;
+            }
+        }
         // Copy flash: keep frames coming until the glimmer has fully faded.
         if flash.is_some() {
             animating = true;
@@ -1661,13 +1697,16 @@ impl GridRenderer {
         ];
         // The bell flashes toward the theme accent (linear, like everything in the filter).
         let [ar, ag, ab, _] = rgba(self.palette.accent, 0.0);
-        let mut verts = [0.0f32; 120];
+        // Exit-status aura: rgb is the outcome color, a the current edge-glow level.
+        let aura = rgba(pb.anim.aura_col, self.exit_aura * pb.anim.aura);
+        let mut verts = [0.0f32; 144];
         for (i, (px, py, u, v)) in corners.into_iter().enumerate() {
             // Each vertex: pos, uv, filt (dim), fx (bell/crt), win (uv bounds for glow taps —
-            // beyond them the backbuffer holds off-viewport rows or unwritten texels), accent.
-            verts[i * 20..(i + 1) * 20].copy_from_slice(&[
+            // beyond them the backbuffer holds off-viewport rows or unwritten texels), accent,
+            // aura.
+            verts[i * 24..(i + 1) * 24].copy_from_slice(&[
                 px, py, u, v, br, bg, bb, dim, fx[0], fx[1], fx[2], fx[3], u0, v0, u1, v1, ar,
-                ag, ab, 0.0,
+                ag, ab, 0.0, aura[0], aura[1], aura[2], aura[3],
             ]);
         }
         queue.write_buffer(&pb.comp_buf, 0, bytemuck::cast_slice(&verts));
@@ -1878,6 +1917,8 @@ struct VsOut {
   @location(3) win: vec4<f32>,
   // rgb: linear theme accent — what the visual bell flashes toward.
   @location(4) accent: vec4<f32>,
+  // Exit-status aura: rgb the outcome color, a the current edge-glow level.
+  @location(5) aura: vec4<f32>,
 };
 @vertex fn vs(
   @location(0) pos: vec2<f32>,
@@ -1886,6 +1927,7 @@ struct VsOut {
   @location(3) fx: vec4<f32>,
   @location(4) win: vec4<f32>,
   @location(5) accent: vec4<f32>,
+  @location(6) aura: vec4<f32>,
 ) -> VsOut {
   let ndc = vec2<f32>(pos.x / screen.size.x * 2.0 - 1.0, 1.0 - pos.y / screen.size.y * 2.0);
   var o: VsOut;
@@ -1895,6 +1937,7 @@ struct VsOut {
   o.fx = fx;
   o.win = win;
   o.accent = accent;
+  o.aura = aura;
   return o;
 }
 // One bilinear glow tap, bright-passed: only genuinely luminous pixels contribute to the
@@ -1936,6 +1979,16 @@ fn tap(uv: vec2<f32>, win: vec4<f32>) -> vec3<f32> {
   let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
   let desat = mix(c, vec3<f32>(luma), min(dim * 2.0, 1.0));
   var faded = mix(desat, in.filt.rgb, dim);
+  // Exit-status aura: a soft band hugging the pane edges, colored by the last command's
+  // outcome. Applied after the dim filter so a failure shows even on an unfocused pane.
+  // Band width rides the scanline-period slot (≈ 1.2 cell heights).
+  if (in.aura.a > 0.0) {
+    let ts = vec2<f32>(textureDimensions(pane_tex));
+    let dx = min(in.uv.x - in.win.x, in.win.z - in.uv.x) * ts.x;
+    let dy = min(in.uv.y - in.win.y, in.win.w - in.uv.y) * ts.y;
+    let edge = exp(-min(dx, dy) / (6.0 * in.fx.w));
+    faded = mix(faded, in.aura.rgb, in.aura.a * edge);
+  }
   // Visual bell: flash toward the theme accent, applied last so it cuts through the dim
   // filter.
   faded = mix(faded, in.accent.rgb, in.fx.x);

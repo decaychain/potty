@@ -70,6 +70,11 @@ pub struct Config {
     pub visual_bell: f32,
     /// Flash the just-copied region briefly when a selection is copied to the clipboard.
     pub copy_flash: bool,
+    /// Exit-status aura: when a shell-integrated command finishes (OSC 133 marks — fish emits
+    /// them natively, zsh/bash need the snippet from the README), the pane's edges briefly
+    /// glow ANSI red on failure or a much quieter green on success, at this peak strength
+    /// (0.0 disables). Failure glows at full strength, success at a quarter of it.
+    pub exit_aura: f32,
     /// Command run on a remote host by "Connect to host…" to start the multiplexer backend. Must
     /// be on the remote's PATH, or an absolute path (until bootstrapping installs it for you).
     pub remote_command: String,
@@ -227,6 +232,7 @@ impl Default for Config {
             crt_glow: 0.0,
             visual_bell: 0.03,
             copy_flash: true,
+            exit_aura: 0.15,
             remote_command: "potty-session".into(),
             profiles: Vec::new(),
             hotkeys: BTreeMap::new(),

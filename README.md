@@ -82,6 +82,34 @@ For `potty-session` connections, potty prefixes the remote command so these valu
 by panes. Plain-shell connections use SSH env requests, which OpenSSH only honors for names allowed
 by the server's `AcceptEnv`.
 
+## Shell integration (exit-status aura)
+
+When your shell marks its prompts with OSC 133 semantic marks, potty pulses a pane's edges after
+each command: ANSI red for a failure, a calmer green for success (`exit_aura` in the config; 0
+disables). **fish** (≥ 3.6) and **nushell** (`shell_integration`) emit the marks natively; for
+zsh and bash add a snippet:
+
+```zsh
+# zsh — ~/.zshrc
+# `%?` (prompt expansion) is the status of *your* last command — unlike `$?`, which other
+# precmd hooks (prompt themes, git status) may already have clobbered by the time ours runs.
+autoload -Uz add-zsh-hook
+_potty_precmd()  { print -Pn '\e]133;D;%?\a\e]133;A\a' }
+_potty_preexec() { printf '\e]133;C\a' }
+add-zsh-hook precmd _potty_precmd
+add-zsh-hook preexec _potty_preexec
+```
+
+```bash
+# bash — ~/.bashrc
+PROMPT_COMMAND='printf "\e]133;D;%s\a\e]133;A\a" "$?"'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+PS0='\[\e]133;C\a\]'
+```
+
+The marks are the same ones kitty/ghostty/VS Code use, so an already-integrated shell needs no
+extra setup. potty only reacts to commands that actually ran (a bare Enter or the shell starting
+up doesn't pulse).
+
 ## Attention feed
 
 When you run several agentic CLIs at once they spend a lot of time *blocked on you* — a permission
