@@ -83,6 +83,8 @@ type SharedTerm = Arc<Mutex<Term<EventProxy>>>;
 enum UserEvent {
     /// A pane's reader advanced its grid — mark it dirty (and redraw if it's visible).
     Wake(PaneId),
+    /// The pane's program rang BEL — flash the visual bell.
+    Bell(PaneId),
     ReloadConfig,
     /// OSC 52 store (app writes the system clipboard). Targets the clipboard selection.
     ClipboardStore(String),
@@ -159,6 +161,7 @@ impl EventListener for EventProxy {
             Event::PtyWrite(text) => Some(UserEvent::PtyWrite(self.pane, text)),
             Event::Title(title) => Some(UserEvent::Title(self.pane, title)),
             Event::ResetTitle => Some(UserEvent::ResetTitle(self.pane)),
+            Event::Bell => Some(UserEvent::Bell(self.pane)),
             _ => None,
         };
         if let Some(ev) = forward {
@@ -4294,6 +4297,11 @@ impl App {
             state.grid.set_smear(self.config.cursor_smear);
             state.grid.set_focus_dim(self.config.focus_dim);
             state.grid.set_smooth_scroll(self.config.smooth_scroll);
+            state
+                .grid
+                .set_crt(self.config.crt_scanlines, self.config.crt_glow);
+            state.grid.set_visual_bell(self.config.visual_bell);
+            state.grid.set_copy_flash(self.config.copy_flash);
             if font_changed {
                 state.grid.set_font(family, size * scale, line);
                 let m = state.grid.metrics();
@@ -4604,16 +4612,30 @@ impl App {
     /// Copy the focused pane's selection to the clipboard and clear it. Returns whether anything
     /// was copied.
     fn copy(&mut self) -> bool {
-        let text = self
-            .focused_arc()
-            .and_then(|t| t.lock().unwrap().selection_to_string());
+        let id = self.focus();
+        let (text, range) = match self.focused_arc() {
+            Some(t) => {
+                let t = t.lock().unwrap();
+                (
+                    t.selection_to_string(),
+                    t.selection.as_ref().and_then(|s| s.to_range(&t)),
+                )
+            }
+            None => (None, None),
+        };
         match text {
             Some(s) if !s.is_empty() => {
                 if let Some(cb) = &self.clipboard {
                     cb.store(s);
                 }
                 self.clear_selection();
-                self.request_redraw();
+                // The vacated region glimmers briefly as copy feedback.
+                if let Some(range) = range
+                    && let Some(state) = self.state.as_mut()
+                {
+                    state.grid.flash_selection(id, range);
+                }
+                self.touch(id);
                 true
             }
             _ => false,
@@ -5197,6 +5219,11 @@ impl ApplicationHandler<UserEvent> for App {
         state.grid.set_smear(self.config.cursor_smear);
         state.grid.set_focus_dim(self.config.focus_dim);
         state.grid.set_smooth_scroll(self.config.smooth_scroll);
+        state
+            .grid
+            .set_crt(self.config.crt_scanlines, self.config.crt_glow);
+        state.grid.set_visual_bell(self.config.visual_bell);
+        state.grid.set_copy_flash(self.config.copy_flash);
         state.grid.set_font(
             self.config.font_family.clone(),
             self.config.font_size * scale,
@@ -5345,6 +5372,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // Output in the focused pane keeps its cursor solid (and restarts the blink cycle).
                 if !self.terms.is_empty() && id == self.focus() {
                     self.reset_blink();
+                }
+                self.touch(id);
+            }
+            UserEvent::Bell(id) => {
+                if let Some(state) = self.state.as_mut() {
+                    state.grid.bell(id);
                 }
                 self.touch(id);
             }

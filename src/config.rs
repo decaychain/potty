@@ -57,6 +57,19 @@ pub struct Config {
     /// Scrolling glides instead of jumping line-by-line — both scrollback (wheel) and output
     /// scrolling at the live bottom. Bursts bigger than a few lines snap instantly.
     pub smooth_scroll: bool,
+    /// CRT scanlines: a soft raster pattern fixed to the screen, this dark at its deepest
+    /// (0.0 disables). 0.15–0.3 reads as a subtle tube; applied per pane at composite time.
+    pub crt_scanlines: f32,
+    /// CRT phosphor glow (halation): bright pixels bleed a soft halo into their neighborhood
+    /// (0.0 disables; 0.4–0.8 is a gentle glow). Not to be confused with `phosphor`, the
+    /// afterglow of departing glyphs — this one glows while the text is *on*.
+    pub crt_glow: f32,
+    /// Visual bell: BEL flashes the pane toward the theme accent (`colors.border`) at this
+    /// peak strength, decaying in ~350 ms (0.0 disables). The whole pane shifts, so a little
+    /// goes a long way — 0.03 reads as a polite blink.
+    pub visual_bell: f32,
+    /// Flash the just-copied region briefly when a selection is copied to the clipboard.
+    pub copy_flash: bool,
     /// Command run on a remote host by "Connect to host…" to start the multiplexer backend. Must
     /// be on the remote's PATH, or an absolute path (until bootstrapping installs it for you).
     pub remote_command: String,
@@ -210,6 +223,10 @@ impl Default for Config {
             cursor_smear: false,
             focus_dim: 0.15,
             smooth_scroll: true,
+            crt_scanlines: 0.0,
+            crt_glow: 0.0,
+            visual_bell: 0.03,
+            copy_flash: true,
             remote_command: "potty-session".into(),
             profiles: Vec::new(),
             hotkeys: BTreeMap::new(),
@@ -295,6 +312,11 @@ impl Config {
                 r: 0x33,
                 g: 0x4a,
                 b: 0x6b,
+            }),
+            accent: parse_hex(&self.colors.border).unwrap_or(Rgb {
+                r: 0x78,
+                g: 0xa0,
+                b: 0xff,
             }),
             ansi,
         }

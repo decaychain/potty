@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
@@ -58,6 +59,15 @@ const SMEAR_ALPHA: f32 = 0.4;
 /// Focus dimming eases exponentially with this time constant (~95% settled in 3τ ≈ 300 ms) —
 /// slow enough to read as a gentle animated fade, fast enough not to lag focus changes.
 const DIM_TAU: f32 = 0.1;
+
+/// Visual bell: the flash peaks instantly on BEL and decays exponentially with this time
+/// constant — mostly gone in ~350 ms, brief enough to read as a blink, not a strobe.
+const BELL_TAU: f32 = 0.12;
+
+/// Copy flash: how long the just-copied region glimmers, and its peak overlay opacity
+/// (drawn in the theme foreground color, so it reads on light and dark themes alike).
+const FLASH: Duration = Duration::from_millis(250);
+const FLASH_ALPHA: f32 = 0.35;
 
 /// Smooth scrolling: each pane renders into a backbuffer with this many rows of adjacent
 /// history drawn above and below the viewport, and the composite pass samples a viewport-sized
@@ -128,6 +138,9 @@ pub struct Palette {
     pub bg: Rgb,
     pub cursor: Rgb,
     pub selection: Rgb,
+    /// The theme's signature accent (the focused-pane border color); the visual bell
+    /// flashes toward it.
+    pub accent: Rgb,
     pub ansi: [Rgb; 16],
 }
 
@@ -150,6 +163,11 @@ impl Default for Palette {
                 b: 0xcc,
             },
             selection: SELECTION_BG,
+            accent: Rgb {
+                r: 0x78,
+                g: 0xa0,
+                b: 0xff,
+            },
             ansi: default_ansi(),
         }
     }
@@ -240,6 +258,10 @@ struct PaneAnim {
     /// Focus dim level, eased toward 0 (focused, bright) or 1 (unfocused): the fraction of
     /// `focus_dim` currently applied.
     dim: f32,
+    /// Visual-bell flash level, decaying 1 → 0 after each BEL.
+    bell: f32,
+    /// A just-copied selection being flashed: the range plus when the copy happened.
+    flash: Option<(SelectionRange, Instant)>,
     /// When this pane last prepared — the dim easing needs a per-pane dt, since panes are
     /// only rebuilt when dirty.
     last_prep: Option<Instant>,
@@ -291,6 +313,7 @@ impl BackTex {
         device: &wgpu::Device,
         tex_layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
+        sampler_lin: &wgpu::Sampler,
         format: wgpu::TextureFormat,
         size: (u32, u32),
     ) -> Self {
@@ -320,6 +343,10 @@ impl BackTex {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler_lin),
                 },
             ],
         });
@@ -373,7 +400,7 @@ impl PaneBuffers {
         });
         let comp_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pane-composite-quad"),
-            size: (6 * 8 * std::mem::size_of::<f32>()) as u64,
+            size: (6 * 20 * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -415,6 +442,16 @@ pub struct GridRenderer {
     focus_dim: f32,
     /// Scrollback scrolling glides instead of jumping (config `smooth_scroll`).
     smooth: bool,
+    /// CRT scanline strength (config `crt_scanlines`; 0 disables): a soft raster pattern
+    /// fixed to the screen, applied at composite time.
+    crt_scanlines: f32,
+    /// CRT phosphor-glow strength (config `crt_glow`; 0 disables): bright pixels bleed a
+    /// soft halo into their neighborhood at composite time.
+    crt_glow: f32,
+    /// Visual bell peak flash strength (config `visual_bell`; 0 disables).
+    visual_bell: f32,
+    /// Flash the just-copied selection as feedback (config `copy_flash`).
+    copy_flash: bool,
 
     atlas: Atlas,
     /// Rasterized-glyph cache, keyed by (char, bold, italic).
@@ -433,6 +470,8 @@ pub struct GridRenderer {
     common_layout: wgpu::BindGroupLayout,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// Bilinear sampler used only by the composite pass's glow taps.
+    sampler_lin: wgpu::Sampler,
     format: wgpu::TextureFormat,
 
     /// Cached instance buffers, one set per pane (keyed by PaneId as a u64).
@@ -500,6 +539,14 @@ impl GridRenderer {
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        // Bilinear sampler for the CRT glow taps — the blit itself stays nearest (crisp 1:1),
+        // but the halo wants smooth off-texel reads.
+        let sampler_lin = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("glow-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let screen_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("screen"),
@@ -540,6 +587,14 @@ impl GridRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Linear sampler for the composite pass's glow taps (unused by the fg shader,
+                // which shares this layout).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -562,6 +617,10 @@ impl GridRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler_lin),
                 },
             ],
         });
@@ -678,8 +737,10 @@ impl GridRenderer {
             bind_group_layouts: &[Some(&common_layout), Some(&atlas_layout)],
             immediate_size: 0,
         });
-        let comp_attrs =
-            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+        let comp_attrs = wgpu::vertex_attr_array![
+            0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4,
+            5 => Float32x4
+        ];
         let comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("composite"),
             layout: Some(&comp_pl),
@@ -687,7 +748,7 @@ impl GridRenderer {
                 module: &comp_shader,
                 entry_point: Some("vs"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 32,
+                    array_stride: 80,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &comp_attrs,
                 }],
@@ -733,6 +794,10 @@ impl GridRenderer {
             smear: false,
             focus_dim: 0.15,
             smooth: true,
+            crt_scanlines: 0.0,
+            crt_glow: 0.0,
+            visual_bell: 0.03,
+            copy_flash: true,
             atlas: Atlas {
                 texture,
                 x: 0,
@@ -750,6 +815,7 @@ impl GridRenderer {
             common_layout,
             tex_layout: atlas_layout,
             sampler,
+            sampler_lin,
             format,
             panes: HashMap::new(),
         }
@@ -787,6 +853,40 @@ impl GridRenderer {
 
     pub fn set_smooth_scroll(&mut self, smooth: bool) {
         self.smooth = smooth;
+    }
+
+    pub fn set_crt(&mut self, scanlines: f32, glow: f32) {
+        // Clamped so a wild config value can't black out every other line or bloom the pane
+        // into a white sheet.
+        self.crt_scanlines = scanlines.clamp(0.0, 0.6);
+        self.crt_glow = glow.clamp(0.0, 2.0);
+    }
+
+    pub fn set_visual_bell(&mut self, strength: f32) {
+        self.visual_bell = strength.clamp(0.0, 1.0);
+    }
+
+    pub fn set_copy_flash(&mut self, on: bool) {
+        self.copy_flash = on;
+    }
+
+    /// Ring the visual bell on a pane: the composite filter flashes it briefly toward white.
+    pub fn bell(&mut self, pane: u64) {
+        if self.visual_bell > 0.0
+            && let Some(pb) = self.panes.get_mut(&pane)
+        {
+            pb.anim.bell = 1.0;
+        }
+    }
+
+    /// Flash a just-copied region as feedback (called right after the selection is cleared,
+    /// with the range it covered).
+    pub fn flash_selection(&mut self, pane: u64, range: SelectionRange) {
+        if self.copy_flash
+            && let Some(pb) = self.panes.get_mut(&pane)
+        {
+            pb.anim.flash = Some((range, Instant::now()));
+        }
     }
 
     /// Update the composite pass's screen uniform to the surface size (once per frame).
@@ -921,6 +1021,7 @@ impl GridRenderer {
                 common_layout,
                 tex_layout,
                 sampler,
+                sampler_lin,
                 format,
                 ..
             } = &mut *self;
@@ -928,7 +1029,14 @@ impl GridRenderer {
                 .entry(pane)
                 .or_insert_with(|| PaneBuffers::new(device, common_layout));
             if pb.tex.as_ref().map(|t| t.size) != Some(tex_size) {
-                pb.tex = Some(BackTex::new(device, tex_layout, sampler, *format, tex_size));
+                pb.tex = Some(BackTex::new(
+                    device,
+                    tex_layout,
+                    sampler,
+                    sampler_lin,
+                    *format,
+                    tex_size,
+                ));
                 queue.write_buffer(
                     &pb.screen_buf,
                     0,
@@ -988,6 +1096,14 @@ impl GridRenderer {
             && content.mode.contains(TermMode::SHOW_CURSOR)
             && cursor_shape != CursorShape::Hidden;
         let selection = content.selection;
+        // Copy flash: overlay alpha for a just-copied region, fading linearly over FLASH.
+        let flash = anim.flash.and_then(|(range, since)| {
+            let t = now.saturating_duration_since(since).as_secs_f32() / FLASH.as_secs_f32();
+            (t < 1.0).then_some((range, FLASH_ALPHA * (1.0 - t)))
+        });
+        if flash.is_none() {
+            anim.flash = None;
+        }
         // When scrolled into history, display_iter yields negative line numbers; shift them
         // back into the 0..screen_lines viewport so scrollback renders in place.
         let off = content.display_offset as i32;
@@ -1049,6 +1165,18 @@ impl GridRenderer {
                     pos: [x, y],
                     size: [cw, ch],
                     color: rgba(bg_col, 1.0),
+                });
+            }
+
+            // A just-copied region glimmers briefly in the foreground color — over the cell
+            // background, under the glyph.
+            if let Some((range, alpha)) = flash
+                && range.contains(point)
+            {
+                bg.push(BgInstance {
+                    pos: [x, y],
+                    size: [cw, ch],
+                    color: rgba(palette.fg, alpha),
                 });
             }
 
@@ -1419,6 +1547,19 @@ impl GridRenderer {
         } else {
             anim.dim = target; // feature off: track silently so enabling it doesn't animate
         }
+        // Visual bell: decay the flash set by `bell()` toward zero.
+        if anim.bell > 0.0 {
+            anim.bell *= (-dt / BELL_TAU).exp();
+            if anim.bell < 0.02 {
+                anim.bell = 0.0;
+            } else {
+                animating = true;
+            }
+        }
+        // Copy flash: keep frames coming until the glimmer has fully faded.
+        if flash.is_some() {
+            animating = true;
+        }
         anim.last_prep = Some(now);
 
         // Store the rebuilt vectors back and upload them (growing the GPU buffers if needed).
@@ -1501,15 +1642,34 @@ impl GridRenderer {
         // Unfocused-pane fade, applied per-pixel while blitting: rgb is the (linear) theme
         // background the filter pulls contrast toward, a is the eased dim strength.
         let [br, bg, bb, dim] = rgba(self.palette.bg, self.focus_dim * pb.anim.dim);
-        #[rustfmt::skip]
-        let verts: [f32; 48] = [
-            x,      y,      u0, v0, br, bg, bb, dim,
-            x + vw, y,      u1, v0, br, bg, bb, dim,
-            x,      y + vh, u0, v1, br, bg, bb, dim,
-            x,      y + vh, u0, v1, br, bg, bb, dim,
-            x + vw, y,      u1, v0, br, bg, bb, dim,
-            x + vw, y + vh, u1, v1, br, bg, bb, dim,
+        // CRT + bell parameters: x = bell flash level, y = scanline strength, z = glow
+        // strength, w = scanline period in px (scaled off the cell so hidpi keeps the pitch).
+        let period = (self.metrics.h / 5.0).clamp(2.0, 8.0);
+        let fx = [
+            self.visual_bell * pb.anim.bell,
+            self.crt_scanlines,
+            self.crt_glow,
+            period,
         ];
+        let corners = [
+            (x, y, u0, v0),
+            (x + vw, y, u1, v0),
+            (x, y + vh, u0, v1),
+            (x, y + vh, u0, v1),
+            (x + vw, y, u1, v0),
+            (x + vw, y + vh, u1, v1),
+        ];
+        // The bell flashes toward the theme accent (linear, like everything in the filter).
+        let [ar, ag, ab, _] = rgba(self.palette.accent, 0.0);
+        let mut verts = [0.0f32; 120];
+        for (i, (px, py, u, v)) in corners.into_iter().enumerate() {
+            // Each vertex: pos, uv, filt (dim), fx (bell/crt), win (uv bounds for glow taps —
+            // beyond them the backbuffer holds off-viewport rows or unwritten texels), accent.
+            verts[i * 20..(i + 1) * 20].copy_from_slice(&[
+                px, py, u, v, br, bg, bb, dim, fx[0], fx[1], fx[2], fx[3], u0, v0, u1, v1, ar,
+                ag, ab, 0.0,
+            ]);
+        }
         queue.write_buffer(&pb.comp_buf, 0, bytemuck::cast_slice(&verts));
         pass.set_pipeline(&self.comp_pipeline);
         pass.set_bind_group(0, &self.common_bg, &[]);
@@ -1706,32 +1866,79 @@ struct Screen { size: vec2<f32> };
 @group(0) @binding(0) var<uniform> screen: Screen;
 @group(1) @binding(0) var pane_tex: texture_2d<f32>;
 @group(1) @binding(1) var pane_smp: sampler;
+@group(1) @binding(2) var glow_smp: sampler;
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
   @location(0) uv: vec2<f32>,
   // rgb: linear theme background (the contrast pivot), a: dim strength (0 = focused).
   @location(1) filt: vec4<f32>,
+  // x: bell flash level, y: scanline strength, z: glow strength, w: scanline period (px).
+  @location(2) fx: vec4<f32>,
+  // The blitted window in uv space (min .xy, max .zw): glow taps clamp to it.
+  @location(3) win: vec4<f32>,
+  // rgb: linear theme accent — what the visual bell flashes toward.
+  @location(4) accent: vec4<f32>,
 };
 @vertex fn vs(
   @location(0) pos: vec2<f32>,
   @location(1) uv: vec2<f32>,
   @location(2) filt: vec4<f32>,
+  @location(3) fx: vec4<f32>,
+  @location(4) win: vec4<f32>,
+  @location(5) accent: vec4<f32>,
 ) -> VsOut {
   let ndc = vec2<f32>(pos.x / screen.size.x * 2.0 - 1.0, 1.0 - pos.y / screen.size.y * 2.0);
   var o: VsOut;
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
   o.uv = uv;
   o.filt = filt;
+  o.fx = fx;
+  o.win = win;
+  o.accent = accent;
   return o;
 }
+// One bilinear glow tap, bright-passed: only genuinely luminous pixels contribute to the
+// halo (0.25 linear ≈ 55% sRGB), so mid-tone UI chrome stays flat.
+fn tap(uv: vec2<f32>, win: vec4<f32>) -> vec3<f32> {
+  let s = textureSampleLevel(pane_tex, glow_smp, clamp(uv, win.xy, win.zw), 0.0).rgb;
+  return max(s - vec3<f32>(0.25), vec3<f32>(0.0));
+}
 @fragment fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let c = textureSample(pane_tex, pane_smp, in.uv).rgb;
+  var c = textureSample(pane_tex, pane_smp, in.uv).rgb;
+  // Phosphor glow (halation): bright neighbors bleed into this pixel. Two rings of
+  // bilinear taps — the inner ring carries the tight halo, the outer a faint corona.
+  if (in.fx.z > 0.0) {
+    let px = 1.0 / vec2<f32>(textureDimensions(pane_tex));
+    var acc = vec3<f32>(0.0);
+    acc += (tap(in.uv + vec2<f32>( 2.0,  0.0) * px, in.win)
+          + tap(in.uv + vec2<f32>(-2.0,  0.0) * px, in.win)
+          + tap(in.uv + vec2<f32>( 0.0,  2.0) * px, in.win)
+          + tap(in.uv + vec2<f32>( 0.0, -2.0) * px, in.win)
+          + tap(in.uv + vec2<f32>( 1.4,  1.4) * px, in.win)
+          + tap(in.uv + vec2<f32>(-1.4,  1.4) * px, in.win)
+          + tap(in.uv + vec2<f32>( 1.4, -1.4) * px, in.win)
+          + tap(in.uv + vec2<f32>(-1.4, -1.4) * px, in.win)) * 0.09;
+    acc += (tap(in.uv + vec2<f32>( 4.0,  0.0) * px, in.win)
+          + tap(in.uv + vec2<f32>(-4.0,  0.0) * px, in.win)
+          + tap(in.uv + vec2<f32>( 0.0,  4.0) * px, in.win)
+          + tap(in.uv + vec2<f32>( 0.0, -4.0) * px, in.win)) * 0.07;
+    c += in.fx.z * acc;
+  }
+  // Scanlines: a soft raster darkening fixed to the screen (like a real tube), so content
+  // scrolls beneath it.
+  if (in.fx.y > 0.0) {
+    let w = 0.5 + 0.5 * cos(6.283185 * in.pos.y / in.fx.w);
+    c *= 1.0 - in.fx.y * w;
+  }
   // Unfocused-pane fade: drain chrominance toward gray (twice the strength), then compress
   // contrast toward the theme background. All in linear light; a no-op at dim = 0.
   let dim = in.filt.a;
   let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
   let desat = mix(c, vec3<f32>(luma), min(dim * 2.0, 1.0));
-  let faded = mix(desat, in.filt.rgb, dim);
+  var faded = mix(desat, in.filt.rgb, dim);
+  // Visual bell: flash toward the theme accent, applied last so it cuts through the dim
+  // filter.
+  faded = mix(faded, in.accent.rgb, in.fx.x);
   return vec4<f32>(faded, 1.0);
 }
 "#;
