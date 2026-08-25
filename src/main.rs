@@ -2189,8 +2189,11 @@ fn build_ui(
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-/// How long to wait before retrying a GPU rebuild that found no adapter.
+/// Shortest gap between GPU rebuild attempts, and the ceiling the backoff grows to. A driver
+/// that is gone for minutes shouldn't be probed twice a second: each attempt re-enumerates
+/// adapters and creates a D3D12 device, which is far from free.
 const GPU_RETRY: Duration = Duration::from_millis(500);
+const GPU_RETRY_MAX: Duration = Duration::from_secs(10);
 
 /// Cap on the diagnostics log; it's rotated (truncated) past this.
 const DIAG_MAX: u64 = 256 * 1024;
@@ -2269,32 +2272,29 @@ const BG_CLEAR: wgpu::Color = wgpu::Color {
 impl WindowState {
     /// Build the GPU stack — adapter, device, surface, glyph renderer — for `window`.
     ///
-    /// Returns `None` when the adapter or device can't be had. That is not necessarily fatal:
-    /// while the display adapter is powering back up after standby, `request_adapter` can fail
-    /// for a moment. The caller retries instead of dying (see `App::rebuild_gpu`).
+    /// Returns the failure as a message rather than dying: while a display adapter is powering
+    /// back up (after standby, or after a driver reset) this can fail for a while before it
+    /// starts working. The caller retries — see `App::rebuild_gpu`.
     ///
-    /// `instance` is passed in rather than created here so a rebuild can reuse the one it
-    /// already has, without needing the `ActiveEventLoop` back.
-    async fn new(window: Arc<Window>, instance: wgpu::Instance, scale: f32) -> Option<Self> {
+    /// `instance` must be *freshly created* for each attempt, not carried over from the stack
+    /// that just died. On DX12 the instance owns the DXGI factory, and an adapter enumerated
+    /// from a stale factory hands back the removed `ID3D12Device` for ever — every subsequent
+    /// `request_device` on it fails with "Parent device is lost", no matter how long you wait.
+    async fn new(
+        window: Arc<Window>,
+        instance: wgpu::Instance,
+        scale: f32,
+    ) -> Result<Self, String> {
         let size = window.inner_size();
 
-        let adapter = match instance
+        let adapter = instance
             .request_adapter(&RequestAdapterOptions::default())
             .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                log_diag(&format!("request_adapter failed: {e}"));
-                return None;
-            }
-        };
-        let (device, queue) = match adapter.request_device(&DeviceDescriptor::default()).await {
-            Ok(dq) => dq,
-            Err(e) => {
-                log_diag(&format!("request_device failed: {e}"));
-                return None;
-            }
-        };
+            .map_err(|e| format!("request_adapter failed: {e}"))?;
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor::default())
+            .await
+            .map_err(|e| format!("request_device failed: {e}"))?;
 
         // wgpu's default handlers are fatal: an uncaptured error panics the process, which under
         // `windows_subsystem = "windows"` means vanishing with no console and no crash report.
@@ -2333,13 +2333,9 @@ impl WindowState {
             }));
         }
 
-        let surface = match instance.create_surface(window.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                log_diag(&format!("create_surface failed: {e}"));
-                return None;
-            }
-        };
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| format!("create_surface failed: {e}"))?;
         let format = TextureFormat::Bgra8UnormSrgb;
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
@@ -2357,7 +2353,7 @@ impl WindowState {
 
         let grid = GridRenderer::new(&device, &queue, format, FONT_PX * scale, LINE_PX * scale);
 
-        Some(Self {
+        Ok(Self {
             device,
             queue,
             surface,
@@ -2588,12 +2584,17 @@ struct App {
     /// The OS window, held independently of `state`: a GPU rebuild drops the whole wgpu stack,
     /// and if the window's last `Arc` went with it the window itself would close.
     window: Option<Arc<Window>>,
-    /// The wgpu instance, kept across rebuilds. It outlives any one device, and re-making it
-    /// would need the `ActiveEventLoop` back (for the display handle Wayland requires).
-    instance: Option<wgpu::Instance>,
-    /// When a failed GPU rebuild should be retried (the adapter can be briefly absent while the
-    /// display comes back from standby). `None` means no rebuild is pending.
+    /// The display handle the wgpu instance is built from. Kept (rather than the instance
+    /// itself) because every rebuild needs a *brand-new* instance: on DX12 the instance owns the
+    /// DXGI factory, which is permanently stale once a device has been removed.
+    display_handle: Option<winit::event_loop::OwnedDisplayHandle>,
+    /// When a failed GPU rebuild should be retried. `None` means no rebuild is pending.
     gpu_retry_at: Option<Instant>,
+    /// Current gap between rebuild attempts, doubling on each consecutive failure up to
+    /// `GPU_RETRY_MAX` and reset once a rebuild succeeds.
+    gpu_backoff: Duration,
+    /// Consecutive failed rebuild attempts, for backoff and for thinning out the log.
+    gpu_fail_streak: u32,
     /// When the GPU stack was last rebuilt, to rate-limit rebuilds.
     last_rebuild: Option<Instant>,
     /// One live terminal per leaf pane, keyed by PaneId (across all tabs).
@@ -2745,8 +2746,10 @@ impl App {
             notify_paths,
             state: None,
             window: None,
-            instance: None,
+            display_handle: None,
             gpu_retry_at: None,
+            gpu_backoff: GPU_RETRY,
+            gpu_fail_streak: 0,
             last_rebuild: None,
             terms: HashMap::new(),
             mods: Modifiers::default(),
@@ -4478,7 +4481,8 @@ impl App {
     /// On Windows this is reached on the ordinary path out of Modern Standby (lid close), and
     /// also after a TDR or a driver update.
     fn rebuild_gpu(&mut self) {
-        let (Some(window), Some(instance)) = (self.window.clone(), self.instance.clone()) else {
+        let (Some(window), Some(display)) = (self.window.clone(), self.display_handle.clone())
+        else {
             return;
         };
         // Drop the dead stack *before* asking for a new one: DXGI refuses a second swapchain on
@@ -4500,16 +4504,47 @@ impl App {
         }
         self.last_rebuild = Some(now);
 
+        // A *new* instance every attempt. Reusing the old one is what turns a recoverable device
+        // loss into a permanent one: on DX12 the instance owns the DXGI factory, that factory is
+        // stale the moment a device is removed, and the adapter it keeps handing back carries the
+        // dead `ID3D12Device` — so `request_device` fails with "Parent device is lost" for ever.
+        let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(display)));
         let scale = window.scale_factor() as f32;
-        let Some(mut state) =
-            pollster::block_on(WindowState::new(window.clone(), instance, scale))
-        else {
-            // The adapter isn't back yet (the display is still powering up). Keep every terminal
-            // running and try again on a timer — see `about_to_wait`.
-            self.gpu_retry_at = Some(Instant::now() + GPU_RETRY);
-            return;
+        let mut state = match pollster::block_on(WindowState::new(window.clone(), instance, scale))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                // Not back yet. Keep every terminal running and try again later, backing off so
+                // a driver that's gone for minutes isn't probed twice a second. The log records
+                // the first failure and then thins out, so a long outage stays readable.
+                self.gpu_fail_streak += 1;
+                if self.gpu_fail_streak.is_power_of_two() {
+                    log_diag(&format!(
+                        "GPU rebuild attempt {} failed ({e}); retrying in {:?}",
+                        self.gpu_fail_streak, self.gpu_backoff
+                    ));
+                }
+                if self.gpu_fail_streak == 1 {
+                    // No renderer means no repaint, so the title bar is the only thing left that
+                    // can tell the user what's going on.
+                    window.set_title("potty — GPU device lost, recovering…");
+                }
+                self.gpu_retry_at = Some(Instant::now() + self.gpu_backoff);
+                self.gpu_backoff = (self.gpu_backoff * 2).min(GPU_RETRY_MAX);
+                return;
+            }
         };
+        if self.gpu_fail_streak > 0 {
+            log_diag(&format!(
+                "GPU stack recovered after {} failed attempts",
+                self.gpu_fail_streak
+            ));
+        }
         self.gpu_retry_at = None;
+        self.gpu_backoff = GPU_RETRY;
+        self.gpu_fail_streak = 0;
+        // Force `redraw` to re-apply the real title over the "recovering" one.
+        self.window_title.clear();
         self.scale = scale;
         self.font_families = state.grid.families().to_vec();
 
@@ -5510,18 +5545,20 @@ impl ApplicationHandler<UserEvent> for App {
         self.scale = scale;
         self.window = Some(window.clone());
 
-        // Built here (not in `WindowState`) because it must outlive any one device: a rebuild
-        // after device loss reuses it, and by then the `ActiveEventLoop` is no longer in hand.
-        let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
-            event_loop.owned_display_handle(),
-        )));
-        self.instance = Some(instance.clone());
+        // The handle (not the instance) is what's kept: a rebuild after device loss needs a
+        // brand-new instance, and by then the `ActiveEventLoop` is no longer in hand.
+        let display = event_loop.owned_display_handle();
+        self.display_handle = Some(display.clone());
+        let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(display)));
 
-        let Some(mut state) = pollster::block_on(WindowState::new(window.clone(), instance, scale))
-        else {
-            log_diag("no usable GPU adapter at startup — exiting");
-            event_loop.exit();
-            return;
+        let mut state = match pollster::block_on(WindowState::new(window.clone(), instance, scale))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log_diag(&format!("no usable GPU at startup ({e}) — exiting"));
+                event_loop.exit();
+                return;
+            }
         };
         self.font_families = state.grid.families().to_vec();
 
