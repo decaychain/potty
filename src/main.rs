@@ -2186,6 +2186,59 @@ fn build_ui(
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/// How long to wait before retrying a GPU rebuild that found no adapter.
+const GPU_RETRY: Duration = Duration::from_millis(500);
+
+/// Cap on the diagnostics log; it's rotated (truncated) past this.
+const DIAG_MAX: u64 = 256 * 1024;
+
+/// `potty.log`, next to `potty.toml`.
+fn diag_path() -> PathBuf {
+    config::config_path().with_file_name("potty.log")
+}
+
+/// Append one timestamped line to the diagnostics log.
+///
+/// potty is built with `windows_subsystem = "windows"`, so it has no console: a panic or a wgpu
+/// error printed to stderr goes nowhere, and the process simply vanishes with nothing in the
+/// Windows event log either. That is precisely why the standby crash was invisible. Every
+/// unexpected condition on the GPU path writes here instead.
+fn log_diag(msg: &str) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let path = diag_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > DIAG_MAX) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[{stamp}] {msg}");
+    }
+    // Still useful when someone does run potty from a console (or on Linux).
+    eprintln!("potty: {msg}");
+}
+
+/// Record panics to the diagnostics log before the default hook runs.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // `PanicHookInfo`'s Display already carries "panicked at file:line: message".
+        log_diag(&format!("PANIC: {info}"));
+        default(info);
+    }));
+}
+
+// ---------------------------------------------------------------------------
 // wgpu window state
 // ---------------------------------------------------------------------------
 
@@ -2194,9 +2247,16 @@ struct WindowState {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: SurfaceConfiguration,
-    instance: wgpu::Instance,
     grid: GridRenderer,
     window: Arc<Window>,
+    /// Set when this device (and everything built on it) has died and the whole GPU stack must
+    /// be rebuilt. Written from wgpu's device-lost / uncaptured-error callbacks — which can fire
+    /// on any thread — and read by `App::redraw`, which does the rebuilding.
+    ///
+    /// The trigger in practice is display power management: on Windows Modern Standby (and on a
+    /// TDR, or a driver update) the D3D12 device is *removed*, not merely idled. wgpu then fails
+    /// every call on it, starting with `get_current_texture`.
+    lost: Arc<AtomicBool>,
 }
 
 const BG_CLEAR: wgpu::Color = wgpu::Color {
@@ -2207,29 +2267,87 @@ const BG_CLEAR: wgpu::Color = wgpu::Color {
 };
 
 impl WindowState {
-    async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> Self {
+    /// Build the GPU stack — adapter, device, surface, glyph renderer — for `window`.
+    ///
+    /// Returns `None` when the adapter or device can't be had. That is not necessarily fatal:
+    /// while the display adapter is powering back up after standby, `request_adapter` can fail
+    /// for a moment. The caller retries instead of dying (see `App::rebuild_gpu`).
+    ///
+    /// `instance` is passed in rather than created here so a rebuild can reuse the one it
+    /// already has, without needing the `ActiveEventLoop` back.
+    async fn new(window: Arc<Window>, instance: wgpu::Instance, scale: f32) -> Option<Self> {
         let size = window.inner_size();
-        let scale = window.scale_factor() as f32;
 
-        let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
-            event_loop.owned_display_handle(),
-        )));
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&RequestAdapterOptions::default())
             .await
-            .unwrap();
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default())
-            .await
-            .unwrap();
+        {
+            Ok(a) => a,
+            Err(e) => {
+                log_diag(&format!("request_adapter failed: {e}"));
+                return None;
+            }
+        };
+        let (device, queue) = match adapter.request_device(&DeviceDescriptor::default()).await {
+            Ok(dq) => dq,
+            Err(e) => {
+                log_diag(&format!("request_device failed: {e}"));
+                return None;
+            }
+        };
 
-        let surface = instance.create_surface(window.clone()).expect("surface");
+        // wgpu's default handlers are fatal: an uncaptured error panics the process, which under
+        // `windows_subsystem = "windows"` means vanishing with no console and no crash report.
+        // Route both signals into a flag instead and let `App::redraw` rebuild the stack.
+        let lost = Arc::new(AtomicBool::new(false));
+        {
+            let flag = lost.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                // `Destroyed` is our own teardown (dropping the device during a rebuild, or at
+                // exit) — not something to rebuild for.
+                if matches!(reason, wgpu::DeviceLostReason::Destroyed) {
+                    return;
+                }
+                log_diag(&format!("wgpu device lost ({reason:?}): {msg}"));
+                flag.store(true, Ordering::Release);
+            });
+        }
+        {
+            let flag = lost.clone();
+            device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+                log_diag(&format!("wgpu error: {e}"));
+                // A dead device reports itself through ordinary errors on every subsequent call
+                // (e.g. "Surface is not configured for presentation" once the swapchain went
+                // with it), so an internal/OOM error is treated as a lost device. Validation
+                // errors that are *our* bug are logged and survived rather than escalated —
+                // rebuilding on those would just spin.
+                if matches!(e, wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }) {
+                    flag.store(true, Ordering::Release);
+                } else {
+                    // A validation error *is* our bug. Keep it loud while developing; in a
+                    // release build the user's session is worth more than the stack trace, and
+                    // the line above is now in `potty.log` either way.
+                    #[cfg(debug_assertions)]
+                    panic!("wgpu validation error: {e}");
+                }
+            }));
+        }
+
+        let surface = match instance.create_surface(window.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                log_diag(&format!("create_surface failed: {e}"));
+                return None;
+            }
+        };
         let format = TextureFormat::Bgra8UnormSrgb;
         let surface_config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width,
-            height: size.height,
+            // Clamped: a minimised window (which is where lid-close can leave us) reports 0×0,
+            // and a zero-sized surface configuration is invalid.
+            width: size.width.max(1),
+            height: size.height.max(1),
             present_mode: PresentMode::Fifo,
             alpha_mode: CompositeAlphaMode::Opaque,
             view_formats: vec![],
@@ -2239,18 +2357,37 @@ impl WindowState {
 
         let grid = GridRenderer::new(&device, &queue, format, FONT_PX * scale, LINE_PX * scale);
 
-        Self {
+        Some(Self {
             device,
             queue,
             surface,
             surface_config,
-            instance,
             grid,
             window,
+            lost,
+        })
+    }
+
+    /// Whether the device has died and the stack needs rebuilding.
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Flag the device as lost and ask for the frame that will rebuild it.
+    fn mark_lost(&self, why: &str) {
+        if !self.lost.swap(true, Ordering::AcqRel) {
+            log_diag(&format!("GPU stack lost: {why} — rebuilding"));
         }
+        self.window.request_redraw();
     }
 
     /// Acquire the surface texture, mapping the recoverable error cases to a redraw request.
+    ///
+    /// Nothing here is fatal. `Lost` and `Validation` both mean the swapchain is gone; on Windows
+    /// that is overwhelmingly a *removed device* (standby, TDR, driver update) rather than a
+    /// surface that outlived its window, and wgpu's own guidance for a lost device is to rebuild
+    /// the device and every resource on it. So both escalate to a rebuild instead of trying to
+    /// re-make the surface on a device that may already be dead.
     fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
         match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => Some(f),
@@ -2264,12 +2401,13 @@ impl WindowState {
                 None
             }
             wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface = self.instance.create_surface(self.window.clone()).unwrap();
-                self.surface.configure(&self.device, &self.surface_config);
-                self.window.request_redraw();
+                self.mark_lost("surface lost");
                 None
             }
-            wgpu::CurrentSurfaceTexture::Validation => panic!("surface validation error"),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.mark_lost("surface validation error");
+                None
+            }
         }
     }
 
@@ -2447,6 +2585,17 @@ struct App {
     /// Socket paths this process owns, removed on exit where possible.
     notify_paths: Vec<PathBuf>,
     state: Option<WindowState>,
+    /// The OS window, held independently of `state`: a GPU rebuild drops the whole wgpu stack,
+    /// and if the window's last `Arc` went with it the window itself would close.
+    window: Option<Arc<Window>>,
+    /// The wgpu instance, kept across rebuilds. It outlives any one device, and re-making it
+    /// would need the `ActiveEventLoop` back (for the display handle Wayland requires).
+    instance: Option<wgpu::Instance>,
+    /// When a failed GPU rebuild should be retried (the adapter can be briefly absent while the
+    /// display comes back from standby). `None` means no rebuild is pending.
+    gpu_retry_at: Option<Instant>,
+    /// When the GPU stack was last rebuilt, to rate-limit rebuilds.
+    last_rebuild: Option<Instant>,
     /// One live terminal per leaf pane, keyed by PaneId (across all tabs).
     terms: HashMap<PaneId, Terminal>,
     mods: Modifiers,
@@ -2560,6 +2709,28 @@ struct App {
     chrome_latched: bool,
 }
 
+/// Push every renderer-affecting config value (palette, effects, font) into a freshly built
+/// `GridRenderer`. Shared by first-time setup and by the post-device-loss rebuild, which starts
+/// from a brand-new renderer and so must re-apply the font too — unlike `apply_config`, which
+/// only touches the font when it actually changed.
+fn apply_gpu_config(state: &mut WindowState, cfg: &Config, scale: f32) {
+    state.grid.set_palette(cfg.palette());
+    state.grid.set_fade(cfg.text_fade);
+    state.grid.set_phosphor(cfg.phosphor);
+    state.grid.set_smear(cfg.cursor_smear);
+    state.grid.set_focus_dim(cfg.focus_dim);
+    state.grid.set_smooth_scroll(cfg.smooth_scroll);
+    state.grid.set_crt(cfg.crt_scanlines, cfg.crt_glow);
+    state.grid.set_visual_bell(cfg.visual_bell);
+    state.grid.set_copy_flash(cfg.copy_flash);
+    state.grid.set_exit_aura(cfg.exit_aura);
+    state.grid.set_font(
+        cfg.font_family.clone(),
+        cfg.font_size * scale,
+        cfg.font_size * 1.2 * scale,
+    );
+}
+
 impl App {
     fn new(
         proxy: EventLoopProxy<UserEvent>,
@@ -2573,6 +2744,10 @@ impl App {
             notify_sock,
             notify_paths,
             state: None,
+            window: None,
+            instance: None,
+            gpu_retry_at: None,
+            last_rebuild: None,
             terms: HashMap::new(),
             mods: Modifiers::default(),
             egui_ctx: egui::Context::default(),
@@ -4292,6 +4467,95 @@ impl App {
         );
     }
 
+    /// Rebuild the entire GPU stack after the device was lost.
+    ///
+    /// A lost device is not a lost *surface*: the adapter, device, queue, every pipeline, buffer,
+    /// texture and bind group built on it are dead, and so is egui's texture atlas. wgpu's own
+    /// guidance for this case is to recreate the device and all resources, which is what this
+    /// does. The terminals themselves — PTYs, grids, scrollback — are untouched; only the
+    /// rendering of them is rebuilt, so the user sees a blink rather than losing their session.
+    ///
+    /// On Windows this is reached on the ordinary path out of Modern Standby (lid close), and
+    /// also after a TDR or a driver update.
+    fn rebuild_gpu(&mut self) {
+        let (Some(window), Some(instance)) = (self.window.clone(), self.instance.clone()) else {
+            return;
+        };
+        // Drop the dead stack *before* asking for a new one: DXGI refuses a second swapchain on
+        // an HWND that still has one, so the old surface must be gone first. egui's renderer and
+        // winit glue hold device-derived resources too.
+        self.state = None;
+        self.egui_renderer = None;
+        self.egui_state = None;
+
+        // A GPU that dies again the moment it returns would otherwise spin through full rebuilds,
+        // each of which re-rasterises the glyph atlas. One attempt per `GPU_RETRY` at most; with
+        // no `state` the app just doesn't paint until the next attempt, rather than burning CPU.
+        let now = Instant::now();
+        if let Some(prev) = self.last_rebuild
+            && now.duration_since(prev) < GPU_RETRY
+        {
+            self.gpu_retry_at = Some(prev + GPU_RETRY);
+            return;
+        }
+        self.last_rebuild = Some(now);
+
+        let scale = window.scale_factor() as f32;
+        let Some(mut state) =
+            pollster::block_on(WindowState::new(window.clone(), instance, scale))
+        else {
+            // The adapter isn't back yet (the display is still powering up). Keep every terminal
+            // running and try again on a timer — see `about_to_wait`.
+            self.gpu_retry_at = Some(Instant::now() + GPU_RETRY);
+            return;
+        };
+        self.gpu_retry_at = None;
+        self.scale = scale;
+        self.font_families = state.grid.families().to_vec();
+
+        // The window may have been resized while we had no surface (lid close can hand us a
+        // different size, or a different monitor's scale, on the way back).
+        let size = window.inner_size();
+        state.surface_config.width = size.width.max(1);
+        state.surface_config.height = size.height.max(1);
+        state
+            .surface
+            .configure(&state.device, &state.surface_config);
+        apply_gpu_config(&mut state, &self.config, scale);
+        let m = state.grid.metrics();
+        self.cell_w = m.w;
+        self.cell_h = m.h;
+
+        // egui's font atlas lived on the dead device. A fresh `Renderer` starts with no textures,
+        // and the old `Context` would only ever send *incremental* texture deltas — so the atlas
+        // would never be re-uploaded and egui-wgpu would fail on the first missing id. Starting a
+        // new Context makes it allocate the atlas again on the next frame. The cost is egui's own
+        // widget memory (window positions, scroll offsets); potty keeps its UI state in `App`.
+        self.egui_ctx = egui::Context::default();
+        self.egui_state = Some(egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            Some(scale),
+            Some(winit::window::Theme::Dark),
+            Some(state.device.limits().max_texture_dimension_2d as usize),
+        ));
+        self.egui_renderer = Some(egui_wgpu::Renderer::new(
+            &state.device,
+            state.surface_config.format,
+            egui_wgpu::RendererOptions::default(),
+        ));
+        self.state = Some(state);
+
+        // Nothing cached survives a new device: drop the damage-tracking bookkeeping so every
+        // visible pane is re-prepared (and its backbuffer re-created) on the next frame.
+        self.last_rect.clear();
+        self.visible.clear();
+        self.dirty.extend(self.terms.keys().copied());
+        window.request_redraw();
+        log_diag("GPU stack rebuilt after device loss");
+    }
+
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
     /// family/size changed (and then force a refit of every terminal, since the cell box moved).
     fn apply_config(&mut self, new: Config) {
@@ -4436,8 +4700,10 @@ impl App {
     }
 
     fn request_redraw(&self) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
+        // Via the window, not `state`: during a GPU rebuild there is no `state`, but redraw
+        // requests must still land or nothing would repaint once it comes back.
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -4881,7 +5147,13 @@ impl App {
 
     #[allow(deprecated)] // egui_ctx.run → run_ui migration, see build_ui note
     fn redraw(&mut self) {
-        // Nothing to draw once the last terminal is gone (we're exiting).
+        // A device lost since the last frame (standby, TDR, driver update) has invalidated every
+        // GPU object we hold — rebuild before touching any of them.
+        if self.state.as_ref().is_some_and(|s| s.is_lost()) {
+            self.rebuild_gpu();
+        }
+        // Nothing to draw once the last terminal is gone (we're exiting), or while a rebuild is
+        // still waiting for the adapter to come back.
         if self.state.is_none() || self.terms.is_empty() {
             return;
         }
@@ -5202,13 +5474,20 @@ impl App {
         let renderer = self.egui_renderer.as_mut().unwrap();
         if let Some(state) = self.state.as_mut() {
             state.render(renderer, &textures_delta, &prims, ppp, &panes, &rendered);
+            // The device can die part-way through a frame; that frame is lost, but the next one
+            // rebuilds. `set_device_lost_callback` has no window to poke, so ask here.
+            if state.is_lost() {
+                state.window.request_redraw();
+            }
         }
     }
 }
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        // Keyed on the window, not the GPU state: a rebuild after device loss can leave `state`
+        // empty for a moment, and a second `resumed` must not open a second window.
+        if self.window.is_some() {
             return;
         }
 
@@ -5229,8 +5508,21 @@ impl ApplicationHandler<UserEvent> for App {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
         self.scale = scale;
+        self.window = Some(window.clone());
 
-        let mut state = pollster::block_on(WindowState::new(window.clone(), event_loop));
+        // Built here (not in `WindowState`) because it must outlive any one device: a rebuild
+        // after device loss reuses it, and by then the `ActiveEventLoop` is no longer in hand.
+        let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
+            event_loop.owned_display_handle(),
+        )));
+        self.instance = Some(instance.clone());
+
+        let Some(mut state) = pollster::block_on(WindowState::new(window.clone(), instance, scale))
+        else {
+            log_diag("no usable GPU adapter at startup — exiting");
+            event_loop.exit();
+            return;
+        };
         self.font_families = state.grid.families().to_vec();
 
         // Load config (writing a default file on first run), then apply it to the renderer.
@@ -5238,23 +5530,7 @@ impl ApplicationHandler<UserEvent> for App {
             Config::default().save(&self.config_path);
         }
         self.config = Config::load(&self.config_path);
-        state.grid.set_palette(self.config.palette());
-        state.grid.set_fade(self.config.text_fade);
-        state.grid.set_phosphor(self.config.phosphor);
-        state.grid.set_smear(self.config.cursor_smear);
-        state.grid.set_focus_dim(self.config.focus_dim);
-        state.grid.set_smooth_scroll(self.config.smooth_scroll);
-        state
-            .grid
-            .set_crt(self.config.crt_scanlines, self.config.crt_glow);
-        state.grid.set_visual_bell(self.config.visual_bell);
-        state.grid.set_copy_flash(self.config.copy_flash);
-        state.grid.set_exit_aura(self.config.exit_aura);
-        state.grid.set_font(
-            self.config.font_family.clone(),
-            self.config.font_size * scale,
-            self.config.font_size * 1.2 * scale,
-        );
+        apply_gpu_config(&mut state, &self.config, scale);
         let m = state.grid.metrics();
         self.cell_w = m.w;
         self.cell_h = m.h;
@@ -5345,6 +5621,18 @@ impl ApplicationHandler<UserEvent> for App {
     /// blinking. On each toggle we re-prepare just the focused pane and ask for one redraw.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         use winit::event_loop::ControlFlow;
+        // A GPU rebuild that found no adapter retries on a timer. Without this the app would sit
+        // idle with no renderer and nothing to wake it, which looks exactly like a hang.
+        if let Some(at) = self.gpu_retry_at {
+            if Instant::now() >= at {
+                self.gpu_retry_at = None;
+                self.rebuild_gpu();
+            }
+            if let Some(next) = self.gpu_retry_at {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                return;
+            }
+        }
         // During teardown the workspace is empty; `focus()` would index an empty leaf vec and
         // panic — and unwinding back through winit's C frames becomes a segfault.
         if self.state.is_none() || self.terms.is_empty() {
@@ -5857,6 +6145,7 @@ fn new_instance_id() -> String {
 }
 
 fn main() {
+    install_panic_hook();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
     let instance_id = new_instance_id();
