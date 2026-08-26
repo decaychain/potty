@@ -179,7 +179,7 @@ A session outside potty (or on a host without the socket) just no-ops — the ho
 | | |
 |---|---|
 | **Linux** | Wayland-native, developed on **KWin**. Clipboard via `smithay-clipboard` (the app's own seat — no XWayland). Config at `~/.config/potty/potty.toml`. |
-| **Windows** | MSVC build. PTY via **ConPTY**, clipboard via the Win32 API (`arboard`), default shell `cmd.exe` (override with `shell` in the config). Config at `%APPDATA%\potty\potty.toml`. |
+| **Windows** | MSVC build. PTY via **ConPTY**, clipboard via the Win32 API (`arboard`), default shell `cmd.exe` (override with `shell` in the config). Renders on **D3D12** by default (`gpu_backend`); on Snapdragon X the Adreno *Vulkan* driver faults in itself after a standby resume and takes the process with it. Config at `%APPDATA%\potty\potty.toml`, diagnostics log alongside it at `potty.log`. |
 
 > **Windows 10 limitation:** mouse reporting into console apps over SSH (e.g. Midnight Commander)
 > does **not** work. The inbox ConPTY on Windows 10 doesn't pass mouse sequences through to/from

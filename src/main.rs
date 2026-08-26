@@ -2276,16 +2276,25 @@ impl WindowState {
     /// back up (after standby, or after a driver reset) this can fail for a while before it
     /// starts working. The caller retries — see `App::rebuild_gpu`.
     ///
-    /// `instance` must be *freshly created* for each attempt, not carried over from the stack
-    /// that just died. On DX12 the instance owns the DXGI factory, and an adapter enumerated
-    /// from a stale factory hands back the removed `ID3D12Device` for ever — every subsequent
-    /// `request_device` on it fails with "Parent device is lost", no matter how long you wait.
+    /// The instance is built here, per call, and never carried over from the stack that just
+    /// died: it owns the backend's connection to the driver (the DXGI factory on DX12, the
+    /// `VkInstance` on Vulkan), and an adapter enumerated from a stale one hands back the
+    /// removed device for ever — every subsequent `request_device` fails with "Parent device is
+    /// lost", no matter how long you wait.
+    ///
+    /// `backends` restricts which backends are even initialised, so an unwanted driver isn't
+    /// loaded into the process at all. `WGPU_BACKEND` still overrides it (`.with_env()`).
     async fn new(
         window: Arc<Window>,
-        instance: wgpu::Instance,
+        display: winit::event_loop::OwnedDisplayHandle,
+        backends: wgpu::Backends,
         scale: f32,
     ) -> Result<Self, String> {
         let size = window.inner_size();
+
+        let mut desc = InstanceDescriptor::new_with_display_handle(Box::new(display));
+        desc.backends = backends;
+        let instance = Instance::new(desc.with_env());
 
         let adapter = instance
             .request_adapter(&RequestAdapterOptions::default())
@@ -2295,6 +2304,15 @@ impl WindowState {
             .request_device(&DeviceDescriptor::default())
             .await
             .map_err(|e| format!("request_device failed: {e}"))?;
+
+        // Which adapter and backend we actually landed on. Worth a line every time: it is the
+        // first thing you need when a crash report names a graphics driver, and it also records
+        // what a rebuild came back with (which need not be what we started on).
+        let info = adapter.get_info();
+        log_diag(&format!(
+            "GPU: {} [{:?}] backend={:?} driver={} {}",
+            info.name, info.device_type, info.backend, info.driver, info.driver_info
+        ));
 
         // wgpu's default handlers are fatal: an uncaptured error panics the process, which under
         // `windows_subsystem = "windows"` means vanishing with no console and no crash report.
@@ -2708,6 +2726,49 @@ struct App {
     /// Once a note has ever arrived, keep the tab bar visible (it hosts the bell) for the rest of
     /// the session — so the content doesn't jump as notifications come and go.
     chrome_latched: bool,
+}
+
+/// The backend sets to try, in order: the configured preference first, then everything.
+///
+/// The fallback is the point — a preferred backend that can't produce a device on someone
+/// else's machine must not stop potty from starting.
+fn backend_chain(cfg: &Config) -> Vec<wgpu::Backends> {
+    let pref = match cfg.gpu_backend.trim().to_ascii_lowercase().as_str() {
+        "dx12" | "d3d12" => Some(wgpu::Backends::DX12),
+        "vulkan" | "vk" => Some(wgpu::Backends::VULKAN),
+        "gl" | "gles" | "opengl" => Some(wgpu::Backends::GL),
+        "auto" | "" => None,
+        other => {
+            log_diag(&format!("unknown gpu_backend {other:?} — falling back to auto"));
+            None
+        }
+    };
+    match pref {
+        Some(b) => vec![b, wgpu::Backends::all()],
+        None => vec![wgpu::Backends::all()],
+    }
+}
+
+/// Build the GPU stack, trying each backend set in `backend_chain` until one works.
+fn build_gpu(
+    window: Arc<Window>,
+    display: &winit::event_loop::OwnedDisplayHandle,
+    cfg: &Config,
+    scale: f32,
+) -> Result<WindowState, String> {
+    let mut last = "no backend available".to_string();
+    for backends in backend_chain(cfg) {
+        match pollster::block_on(WindowState::new(
+            window.clone(),
+            display.clone(),
+            backends,
+            scale,
+        )) {
+            Ok(state) => return Ok(state),
+            Err(e) => last = format!("{backends:?} — {e}"),
+        }
+    }
+    Err(last)
 }
 
 /// Push every renderer-affecting config value (palette, effects, font) into a freshly built
@@ -4504,14 +4565,10 @@ impl App {
         }
         self.last_rebuild = Some(now);
 
-        // A *new* instance every attempt. Reusing the old one is what turns a recoverable device
-        // loss into a permanent one: on DX12 the instance owns the DXGI factory, that factory is
-        // stale the moment a device is removed, and the adapter it keeps handing back carries the
-        // dead `ID3D12Device` — so `request_device` fails with "Parent device is lost" for ever.
-        let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(display)));
+        // `build_gpu` makes a *new* instance every attempt. Reusing the old one is what turns a
+        // recoverable device loss into a permanent one — see `WindowState::new`.
         let scale = window.scale_factor() as f32;
-        let mut state = match pollster::block_on(WindowState::new(window.clone(), instance, scale))
-        {
+        let mut state = match build_gpu(window.clone(), &display, &self.config, scale) {
             Ok(s) => s,
             Err(e) => {
                 // Not back yet. Keep every terminal running and try again later, backing off so
@@ -5545,14 +5602,19 @@ impl ApplicationHandler<UserEvent> for App {
         self.scale = scale;
         self.window = Some(window.clone());
 
+        // Load config (writing a default file on first run) before touching the GPU — the
+        // backend to use comes from it.
+        if !self.config_path.exists() {
+            Config::default().save(&self.config_path);
+        }
+        self.config = Config::load(&self.config_path);
+
         // The handle (not the instance) is what's kept: a rebuild after device loss needs a
         // brand-new instance, and by then the `ActiveEventLoop` is no longer in hand.
         let display = event_loop.owned_display_handle();
         self.display_handle = Some(display.clone());
-        let instance = Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(display)));
 
-        let mut state = match pollster::block_on(WindowState::new(window.clone(), instance, scale))
-        {
+        let mut state = match build_gpu(window.clone(), &display, &self.config, scale) {
             Ok(s) => s,
             Err(e) => {
                 log_diag(&format!("no usable GPU at startup ({e}) — exiting"));
@@ -5561,12 +5623,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         self.font_families = state.grid.families().to_vec();
-
-        // Load config (writing a default file on first run), then apply it to the renderer.
-        if !self.config_path.exists() {
-            Config::default().save(&self.config_path);
-        }
-        self.config = Config::load(&self.config_path);
         apply_gpu_config(&mut state, &self.config, scale);
         let m = state.grid.metrics();
         self.cell_w = m.w;

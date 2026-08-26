@@ -75,6 +75,16 @@ pub struct Config {
     /// glow ANSI red on failure or a much quieter green on success, at this peak strength
     /// (0.0 disables). Failure glows at full strength, success at a quarter of it.
     pub exit_aura: f32,
+    /// Which wgpu backend to render with: "auto", "dx12", "vulkan", or "gl".
+    ///
+    /// Defaults to "dx12" on Windows and "auto" everywhere else. The default is not a
+    /// performance choice: on Snapdragon X (Adreno X1) the Qualcomm *Vulkan* user-mode driver
+    /// faults inside itself after a Modern Standby resume, taking potty's process with it —
+    /// an access violation in foreign code, so nothing on the Rust side can catch or log it.
+    /// D3D12 is the far better-exercised path on Windows for every vendor. If the chosen
+    /// backend can't produce a device, potty falls back to trying all of them, so a wrong
+    /// value here can't stop it starting. `WGPU_BACKEND` overrides this.
+    pub gpu_backend: String,
     /// Command run on a remote host by "Connect to host…" to start the multiplexer backend. Must
     /// be on the remote's PATH, or an absolute path (until bootstrapping installs it for you).
     pub remote_command: String,
@@ -233,6 +243,7 @@ impl Default for Config {
             visual_bell: 0.03,
             copy_flash: true,
             exit_aura: 0.15,
+            gpu_backend: if cfg!(windows) { "dx12".into() } else { "auto".into() },
             remote_command: "potty-session".into(),
             profiles: Vec::new(),
             hotkeys: BTreeMap::new(),
