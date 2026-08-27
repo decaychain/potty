@@ -37,6 +37,12 @@ smithay-clipboard = "0.7.3"
 # Text only — skip the default image-data feature (and its `image` dependency).
 arboard = { version = "3", default-features = false }
 
+# The renderer catches panics raised inside egui-wgpu when the GPU device dies mid-frame (see
+# `App::redraw`) and rebuilds the GPU stack instead of dying. That recovery needs unwinding —
+# `panic = "abort"` would turn every such driver hiccup back into a lost session.
+[profile.release]
+panic = "unwind"
+
 [target.'cfg(windows)'.build-dependencies]
 # Embeds assets/icon.ico into the .exe (build.rs).
 winresource = "0.1"

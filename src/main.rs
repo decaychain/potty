@@ -2262,6 +2262,9 @@ struct WindowState {
     lost: Arc<AtomicBool>,
 }
 
+/// Whether the `POTTY_TEST_PAINT_PANIC` fault injection has already fired (it is one-shot).
+static PAINT_PANIC_FIRED: AtomicBool = AtomicBool::new(false);
+
 const BG_CLEAR: wgpu::Color = wgpu::Color {
     r: 0.02,
     g: 0.02,
@@ -2390,7 +2393,7 @@ impl WindowState {
     /// Flag the device as lost and ask for the frame that will rebuild it.
     fn mark_lost(&self, why: &str) {
         if !self.lost.swap(true, Ordering::AcqRel) {
-            log_diag(&format!("GPU stack lost: {why} — rebuilding"));
+            log_diag(&format!("GPU stack lost: {why} - rebuilding"));
         }
         self.window.request_redraw();
     }
@@ -2462,6 +2465,21 @@ impl WindowState {
         rendered: &[u64],
     ) {
         let (sw, sh) = (self.surface_config.width, self.surface_config.height);
+        // Painting on a device known to be dead is not merely useless: egui-wgpu answers a lost
+        // device with `panic!` rather than an error (see the call site in `App::redraw`), so the
+        // frame must be abandoned before the first wgpu call.
+        if self.is_lost() {
+            self.window.request_redraw();
+            return;
+        }
+        // Test hook: `POTTY_TEST_PAINT_PANIC=1` panics on the first frame the way egui-wgpu does
+        // on a dead device, so the catch-and-rebuild path can be exercised on demand instead of
+        // waiting for a driver to misbehave. Fires once — the rebuilt renderer must then paint.
+        if std::env::var_os("POTTY_TEST_PAINT_PANIC").is_some()
+            && !PAINT_PANIC_FIRED.swap(true, Ordering::Relaxed)
+        {
+            panic!("simulated paint panic (POTTY_TEST_PAINT_PANIC)");
+        }
         // Texture deltas are stateful: the first font-atlas delta allocates the texture, and later
         // frames usually contain only partial updates. Apply them even when the surface is
         // temporarily unavailable (common while macOS is occluding/configuring a window), or an
@@ -2477,6 +2495,14 @@ impl WindowState {
             }
             return;
         };
+        // `get_current_texture` can hand back a texture from a swapchain whose device died a
+        // moment ago — the loss surfaces through the device-lost callback rather than through
+        // the acquire result. Re-check now that the callback has had its chance to fire.
+        if self.is_lost() {
+            drop(frame);
+            self.window.request_redraw();
+            return;
+        }
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         self.grid.set_surface_size(&self.queue, sw as f32, sh as f32);
 
@@ -2739,7 +2765,7 @@ fn backend_chain(cfg: &Config) -> Vec<wgpu::Backends> {
         "gl" | "gles" | "opengl" => Some(wgpu::Backends::GL),
         "auto" | "" => None,
         other => {
-            log_diag(&format!("unknown gpu_backend {other:?} — falling back to auto"));
+            log_diag(&format!("unknown gpu_backend {other:?} - falling back to auto"));
             None
         }
     };
@@ -5565,10 +5591,31 @@ impl App {
         let panes: Vec<(egui::Rect, u64)> = leaves.iter().map(|(id, r)| (*r, (*id))).collect();
         let renderer = self.egui_renderer.as_mut().unwrap();
         if let Some(state) = self.state.as_mut() {
-            state.render(renderer, &textures_delta, &prims, ppp, &panes, &rendered);
-            // The device can die part-way through a frame; that frame is lost, but the next one
-            // rebuilds. `set_device_lost_callback` has no window to poke, so ask here.
-            if state.is_lost() {
+            // egui-wgpu reports a dead device by panicking, not by erroring: half a dozen sites
+            // in `update_buffers` / `update_texture` unwrap what a lost device turns into `None`
+            // ("Failed to create staging buffer for index data…"). `render` bails out on a loss
+            // it can see beforehand, but the device can equally die *inside* one of those calls,
+            // and then no prior check can help — the panic is the first notice we get.
+            //
+            // Catching it is sound here rather than merely expedient: everything the unwind
+            // could leave inconsistent — the egui renderer, the device, every buffer and texture
+            // on it — is exactly what `rebuild_gpu` throws away and builds again. Nothing that
+            // survives the frame is device-derived, and no terminal lock is held this far into
+            // it (the panes were prepared and unlocked above), so no `Mutex` can be poisoned.
+            let painted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.render(renderer, &textures_delta, &prims, ppp, &panes, &rendered);
+            }));
+            if painted.is_err() {
+                // Already logged by the panic hook. Recovery is the same as for any lost device:
+                // the next frame rebuilds. Should the panic prove to be our own bug rather than a
+                // dying driver it will simply recur, and the backoff in `rebuild_gpu` keeps that
+                // to one attempt per interval — a slow, logged, survivable loop instead of a
+                // process that disappears mid-session.
+                state.mark_lost("panic while painting");
+            } else if state.is_lost() {
+                // The device died part-way through the frame without panicking. That frame is
+                // lost, but the next one rebuilds — and `set_device_lost_callback` has no window
+                // to poke, so ask here.
                 state.window.request_redraw();
             }
         }
@@ -5617,7 +5664,7 @@ impl ApplicationHandler<UserEvent> for App {
         let mut state = match build_gpu(window.clone(), &display, &self.config, scale) {
             Ok(s) => s,
             Err(e) => {
-                log_diag(&format!("no usable GPU at startup ({e}) — exiting"));
+                log_diag(&format!("no usable GPU at startup ({e}) - exiting"));
                 event_loop.exit();
                 return;
             }
@@ -6251,12 +6298,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        csi_tilde, cursor_key, ime_commit_needs_text_fallback, macos_control_click,
+        backend_chain, csi_tilde, cursor_key, ime_commit_needs_text_fallback, macos_control_click,
         macos_pane_context_click, stale_terminal_ids, terminal_mouse_claims_context_click,
         terminal_should_receive_ime_commit, xterm_modifier,
     };
+    use crate::config::Config;
     use std::collections::HashSet;
     use winit::event::MouseButton;
+
+    /// Recovering from a mid-frame device loss depends on unwinding: egui-wgpu panics rather
+    /// than erroring on a dead device, and `App::redraw` catches that to rebuild the GPU stack.
+    /// `panic = "abort"` anywhere in the profile would silently turn every driver hiccup back
+    /// into a lost session, so assert the strategy rather than trusting the default.
+    #[test]
+    fn panics_unwind_so_the_renderer_can_recover() {
+        let caught = std::panic::catch_unwind(|| {
+            std::panic::set_hook(Box::new(|_| {})); // keep the expected panic off the test output
+            panic!("boom");
+        });
+        let _ = std::panic::take_hook();
+        assert!(caught.is_err(), "catch_unwind must catch — is panic=abort set?");
+    }
+
+    #[test]
+    fn backend_preference_always_falls_back_to_every_backend() {
+        let mut cfg = Config::default();
+        for (name, want_first) in [
+            ("dx12", Some(wgpu::Backends::DX12)),
+            ("vulkan", Some(wgpu::Backends::VULKAN)),
+            ("gl", Some(wgpu::Backends::GL)),
+            ("auto", None),
+            ("nonsense", None),
+        ] {
+            cfg.gpu_backend = name.into();
+            let chain = backend_chain(&cfg);
+            // Whatever the preference, trying everything is always the last resort — a backend
+            // that can't produce a device must never stop potty from starting.
+            assert_eq!(chain.last(), Some(&wgpu::Backends::all()), "{name}");
+            match want_first {
+                Some(b) => assert_eq!(chain.first(), Some(&b), "{name}"),
+                None => assert_eq!(chain.len(), 1, "{name} should not add a preference"),
+            }
+        }
+    }
 
     #[test]
     fn modifier_parameter() {
