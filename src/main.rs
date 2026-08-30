@@ -682,13 +682,45 @@ fn cursor_key(final_byte: u8, modifier: u8, app_cursor: bool) -> Vec<u8> {
 }
 
 /// Encode a CSI-tilde editing key (`ESC [ <code> ~`, or `ESC [ <code> ; <mod> ~` when modified) —
-/// Insert/Delete/PageUp/PageDown.
+/// Insert/Delete/PageUp/PageDown, plus F5-F12.
 fn csi_tilde(code: u8, modifier: u8) -> Vec<u8> {
     if modifier > 1 {
         format!("\x1b[{code};{modifier}~").into_bytes()
     } else {
         format!("\x1b[{code}~").into_bytes()
     }
+}
+
+/// F1-F4 share the cursor keys' shape: `ESC O P..S` bare, `ESC [ 1 ; <mod> P..S` once a modifier
+/// is held. (F5-F12 use `csi_tilde` instead.)
+fn fn_key(final_byte: u8, modifier: u8) -> Vec<u8> {
+    cursor_key(final_byte, modifier, true)
+}
+
+/// Whether Alt counts as a modifier for this keypress. Windows reports AltGr as Ctrl+Alt, so on a
+/// German layout the symbols `@ { [ ] } | ~` and the euro sign are indistinguishable from a real
+/// Ctrl+Alt chord by modifier state alone. We resolve that in favour of the layout: with both down
+/// the keypress is AltGr, and Alt is dropped rather than corrupting the character.
+fn alt_modifier(ctrl: bool, alt: bool) -> bool {
+    alt && !(cfg!(target_os = "windows") && ctrl)
+}
+
+/// Whether Alt should additionally be sent as a meta (ESC) prefix on keys that have no modifier
+/// parameter of their own. Not on macOS, where Option is a compose key: `Option-e e` types `e`
+/// with an acute accent, and prefixing that with ESC would make accented input unreachable.
+fn alt_is_meta(alt: bool) -> bool {
+    alt && !cfg!(target_os = "macos")
+}
+
+/// xterm's meta form: a key with no modifier parameter of its own carries Alt as an ESC prefix --
+/// `Alt-x` is `ESC x`, `Alt-Enter` is `ESC CR`. A key already encoded as a CSI/SS3 sequence carries
+/// Alt in that sequence's modifier parameter instead and must not gain a second ESC.
+fn meta_prefixed(mut out: Vec<u8>, meta: bool) -> Vec<u8> {
+    let escape_sequence = out.len() > 1 && out[0] == 0x1b;
+    if meta && !out.is_empty() && !escape_sequence {
+        out.insert(0, 0x1b);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -5130,9 +5162,10 @@ impl App {
         // (`@ { [ ] } \\ | ~ €` on the German layout) out of the Ctrl-shortcut / control-code path.
         let ctrl = self.mods.state().control_key() && !self.mods.state().alt_key();
         let shift = self.mods.state().shift_key();
-        let alt = self.mods.state().alt_key();
-        // xterm modifier for cursor/editing keys, so e.g. Ctrl-Left sends `ESC [ 1 ; 5 D` (word
-        // motion) rather than a bare arrow indistinguishable from an unmodified press.
+        // Same reasoning from the other side: an AltGr press is not an Alt press.
+        let alt = alt_modifier(self.mods.state().control_key(), self.mods.state().alt_key());
+        // xterm modifier for cursor/editing/function keys, so e.g. Ctrl-Left sends `ESC [ 1 ; 5 D`
+        // (word motion) rather than a bare arrow indistinguishable from an unmodified press.
         let modifier = xterm_modifier(shift, alt, ctrl);
 
         // Shift+nav scrolls the focused pane's history viewport (and is not sent to the PTY).
@@ -5196,19 +5229,21 @@ impl App {
             Key::Named(NamedKey::PageUp) => out = csi_tilde(5, modifier),
             Key::Named(NamedKey::PageDown) => out = csi_tilde(6, modifier),
 
-            // Function keys (xterm encoding, matching xterm-256color terminfo).
-            Key::Named(NamedKey::F1) => out.extend_from_slice(b"\x1bOP"),
-            Key::Named(NamedKey::F2) => out.extend_from_slice(b"\x1bOQ"),
-            Key::Named(NamedKey::F3) => out.extend_from_slice(b"\x1bOR"),
-            Key::Named(NamedKey::F4) => out.extend_from_slice(b"\x1bOS"),
-            Key::Named(NamedKey::F5) => out.extend_from_slice(b"\x1b[15~"),
-            Key::Named(NamedKey::F6) => out.extend_from_slice(b"\x1b[17~"),
-            Key::Named(NamedKey::F7) => out.extend_from_slice(b"\x1b[18~"),
-            Key::Named(NamedKey::F8) => out.extend_from_slice(b"\x1b[19~"),
-            Key::Named(NamedKey::F9) => out.extend_from_slice(b"\x1b[20~"),
-            Key::Named(NamedKey::F10) => out.extend_from_slice(b"\x1b[21~"),
-            Key::Named(NamedKey::F11) => out.extend_from_slice(b"\x1b[23~"),
-            Key::Named(NamedKey::F12) => out.extend_from_slice(b"\x1b[24~"),
+            // Function keys (xterm encoding, matching xterm-256color terminfo). The modifier goes
+            // into the sequence just as it does for the cursor keys: without it Alt-F1 is byte-for
+            // -byte a bare F1, which is why Far Manager's Alt-F1 drive menu never opened.
+            Key::Named(NamedKey::F1) => out = fn_key(b'P', modifier),
+            Key::Named(NamedKey::F2) => out = fn_key(b'Q', modifier),
+            Key::Named(NamedKey::F3) => out = fn_key(b'R', modifier),
+            Key::Named(NamedKey::F4) => out = fn_key(b'S', modifier),
+            Key::Named(NamedKey::F5) => out = csi_tilde(15, modifier),
+            Key::Named(NamedKey::F6) => out = csi_tilde(17, modifier),
+            Key::Named(NamedKey::F7) => out = csi_tilde(18, modifier),
+            Key::Named(NamedKey::F8) => out = csi_tilde(19, modifier),
+            Key::Named(NamedKey::F9) => out = csi_tilde(20, modifier),
+            Key::Named(NamedKey::F10) => out = csi_tilde(21, modifier),
+            Key::Named(NamedKey::F11) => out = csi_tilde(23, modifier),
+            Key::Named(NamedKey::F12) => out = csi_tilde(24, modifier),
 
             _ => {
                 if let Some(t) = &ev.text {
@@ -5220,6 +5255,9 @@ impl App {
                 }
             }
         }
+        // Everything the match above left as plain bytes (text, Enter, Tab, Backspace, Escape)
+        // takes Alt as xterm's ESC prefix; the CSI/SS3 arms already carry it and are left alone.
+        let out = meta_prefixed(out, alt_is_meta(alt));
         if !out.is_empty() {
             // Typing clears the focused selection and returns its viewport to the prompt.
             self.clear_selection();
@@ -6304,8 +6342,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_chain, csi_tilde, cursor_key, ime_commit_needs_text_fallback, macos_control_click,
-        macos_pane_context_click, stale_terminal_ids, terminal_mouse_claims_context_click,
+        alt_is_meta, alt_modifier, backend_chain, csi_tilde, cursor_key, fn_key,
+        ime_commit_needs_text_fallback, macos_control_click, macos_pane_context_click,
+        meta_prefixed, stale_terminal_ids, terminal_mouse_claims_context_click,
         terminal_should_receive_ime_commit, xterm_modifier,
     };
     use crate::config::Config;
@@ -6415,6 +6454,50 @@ mod tests {
         assert_eq!(cursor_key(b'C', 5, true), b"\x1b[1;5C"); // app mode ignored when modified
         assert_eq!(cursor_key(b'A', 2, false), b"\x1b[1;2A"); // Shift-Up
         assert_eq!(cursor_key(b'F', 3, false), b"\x1b[1;3F"); // Alt-End
+    }
+
+    #[test]
+    fn function_keys_carry_their_modifier() {
+        // Bare F1 keeps the SS3 form every terminfo expects.
+        assert_eq!(fn_key(b'P', 1), b"\x1bOP");
+        // Alt-F1 (Far Manager's left drive menu) must not be byte-identical to F1.
+        assert_eq!(fn_key(b'P', 3), b"\x1b[1;3P");
+        assert_ne!(fn_key(b'P', 3), fn_key(b'P', 1));
+        assert_eq!(fn_key(b'Q', 3), b"\x1b[1;3Q"); // Alt-F2, the right drive menu
+        assert_eq!(fn_key(b'S', 5), b"\x1b[1;5S"); // Ctrl-F4
+        assert_eq!(csi_tilde(15, 1), b"\x1b[15~"); // F5
+        assert_eq!(csi_tilde(15, 3), b"\x1b[15;3~"); // Alt-F5
+        assert_eq!(csi_tilde(24, 2), b"\x1b[24;2~"); // Shift-F12
+    }
+
+    #[test]
+    fn alt_becomes_a_meta_prefix_only_where_the_key_has_nowhere_else_to_put_it() {
+        // Plain bytes take the ESC prefix.
+        assert_eq!(meta_prefixed(b"x".to_vec(), true), b"\x1bx");
+        assert_eq!(meta_prefixed(b"\r".to_vec(), true), b"\x1b\r");
+        assert_eq!(meta_prefixed(vec![0x7f], true), b"\x1b\x7f");
+        // Escape is one byte, so Alt-Escape doubles it the way xterm does.
+        assert_eq!(meta_prefixed(vec![0x1b], true), b"\x1b\x1b");
+        // Sequences already carrying the modifier in a parameter are left alone.
+        assert_eq!(
+            meta_prefixed(cursor_key(b'D', 3, false), true),
+            b"\x1b[1;3D"
+        );
+        assert_eq!(meta_prefixed(fn_key(b'P', 3), true), b"\x1b[1;3P");
+        // Without Alt, nothing changes; an empty encoding stays empty.
+        assert_eq!(meta_prefixed(b"x".to_vec(), false), b"x");
+        assert!(meta_prefixed(Vec::new(), true).is_empty());
+    }
+
+    #[test]
+    fn altgr_is_not_alt_on_windows() {
+        assert!(alt_modifier(false, true)); // plain Alt
+        assert!(!alt_modifier(false, false));
+        // Ctrl+Alt is how Windows reports AltGr, so the character wins over the chord there.
+        assert_eq!(alt_modifier(true, true), !cfg!(target_os = "windows"));
+        // Option composes on macOS, so it never turns into a meta prefix.
+        assert_eq!(alt_is_meta(true), !cfg!(target_os = "macos"));
+        assert!(!alt_is_meta(false));
     }
 
     #[test]
