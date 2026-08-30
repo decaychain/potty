@@ -243,7 +243,11 @@ impl Default for Config {
             visual_bell: 0.03,
             copy_flash: true,
             exit_aura: 0.15,
-            gpu_backend: if cfg!(windows) { "dx12".into() } else { "auto".into() },
+            gpu_backend: if cfg!(windows) {
+                "dx12".into()
+            } else {
+                "auto".into()
+            },
             remote_command: "potty-session".into(),
             profiles: Vec::new(),
             hotkeys: BTreeMap::new(),

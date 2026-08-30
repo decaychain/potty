@@ -207,7 +207,10 @@ impl SgrState {
                 | Flags::STRIKEOUT
                 | Flags::ALL_UNDERLINES);
         let underline = cell.underline_color();
-        if self.fg == cell.fg && self.bg == cell.bg && self.flags == style && self.underline == underline
+        if self.fg == cell.fg
+            && self.bg == cell.bg
+            && self.flags == style
+            && self.underline == underline
         {
             return;
         }
@@ -331,7 +334,11 @@ mod tests {
     /// The two grids render identically: same history depth, and every cell either matches or
     /// both are visually blank (a trimmed trailing cell only keeps its bg/decoration guarantee).
     fn assert_same_screen(a: &Term<VoidListener>, b: &Term<VoidListener>) {
-        assert_eq!(a.grid().history_size(), b.grid().history_size(), "history depth");
+        assert_eq!(
+            a.grid().history_size(),
+            b.grid().history_size(),
+            "history depth"
+        );
         assert_eq!(a.grid().cursor.point, b.grid().cursor.point, "cursor");
         let top = a.grid().topmost_line().0;
         for l in top..ROWS as i32 {
@@ -356,7 +363,11 @@ mod tests {
                     | Flags::WIDE_CHAR
                     | Flags::WIDE_CHAR_SPACER
                     | Flags::LEADING_WIDE_CHAR_SPACER;
-                assert_eq!(ca.flags & mask, cb.flags & mask, "flags at line {l} col {c}");
+                assert_eq!(
+                    ca.flags & mask,
+                    cb.flags & mask,
+                    "flags at line {l} col {c}"
+                );
             }
         }
     }

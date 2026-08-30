@@ -136,7 +136,10 @@ mod tests {
     #[test]
     fn reports_exit_code_after_exec() {
         let mut s = Scanner::default();
-        assert_eq!(s.scan(b"\x1b]133;C\x07make: error\r\n\x1b]133;D;2\x07"), [2]);
+        assert_eq!(
+            s.scan(b"\x1b]133;C\x07make: error\r\n\x1b]133;D;2\x07"),
+            [2]
+        );
     }
 
     #[test]
@@ -192,7 +195,10 @@ mod tests {
     #[test]
     fn other_oscs_are_ignored() {
         let mut s = Scanner::default();
-        assert_eq!(s.scan(b"\x1b]2;title\x07\x1b]133;C\x07\x1b]133;D;7\x07"), [7]);
+        assert_eq!(
+            s.scan(b"\x1b]2;title\x07\x1b]133;C\x07\x1b]133;D;7\x07"),
+            [7]
+        );
     }
 
     #[test]

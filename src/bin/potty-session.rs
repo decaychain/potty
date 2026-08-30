@@ -123,7 +123,8 @@ mod imp {
         }
 
         fn resize(&mut self, cols: u16, rows: u16) {
-            self.term.resize(TermSize::new(cols as usize, rows as usize));
+            self.term
+                .resize(TermSize::new(cols as usize, rows as usize));
         }
 
         fn snapshot(&mut self) -> Vec<u8> {

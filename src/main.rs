@@ -2342,7 +2342,10 @@ impl WindowState {
                 // with it), so an internal/OOM error is treated as a lost device. Validation
                 // errors that are *our* bug are logged and survived rather than escalated —
                 // rebuilding on those would just spin.
-                if matches!(e, wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }) {
+                if matches!(
+                    e,
+                    wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }
+                ) {
                     flag.store(true, Ordering::Release);
                 } else {
                     // A validation error *is* our bug. Keep it loud while developing; in a
@@ -2504,7 +2507,8 @@ impl WindowState {
             return;
         }
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
-        self.grid.set_surface_size(&self.queue, sw as f32, sh as f32);
+        self.grid
+            .set_surface_size(&self.queue, sw as f32, sh as f32);
 
         // Pass 1: re-render the backbuffer of every pane whose content was rebuilt this frame
         // (the rest keep their previous backbuffer — a scroll glide re-composites without
@@ -2765,7 +2769,9 @@ fn backend_chain(cfg: &Config) -> Vec<wgpu::Backends> {
         "gl" | "gles" | "opengl" => Some(wgpu::Backends::GL),
         "auto" | "" => None,
         other => {
-            log_diag(&format!("unknown gpu_backend {other:?} - falling back to auto"));
+            log_diag(&format!(
+                "unknown gpu_backend {other:?} - falling back to auto"
+            ));
             None
         }
     };
@@ -6317,7 +6323,10 @@ mod tests {
             panic!("boom");
         });
         let _ = std::panic::take_hook();
-        assert!(caught.is_err(), "catch_unwind must catch — is panic=abort set?");
+        assert!(
+            caught.is_err(),
+            "catch_unwind must catch — is panic=abort set?"
+        );
     }
 
     #[test]

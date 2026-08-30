@@ -1037,10 +1037,7 @@ impl GridRenderer {
     ) -> bool {
         let (cw, ch, asc) = (self.metrics.w, self.metrics.h, self.metrics.ascent);
         let margin_px = (MARGIN_ROWS as f32 * ch).round();
-        let tex_size = (
-            view_px.0.max(1),
-            view_px.1.max(1) + 2 * margin_px as u32,
-        );
+        let tex_size = (view_px.0.max(1), view_px.1.max(1) + 2 * margin_px as u32);
         // Ensure the pane's buffers and a correctly-sized backbuffer exist up front.
         {
             let Self {
@@ -1441,7 +1438,11 @@ impl GridRenderer {
                     }
                 }
                 if let Some(ghost) = rec.ghost {
-                    let decay = if phosphor_on { PHOSPHOR_DECAY } else { FADE_OUT };
+                    let decay = if phosphor_on {
+                        PHOSPHOR_DECAY
+                    } else {
+                        FADE_OUT
+                    };
                     let t = (now - ghost.since).as_secs_f32() / decay.as_secs_f32();
                     if t >= 1.0 {
                         rec.ghost = None;
@@ -1548,7 +1549,10 @@ impl GridRenderer {
                 };
                 for i in 0..SMEAR_COPIES {
                     let f = (i as f32 + 1.0) / SMEAR_COPIES as f32;
-                    let p = (tail.0 + (s.to.0 - tail.0) * f, tail.1 + (s.to.1 - tail.1) * f);
+                    let p = (
+                        tail.0 + (s.to.0 - tail.0) * f,
+                        tail.1 + (s.to.1 - tail.1) * f,
+                    );
                     bg.push(BgInstance {
                         pos: [p.0 + dx, p.1 + dy],
                         size: [w, h],
@@ -1705,8 +1709,8 @@ impl GridRenderer {
             // beyond them the backbuffer holds off-viewport rows or unwritten texels), accent,
             // aura.
             verts[i * 24..(i + 1) * 24].copy_from_slice(&[
-                px, py, u, v, br, bg, bb, dim, fx[0], fx[1], fx[2], fx[3], u0, v0, u1, v1, ar,
-                ag, ab, 0.0, aura[0], aura[1], aura[2], aura[3],
+                px, py, u, v, br, bg, bb, dim, fx[0], fx[1], fx[2], fx[3], u0, v0, u1, v1, ar, ag,
+                ab, 0.0, aura[0], aura[1], aura[2], aura[3],
             ]);
         }
         queue.write_buffer(&pb.comp_buf, 0, bytemuck::cast_slice(&verts));

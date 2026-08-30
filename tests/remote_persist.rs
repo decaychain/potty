@@ -422,8 +422,7 @@ fn reattach_snapshot_drops_finished_alt_screen_junk() {
     });
     let leaked = {
         let g = c2.collected.lock().unwrap();
-        g.0.get(&1)
-            .is_some_and(|o| contains(o, b"ALTJUNKPAYLOAD"))
+        g.0.get(&1).is_some_and(|o| contains(o, b"ALTJUNKPAYLOAD"))
     };
     c2.disconnect();
     cleanup(daemon, &sock);
