@@ -28,6 +28,20 @@ sudo dnf copr enable decaychain/potty
 sudo dnf install potty
 ```
 
+**Ubuntu 24.04 LTS** (x86_64) — enable the GitHub Pages APT repository:
+
+```sh
+curl -fsSL https://decaychain.github.io/potty/pubkey.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/potty.gpg
+echo "deb [signed-by=/usr/share/keyrings/potty.gpg] https://decaychain.github.io/potty stable main" \
+  | sudo tee /etc/apt/sources.list.d/potty.list
+sudo apt update
+sudo apt install potty
+```
+
+The `.deb` files are also attached to the
+[latest release](https://github.com/decaychain/potty/releases/latest) for manual installs.
+
 **Windows** — grab the installer for your architecture from the
 [latest release](https://github.com/decaychain/potty/releases/latest):
 `potty-<version>-x64-setup.exe` or `potty-<version>-arm64-setup.exe` (a per-user install, no admin

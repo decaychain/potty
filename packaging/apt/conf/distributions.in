@@ -1,0 +1,8 @@
+Origin: Potty
+Label: Potty
+Suite: stable
+Codename: stable
+Architectures: amd64
+Components: main
+Description: Potty terminal emulator APT repository
+SignWith: @@KEY_FINGERPRINT@@

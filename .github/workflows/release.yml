@@ -135,6 +135,157 @@ jobs:
           SRPM=$(ls "$HOME/rpmbuild/SRPMS"/*.src.rpm | head -1)
           copr-cli build --nowait decaychain/potty "$SRPM"
 
+  # Ubuntu 24.04 LTS x86_64 binary packages, attached to the GitHub Release.
+  # The follow-up publish-apt job mirrors these same .deb files into the
+  # GitHub Pages APT repository.
+  ubuntu-deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute packaging version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DEB_VERSION="${VERSION//-/~}"
+          DEB_ARCH="$(dpkg --print-architecture)"
+          if [[ "$DEB_ARCH" != "amd64" ]]; then
+            echo "Expected amd64 runner, got $DEB_ARCH" >&2
+            exit 1
+          fi
+          {
+            echo "VERSION=$VERSION"
+            echo "DEB_VERSION=$DEB_VERSION"
+            echo "DEB_ARCH=$DEB_ARCH"
+          } >> "$GITHUB_ENV"
+          echo "Version=$VERSION  DebianVersion=$DEB_VERSION  Arch=$DEB_ARCH"
+
+      - name: Sync Cargo.toml version
+        run: |
+          sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
+          grep '^version' Cargo.toml | head -1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential dpkg-dev lld
+
+      - name: Build release binaries
+        env:
+          RUSTFLAGS: "-Clink-arg=-fuse-ld=lld"
+        run: cargo build --release --locked --bin potty --bin potty-session --bin potty-notify
+
+      - name: Smoke-test helper binary
+        run: target/release/potty-notify --help
+
+      - name: Build Debian packages
+        run: bash packaging/debian/build.sh
+
+      - name: Upload Ubuntu artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: potty-ubuntu-24.04-amd64
+          path: dist/debian/*.deb
+
+      - name: Upload Ubuntu artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/debian/*.deb
+
+  # Mirror the Ubuntu `.deb` artifacts into a signed APT repository hosted on
+  # GitHub Pages at https://decaychain.github.io/potty/. This borrows the
+  # Uncloud release pattern: same `gh-pages` branch layout, same secret name
+  # (`APT_GPG_PRIVATE_KEY`), and a reprepro-managed repository.
+  publish-apt:
+    runs-on: ubuntu-24.04
+    needs: ubuntu-deb
+    # Keep the .deb release artifacts as the escape hatch if Pages/GPG publishing
+    # is not configured yet or trips independently of the release build.
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install reprepro + gpg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y reprepro gnupg
+
+      - name: Wait for release assets, then download .deb files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/debs
+          # `ubuntu-deb` uploads via softprops/action-gh-release which is
+          # asynchronous; poll briefly until both binary packages are listed.
+          for attempt in $(seq 1 30); do
+            count=$(gh release view "$GITHUB_REF_NAME" \
+              --json assets --jq '[.assets[] | select(.name | endswith(".deb"))] | length')
+            if [ "$count" -ge 2 ]; then break; fi
+            echo "Waiting for .deb assets (attempt $attempt, currently $count)..."
+            sleep 10
+          done
+          gh release download "$GITHUB_REF_NAME" --pattern '*.deb' --dir /tmp/debs
+          ls -la /tmp/debs
+
+      - name: Import GPG signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APT_GPG_PRIVATE_KEY" ]; then
+            echo "APT_GPG_PRIVATE_KEY is not configured" >&2
+            exit 1
+          fi
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY_FPR=$(gpg --list-secret-keys --with-colons \
+            | awk -F: '/^fpr:/ { print $10; exit }')
+          if [ -z "$KEY_FPR" ]; then
+            echo "Failed to extract GPG fingerprint" >&2
+            exit 1
+          fi
+          echo "KEY_FPR=$KEY_FPR" >> "$GITHUB_ENV"
+          gpg --batch --yes --armor --export "$KEY_FPR" > /tmp/pubkey.gpg
+
+      - name: Check out / create gh-pages worktree
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch origin gh-pages
+            git worktree add /tmp/aptroot gh-pages
+          else
+            git worktree add --detach /tmp/aptroot
+            git -C /tmp/aptroot checkout --orphan gh-pages
+            git -C /tmp/aptroot rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p /tmp/aptroot/conf
+          sed "s/@@KEY_FINGERPRINT@@/${KEY_FPR}/" \
+            "${GITHUB_WORKSPACE}/packaging/apt/conf/distributions.in" \
+            > /tmp/aptroot/conf/distributions
+          cp /tmp/pubkey.gpg /tmp/aptroot/pubkey.gpg
+
+      - name: Add .deb files to repository
+        run: |
+          for deb in /tmp/debs/*.deb; do
+            reprepro -b /tmp/aptroot includedeb stable "$deb"
+          done
+          ls -la /tmp/aptroot/
+
+      - name: Commit + push gh-pages
+        working-directory: /tmp/aptroot
+        run: |
+          touch .nojekyll
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+            exit 0
+          fi
+          git commit -m "Publish ${GITHUB_REF_NAME} to APT repository"
+          git push origin gh-pages
+
   # macOS app bundle + installer, attached to the same tag-driven GitHub Release as Windows.
   macos:
     runs-on: macos-latest
