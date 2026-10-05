@@ -159,11 +159,6 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "Version=$VERSION  DebianVersion=$DEB_VERSION  Arch=$DEB_ARCH"
 
-      - name: Sync Cargo.toml version
-        run: |
-          sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
-          grep '^version' Cargo.toml | head -1
-
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install prerequisites
