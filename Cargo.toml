@@ -28,12 +28,12 @@ winit = "0.30"
 russh = "0.61.2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 
-# Clipboard is platform-specific. On Linux/Wayland we use smithay-clipboard (our own seat, no
-# XWayland); on Windows the Win32 clipboard via arboard. See src/clip.rs.
+# Clipboard is platform-specific: smithay-clipboard for native Wayland, arboard for X11,
+# Windows, and macOS. See src/clip.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay-clipboard = "0.7.3"
 
-[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "linux", windows, target_os = "macos"))'.dependencies]
 # Text only — skip the default image-data feature (and its `image` dependency).
 arboard = { version = "3", default-features = false }
 
