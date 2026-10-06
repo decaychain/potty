@@ -1,0 +1,6 @@
+Archive: stable
+Component: main
+Origin: Potty
+Label: Potty
+Architecture: amd64
+Description: Potty terminal emulator APT repository

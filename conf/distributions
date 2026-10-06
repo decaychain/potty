@@ -1,0 +1,8 @@
+Origin: Potty
+Label: Potty
+Suite: stable
+Codename: stable
+Architectures: amd64
+Components: main
+Description: Potty terminal emulator APT repository
+SignWith: A9970A26E22087874D6ED0566DC3DEA5276E1398

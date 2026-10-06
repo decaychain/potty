@@ -1,0 +1,20 @@
+Origin: Potty
+Label: Potty
+Suite: stable
+Codename: stable
+Date: Tue, 06 Oct 2026 00:09:27 UTC
+Architectures: amd64
+Components: main
+Description: Potty terminal emulator APT repository
+MD5Sum:
+ a0be7bfc956055f12d58318609f2188e 1573 main/binary-amd64/Packages
+ 75f4f9affc9f649f2801a85ca133abd9 818 main/binary-amd64/Packages.gz
+ ca629b36f0cfc9812a257f10df88dd84 131 main/binary-amd64/Release
+SHA1:
+ 8bd31b8dfe0d8f01ab7b36a3f46fc9fb687197aa 1573 main/binary-amd64/Packages
+ 6d9f17051ecfee3aed4b9e742d64aa8a0be1ff7a 818 main/binary-amd64/Packages.gz
+ 7eaab59f65f118d6f362a1ec4e6ceab046bf44c7 131 main/binary-amd64/Release
+SHA256:
+ 23e49fb81b31ba261c0ed2b9d39c2607deda6fd9f6acc275f0c1c6aeeed7c25d 1573 main/binary-amd64/Packages
+ 6fcfb1c65157e65b7453540816daf084e4f112f61216605edbb90b6eb88f753a 818 main/binary-amd64/Packages.gz
+ 935c8785bcb9d9c449ea581f90585f0a205110907f211a2427352820d78e2eb2 131 main/binary-amd64/Release
