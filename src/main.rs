@@ -67,6 +67,19 @@ const TOPBAR: f32 = 34.0;
 /// Cursor blink half-period (time the cursor stays solid, then hidden). ~1.2 Hz, the classic feel.
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
+fn egui_repaint_deadline(output: &egui::FullOutput, now: Instant) -> Option<Instant> {
+    let delay = output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)?
+        .repaint_delay;
+    // egui uses Duration::MAX to mean no repaint is needed.
+    if delay == Duration::MAX {
+        None
+    } else {
+        now.checked_add(delay)
+    }
+}
+
 /// 64×64 RGBA window icon, embedded raw (no PNG decoder needed). Used by winit's
 /// `set_window_icon` — drives the title bar / taskbar / alt-tab on Windows (a no-op on Wayland,
 /// where the icon comes from the `.desktop` file matched by `app_id`).
@@ -2684,6 +2697,8 @@ struct App {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    /// Repaint requested by the last UI frame (animations, tooltips, progress indicators).
+    egui_repaint_at: Option<Instant>,
     workspace: Workspace,
     /// Size newly spawned panes start at (the most recent fit); they're refitted next redraw.
     last_dims: Dims,
@@ -2881,6 +2896,7 @@ impl App {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             egui_renderer: None,
+            egui_repaint_at: None,
             workspace: Workspace::new(),
             last_dims: Dims { cols: 80, rows: 24 },
             cell_w: 9.0,
@@ -5309,6 +5325,7 @@ impl App {
 
     #[allow(deprecated)] // egui_ctx.run → run_ui migration, see build_ui note
     fn redraw(&mut self) {
+        self.egui_repaint_at = None;
         // A device lost since the last frame (standby, TDR, driver update) has invalidated every
         // GPU object we hold — rebuild before touching any of them.
         if self.state.as_ref().is_some_and(|s| s.is_lost()) {
@@ -5410,6 +5427,7 @@ impl App {
         let connect_host = &mut self.connect_host;
         let connect_name = &mut self.connect_name;
         let connect_use_session = &mut self.connect_use_session;
+        let ui_started = Instant::now();
         let full = {
             let ws = &self.workspace;
             let families = &self.font_families;
@@ -5451,6 +5469,7 @@ impl App {
                 )
             })
         };
+        self.egui_repaint_at = egui_repaint_deadline(&full, ui_started);
         self.show_settings = show_settings;
         self.settings_page = settings_page;
         if !self.show_settings {
@@ -5800,9 +5819,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    /// Drive the cursor blink. We otherwise wait idle (everything else is redraw-on-demand), so
-    /// the timer — and the CPU it costs — exists only while the focused cursor is actually
-    /// blinking. On each toggle we re-prepare just the focused pane and ask for one redraw.
+    /// Sleep until UI repaint deadlines or cursor blinks; terminal animations keep frames coming
+    /// only while in flight. With none of these active, wait for input or terminal output.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         use winit::event_loop::ControlFlow;
         // A GPU rebuild that found no adapter retries on a timer. Without this the app would sit
@@ -5823,7 +5841,13 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let now = Instant::now();
-        let mut deadline: Option<Instant> = None;
+        if self.egui_repaint_at.is_some_and(|at| now >= at) {
+            // Consume the deadline before requesting a frame, so it cannot cause a busy wait
+            // while the platform is still delivering that redraw.
+            self.egui_repaint_at = None;
+            self.request_redraw();
+        }
+        let mut deadline = self.egui_repaint_at;
         if self.focused_cursor_blinks() {
             let next = *self.blink_next.get_or_insert(now + BLINK_INTERVAL);
             if now >= next {
@@ -5833,7 +5857,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.dirty.insert(focus);
                 self.request_redraw();
             }
-            deadline = Some(self.blink_next.unwrap_or(now + BLINK_INTERVAL));
+            let blink_next = self.blink_next.unwrap_or(now + BLINK_INTERVAL);
+            deadline = Some(deadline.map_or(blink_next, |d| d.min(blink_next)));
         } else {
             // Not blinking: make sure the cursor is shown.
             if !self.blink_on {
@@ -6027,7 +6052,9 @@ impl ApplicationHandler<UserEvent> for App {
             } else if !withhold_from_egui {
                 let resp = es.on_window_event(&window, &event);
                 egui_consumed = resp.consumed;
-                if resp.repaint {
+                // This event is already being painted below. Scheduling it again creates an
+                // endless redraw loop; UI follow-up frames come from viewport repaint_delay.
+                if resp.repaint && !matches!(event, WindowEvent::RedrawRequested) {
                     window.request_redraw();
                 }
             }
@@ -6342,14 +6369,209 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        alt_is_meta, alt_modifier, backend_chain, csi_tilde, cursor_key, fn_key,
-        ime_commit_needs_text_fallback, macos_control_click, macos_pane_context_click,
+        alt_is_meta, alt_modifier, backend_chain, csi_tilde, cursor_key, egui_repaint_deadline,
+        fn_key, ime_commit_needs_text_fallback, macos_control_click, macos_pane_context_click,
         meta_prefixed, stale_terminal_ids, terminal_mouse_claims_context_click,
         terminal_should_receive_ime_commit, xterm_modifier,
     };
     use crate::config::Config;
     use std::collections::HashSet;
     use winit::event::MouseButton;
+
+    #[test]
+    #[allow(deprecated)]
+    fn idle_egui_frames_stop_requesting_repaints() {
+        let ctx = egui::Context::default();
+        let now = std::time::Instant::now();
+        for _ in 0..10 {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("Idle terminal");
+                });
+            });
+            if egui_repaint_deadline(&output, now).is_none() {
+                return;
+            }
+        }
+        panic!("idle UI never stopped requesting repaints");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn egui_repaint_deadlines_handle_immediate_delayed_and_idle_frames() {
+        use std::time::{Duration, Instant};
+
+        let ctx = egui::Context::default();
+        let mut output = ctx.run(egui::RawInput::default(), |_| {});
+        let now = Instant::now();
+        let viewport = output
+            .viewport_output
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap();
+        viewport.repaint_delay = Duration::ZERO;
+        assert_eq!(egui_repaint_deadline(&output, now), Some(now));
+
+        output
+            .viewport_output
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .repaint_delay = Duration::from_millis(100);
+        assert_eq!(
+            egui_repaint_deadline(&output, now),
+            Some(now + Duration::from_millis(100))
+        );
+        output
+            .viewport_output
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .repaint_delay = Duration::MAX;
+        assert_eq!(egui_repaint_deadline(&output, now), None);
+        output.viewport_output.clear();
+        assert_eq!(egui_repaint_deadline(&output, now), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated X11 server and GPU/software renderer"]
+    fn x11_redraws_settle_with_terminal_and_settings_idle() {
+        redraws_settle_with_terminal_and_settings_idle(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated Wayland compositor and GPU/software renderer"]
+    fn wayland_redraws_settle_with_terminal_and_settings_idle() {
+        redraws_settle_with_terminal_and_settings_idle(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn redraws_settle_with_terminal_and_settings_idle(x11: bool) {
+        use super::{App, UserEvent};
+        use std::time::{Duration, Instant};
+        use winit::application::ApplicationHandler;
+        use winit::event::WindowEvent;
+        use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+        use winit::platform::wayland::EventLoopBuilderExtWayland;
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        use winit::window::WindowId;
+
+        struct IdleTest {
+            app: App,
+            frames: usize,
+            settled_frames: usize,
+            phase: usize,
+            check_at: Instant,
+        }
+
+        impl ApplicationHandler<UserEvent> for IdleTest {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.resumed(event_loop);
+                assert!(self.app.state.is_some(), "renderer must initialize");
+                self.check_at = Instant::now() + Duration::from_secs(3);
+            }
+
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                id: WindowId,
+                event: WindowEvent,
+            ) {
+                if matches!(event, WindowEvent::RedrawRequested) {
+                    self.frames += 1;
+                }
+                self.app.window_event(event_loop, id, event);
+            }
+
+            fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+                self.app.user_event(event_loop, event);
+            }
+
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.about_to_wait(event_loop);
+                if Instant::now() >= self.check_at {
+                    if self.phase % 2 == 0 {
+                        assert!(self.frames > 0, "test must actually render");
+                        if self.phase == 4 {
+                            assert!(
+                                self.frames > self.settled_frames,
+                                "delayed repaint never fired"
+                            );
+                        }
+                        self.settled_frames = self.frames;
+                    } else {
+                        assert_eq!(
+                            self.frames, self.settled_frames,
+                            "idle frames keep redrawing"
+                        );
+                        assert!(self.app.egui_repaint_at.is_none());
+                        assert!(self.app.animating.is_empty());
+                        assert_eq!(event_loop.control_flow(), ControlFlow::Wait);
+                        if self.phase == 5 {
+                            event_loop.exit();
+                            return;
+                        }
+                        if self.phase == 1 {
+                            self.app.show_settings = true;
+                            self.app.request_redraw();
+                        } else {
+                            self.app.egui_repaint_at =
+                                Some(Instant::now() + Duration::from_millis(100));
+                        }
+                    }
+                    self.phase += 1;
+                    self.check_at = Instant::now() + Duration::from_secs(1);
+                    self.app.about_to_wait(event_loop);
+                }
+                let next = match event_loop.control_flow() {
+                    ControlFlow::WaitUntil(at) => at.min(self.check_at),
+                    _ => self.check_at,
+                };
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+
+            fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+                self.app.exiting(event_loop);
+            }
+        }
+
+        let mut builder = EventLoop::<UserEvent>::with_user_event();
+        EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+        if x11 {
+            builder.with_x11();
+        } else {
+            builder.with_wayland();
+        }
+        let event_loop = builder.build().unwrap();
+        let id = super::new_instance_id();
+        let dir = std::env::temp_dir().join(format!("potty-idle-test-{id}"));
+        std::fs::create_dir(&dir).unwrap();
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            id,
+            dir.join("notify.sock"),
+            Vec::new(),
+        );
+        app.config_path = dir.join("potty.toml");
+        let cfg = Config {
+            shell: Some("/bin/sh".into()),
+            ..Config::default()
+        };
+        cfg.save(&app.config_path);
+        let mut test = IdleTest {
+            app,
+            frames: 0,
+            settled_frames: 0,
+            phase: 0,
+            check_at: Instant::now(),
+        };
+        event_loop.run_app(&mut test).unwrap();
+        assert_eq!(
+            test.phase, 5,
+            "test must finish all idle and delayed repaint checks"
+        );
+        drop(test);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Recovering from a mid-frame device loss depends on unwinding: egui-wgpu panics rather
     /// than erroring on a dead device, and `App::redraw` catches that to rebuild the GPU stack.
