@@ -2,19 +2,19 @@ Origin: Potty
 Label: Potty
 Suite: stable
 Codename: stable
-Date: Tue, 06 Oct 2026 20:23:40 UTC
+Date: Sun, 11 Oct 2026 14:17:59 UTC
 Architectures: amd64
 Components: main
 Description: Potty terminal emulator APT repository
 MD5Sum:
- f921108e1c79c577dc0ad28387287509 1578 main/binary-amd64/Packages
- abf5561fcdc303c1425b61bf8cd528f3 821 main/binary-amd64/Packages.gz
+ 51931acad119881012de082fbaf6783f 1578 main/binary-amd64/Packages
+ 6924bbead00c4ca81fff10786be73302 822 main/binary-amd64/Packages.gz
  ca629b36f0cfc9812a257f10df88dd84 131 main/binary-amd64/Release
 SHA1:
- 51802ad4d0f53a9698019ada21ea48029fb4103d 1578 main/binary-amd64/Packages
- 3028a75be30e4afff1ede678ad4c38f9b660fed4 821 main/binary-amd64/Packages.gz
+ 4c98e2ee8e531eed8da29a104581ec5ae1976bf4 1578 main/binary-amd64/Packages
+ 32cebae9593e843b66699e773bfaf310c7d59855 822 main/binary-amd64/Packages.gz
  7eaab59f65f118d6f362a1ec4e6ceab046bf44c7 131 main/binary-amd64/Release
 SHA256:
- 33a15999dee5444daf5720eff67e8387d18d8b18285cd7f1e2eca221b57d8d46 1578 main/binary-amd64/Packages
- 1e4e8f6d4118fe52a59582f1b3d9ec1b91fab92f91ddb4af663a773882e45789 821 main/binary-amd64/Packages.gz
+ 100c15c4ff0d1d05c672ddc854ec26d4fd9c9fdcf4abe3eb336ee5f700341517 1578 main/binary-amd64/Packages
+ 47c9ec47a954583a027443a895a8b0d3146b6d4637daa57a3ee1af3acd90fb49 822 main/binary-amd64/Packages.gz
  935c8785bcb9d9c449ea581f90585f0a205110907f211a2427352820d78e2eb2 131 main/binary-amd64/Release
