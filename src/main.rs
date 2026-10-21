@@ -17,6 +17,7 @@
 mod clip;
 mod config;
 mod gridr;
+mod overview;
 mod workspace;
 
 use std::collections::HashMap;
@@ -508,6 +509,7 @@ enum Action {
     /// Replace the whole color scheme (a Settings preset, or the defaults).
     SetColors(config::Colors),
     ShowSettings,
+    ToggleOverview,
     CaptureShortcut(MenuAction),
     ResetShortcut(MenuAction),
     /// Activate an attention-feed entry: focus its pane/window if possible, otherwise clear it.
@@ -642,6 +644,7 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::SetFontSize(_)
         | Action::SetColors(_)
         | Action::ShowSettings
+        | Action::ToggleOverview
         | Action::CaptureShortcut(_)
         | Action::ResetShortcut(_)
         | Action::ActivateNote(..)
@@ -1492,6 +1495,7 @@ fn full_menu(
     cfg: &Config,
     for_pane: Option<PaneId>,
     can_detach: bool,
+    overview_enabled: bool,
 ) {
     ui.set_min_width(228.0);
     ui.style_mut().interaction.selectable_labels = false;
@@ -1543,6 +1547,10 @@ fn full_menu(
     }
     ui.separator();
     section_label(ui, "View");
+    if overview_enabled && menu_item(ui, "[]", "Sessions", None).clicked() {
+        actions.push(Action::ToggleOverview);
+        ui.close_menu();
+    }
     let settings = shortcut_hint(&binding_from_config(cfg, MenuAction::Settings));
     if menu_item(ui, "Aa", "Settings...", Some(&settings)).clicked() {
         actions.push(Action::ShowSettings);
@@ -1790,6 +1798,7 @@ fn settings_window(
 #[allow(deprecated, clippy::too_many_arguments)]
 fn build_ui(
     ctx: &egui::Context,
+    overview: &mut overview::Overview,
     cfg: &Config,
     ws: &Workspace,
     families: &[String],
@@ -1824,7 +1833,7 @@ fn build_ui(
     // The tab bar earns its space with more than one tab, or once the attention feed has latched
     // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
     // (shift-right-click when an app has grabbed the mouse).
-    let show_chrome = ws.tabs.len() > 1 || chrome_latched;
+    let show_chrome = ws.tabs.len() > 1 || chrome_latched || overview.enabled;
     if show_chrome {
         egui::TopBottomPanel::top("tabbar")
             .frame(tabbar_frame())
@@ -1857,8 +1866,13 @@ fn build_ui(
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let focus_detachable = detachable_panes.contains(&ws.active_tab().focus);
                         ui.menu_button("☰", |ui| {
-                            full_menu(ui, actions, cfg, None, focus_detachable)
+                            full_menu(ui, actions, cfg, None, focus_detachable, overview.enabled)
                         });
+                        if overview.enabled
+                            && icon_button(ui, "[]", "Toggle session overview").clicked()
+                        {
+                            actions.push(Action::ToggleOverview);
+                        }
                         // Attention-feed bell — present once the feed has latched the bar on. Shows
                         // the waiting count; toggles the overlay.
                         if chrome_latched {
@@ -1909,83 +1923,93 @@ fn build_ui(
         );
     }
 
-    egui::CentralPanel::default()
-        .frame(egui::Frame::NONE)
-        .show(ctx, |ui| {
-            let area = ui.max_rect();
-            let focus = ws.active_tab().focus;
-            // Each leaf is a live terminal drawn underneath (pass 1) — keep the fill
-            // transparent. We claim the rect so right-click opens the context menu; left-clicks
-            // fall through to our own handler (which gates geometrically, not on egui
-            // consumption), so selection/focus still work. Plain right-click in a mouse-mode
-            // app is withheld from egui upstream so it reaches the app instead.
-            //
-            // A lone pane draws no border (it'd just be noise) and fills its area. With several
-            // panes the border helps, and the terminal is inset by `pane_padding` so the cells
-            // don't touch it.
-            let rects = ws.leaf_rects(area);
-            let single = rects.len() == 1;
-            for (id, rect) in rects {
-                let response = ui.interact(
-                    rect,
-                    egui::Id::new(("pane", ws.active, id)),
-                    egui::Sense::click(),
-                );
-                pane_context_menu(&response, context_menu_pane == Some(id), |ui| {
-                    full_menu(ui, actions, cfg, Some(id), detachable_panes.contains(&id))
-                });
-                if single {
-                    leaves.push((id, rect));
-                    continue;
+    let overview_full_width = overview.show(ctx);
+    if !overview_full_width {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                let area = ui.max_rect();
+                let focus = ws.active_tab().focus;
+                // Each leaf is a live terminal drawn underneath (pass 1) — keep the fill
+                // transparent. We claim the rect so right-click opens the context menu; left-clicks
+                // fall through to our own handler (which gates geometrically, not on egui
+                // consumption), so selection/focus still work. Plain right-click in a mouse-mode
+                // app is withheld from egui upstream so it reaches the app instead.
+                //
+                // A lone pane draws no border (it'd just be noise) and fills its area. With several
+                // panes the border helps, and the terminal is inset by `pane_padding` so the cells
+                // don't touch it.
+                let rects = ws.leaf_rects(area);
+                let single = rects.len() == 1;
+                for (id, rect) in rects {
+                    let response = ui.interact(
+                        rect,
+                        egui::Id::new(("pane", ws.active, id)),
+                        egui::Sense::click(),
+                    );
+                    pane_context_menu(&response, context_menu_pane == Some(id), |ui| {
+                        full_menu(
+                            ui,
+                            actions,
+                            cfg,
+                            Some(id),
+                            detachable_panes.contains(&id),
+                            overview.enabled,
+                        )
+                    });
+                    if single {
+                        leaves.push((id, rect));
+                        continue;
+                    }
+                    let stroke = if id == focus {
+                        egui::Stroke::new(1.5, border_color)
+                    } else {
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(60))
+                    };
+                    ui.painter().rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(4),
+                        stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                    leaves.push((id, rect.shrink(pane_padding)));
                 }
-                let stroke = if id == focus {
-                    egui::Stroke::new(1.5, border_color)
-                } else {
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(60))
-                };
-                ui.painter().rect_stroke(
-                    rect,
-                    egui::CornerRadius::same(4),
-                    stroke,
-                    egui::StrokeKind::Inside,
-                );
-                leaves.push((id, rect.shrink(pane_padding)));
-            }
 
-            // Draggable split dividers. The grab region is widened beyond the thin visual gap;
-            // we publish it (`dividers`) so our own mouse handler yields these pixels to egui.
-            for d in ws.dividers(area) {
-                let grab = match d.split {
-                    Split::Cols => d.rect.expand2(egui::vec2(4.0, 0.0)),
-                    Split::Rows => d.rect.expand2(egui::vec2(0.0, 4.0)),
-                };
-                dividers.push(grab);
-                let resp = ui.interact(
-                    grab,
-                    egui::Id::new(("divider", ws.active, d.id)),
-                    egui::Sense::drag(),
-                );
-                let active = resp.hovered() || resp.dragged();
-                if active {
-                    let cursor = match d.split {
-                        Split::Cols => egui::CursorIcon::ResizeHorizontal,
-                        Split::Rows => egui::CursorIcon::ResizeVertical,
+                // Draggable split dividers. The grab region is widened beyond the thin visual gap;
+                // we publish it (`dividers`) so our own mouse handler yields these pixels to egui.
+                for d in ws.dividers(area) {
+                    let grab = match d.split {
+                        Split::Cols => d.rect.expand2(egui::vec2(4.0, 0.0)),
+                        Split::Rows => d.rect.expand2(egui::vec2(0.0, 4.0)),
                     };
-                    ui.ctx().set_cursor_icon(cursor);
-                    ui.painter()
-                        .rect_filled(d.rect, egui::CornerRadius::ZERO, border_color);
+                    dividers.push(grab);
+                    let resp = ui.interact(
+                        grab,
+                        egui::Id::new(("divider", ws.active, d.id)),
+                        egui::Sense::drag(),
+                    );
+                    let active = resp.hovered() || resp.dragged();
+                    if active {
+                        let cursor = match d.split {
+                            Split::Cols => egui::CursorIcon::ResizeHorizontal,
+                            Split::Rows => egui::CursorIcon::ResizeVertical,
+                        };
+                        ui.ctx().set_cursor_icon(cursor);
+                        ui.painter()
+                            .rect_filled(d.rect, egui::CornerRadius::ZERO, border_color);
+                    }
+                    if resp.dragged()
+                        && let Some(p) = resp.interact_pointer_pos()
+                    {
+                        let ratio = match d.split {
+                            Split::Cols => (p.x - d.area.min.x) / (d.area.width() - GAP),
+                            Split::Rows => (p.y - d.area.min.y) / (d.area.height() - GAP),
+                        };
+                        actions.push(Action::SetRatio(d.id, ratio));
+                    }
                 }
-                if resp.dragged()
-                    && let Some(p) = resp.interact_pointer_pos()
-                {
-                    let ratio = match d.split {
-                        Split::Cols => (p.x - d.area.min.x) / (d.area.width() - GAP),
-                        Split::Rows => (p.y - d.area.min.y) / (d.area.height() - GAP),
-                    };
-                    actions.push(Action::SetRatio(d.id, ratio));
-                }
-            }
-        });
+            });
+    }
 
     // Attention feed — a floating list of sessions waiting for you, drawn as an Area so it
     // overlays the terminal without affecting pane sizing. Shown when the user has it open
@@ -2740,6 +2764,8 @@ struct App {
     settings_page: SettingsPage,
     shortcut_capture: Option<MenuAction>,
 
+    overview: overview::Overview,
+
     /// Panes whose cached render is stale and must be re-prepared next frame (damage tracking).
     dirty: std::collections::HashSet<PaneId>,
     /// Pane ids currently on screen (the active tab's leaves) — a background pane's output
@@ -2921,6 +2947,7 @@ impl App {
             show_settings: false,
             settings_page: SettingsPage::Font,
             shortcut_capture: None,
+            overview: overview::Overview::default(),
             dirty: std::collections::HashSet::new(),
             visible: std::collections::HashSet::new(),
             last_rect: HashMap::new(),
@@ -4895,6 +4922,14 @@ impl App {
     /// The pane under a physical-pixel position (active tab only), if any.
     fn pane_at(&self, px: f64, py: f64) -> Option<PaneId> {
         let (px, py) = (px as f32, py as f32);
+        // Check the last rendered panel geometry directly: a pointer move and click can arrive
+        // before another redraw has updated menu_open. Floating panels overlap live panes.
+        if self
+            .overview
+            .blocks_pointer(egui::pos2(px / self.scale, py / self.scale))
+        {
+            return None;
+        }
         self.pane_px
             .iter()
             .find(|(_, ox, oy, w, h)| px >= *ox && px < ox + w && py >= *oy && py < oy + h)
@@ -5158,6 +5193,17 @@ impl App {
         {
             self.show_settings = false;
             self.request_redraw();
+            return;
+        }
+        if self.overview.closes_on_escape()
+            && ev.state == ElementState::Pressed
+            && matches!(ev.logical_key, Key::Named(NamedKey::Escape))
+        {
+            self.overview.open = false;
+            self.request_redraw();
+            return;
+        }
+        if self.overview.covers_terminal {
             return;
         }
         if ev.state != ElementState::Pressed || self.terms.is_empty() {
@@ -5436,6 +5482,7 @@ impl App {
             self.egui_ctx.run(raw, |ctx| {
                 build_ui(
                     ctx,
+                    &mut self.overview,
                     &self.config,
                     ws,
                     families,
@@ -5483,6 +5530,7 @@ impl App {
         self.menu_open = self.egui_ctx.memory(|m| m.any_popup_open())
             || feed_active
             || connect_progress_active
+            || self.overview.pointer_over
             || auth_view.is_some()
             || self.show_settings
             || self.show_connect
@@ -5493,6 +5541,10 @@ impl App {
                 Action::SetColors(c) => self.set_colors(c),
                 Action::SetFontSize(s) => self.set_font_size(s),
                 Action::ShowSettings => self.show_settings = true,
+                Action::ToggleOverview => {
+                    self.overview.toggle();
+                    self.request_redraw();
+                }
                 Action::CaptureShortcut(action) => {
                     self.shortcut_capture = Some(action);
                     self.request_redraw();
@@ -5580,6 +5632,9 @@ impl App {
             self.dirty.extend(new_visible.iter().copied());
         }
         self.visible = new_visible;
+        // A full-window overview hides every terminal. Hidden animations cannot advance in
+        // prepare_pane, so retire them here rather than scheduling frames indefinitely.
+        self.animating.retain(|id| self.visible.contains(id));
 
         // Geometry damage: any pane whose pixel rect moved/resized (drag-resize a divider, window
         // resize) has its cached buffers positioned for the old rect — rebuild it.
@@ -5848,7 +5903,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.request_redraw();
         }
         let mut deadline = self.egui_repaint_at;
-        if self.focused_cursor_blinks() {
+        if self.visible.contains(&self.focus()) && self.focused_cursor_blinks() {
             let next = *self.blink_next.get_or_insert(now + BLINK_INTERVAL);
             if now >= next {
                 self.blink_on = !self.blink_on;
@@ -6169,7 +6224,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(Ime::Commit(text))
                 if terminal_should_receive_ime_commit(
                     !self.terms.is_empty(),
-                    self.text_input_active(),
+                    self.text_input_active() || self.overview.covers_terminal,
                     egui_consumed,
                 ) =>
             {
@@ -6363,6 +6418,9 @@ fn main() {
     let notify_sock = feed::instance_socket_path(&instance_id);
     let notify_paths = spawn_notify_listener(proxy.clone(), &notify_sock);
     let mut app = App::new(proxy, instance_id, notify_sock, notify_paths);
+    if std::env::args_os().any(|arg| arg == "--overview-demo") {
+        app.overview = overview::Overview::demo();
+    }
     event_loop.run_app(&mut app).unwrap();
 }
 
@@ -6434,18 +6492,25 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated X11 server and GPU/software renderer"]
     fn x11_redraws_settle_with_terminal_and_settings_idle() {
-        redraws_settle_with_terminal_and_settings_idle(true);
+        redraws_settle_with_terminal_and_settings_idle(true, false);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an isolated Wayland compositor and GPU/software renderer"]
     fn wayland_redraws_settle_with_terminal_and_settings_idle() {
-        redraws_settle_with_terminal_and_settings_idle(false);
+        redraws_settle_with_terminal_and_settings_idle(false, false);
     }
 
     #[cfg(target_os = "linux")]
-    fn redraws_settle_with_terminal_and_settings_idle(x11: bool) {
+    #[test]
+    #[ignore = "requires an isolated X11 server and GPU/software renderer"]
+    fn overview_hides_terminal_without_input_or_repaint_leaks() {
+        redraws_settle_with_terminal_and_settings_idle(true, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn redraws_settle_with_terminal_and_settings_idle(x11: bool, overview: bool) {
         use super::{App, UserEvent};
         use std::time::{Duration, Instant};
         use winit::application::ApplicationHandler;
@@ -6461,6 +6526,8 @@ mod tests {
             settled_frames: usize,
             phase: usize,
             check_at: Instant,
+            overview: bool,
+            hidden_cursor: Option<alacritty_terminal::index::Point>,
         }
 
         impl ApplicationHandler<UserEvent> for IdleTest {
@@ -6496,24 +6563,75 @@ mod tests {
                                 self.frames > self.settled_frames,
                                 "delayed repaint never fired"
                             );
+                            if self.overview {
+                                assert!(self.app.overview.covers_terminal);
+                                assert!(self.app.visible.is_empty());
+                                self.hidden_cursor = Some(
+                                    self.app
+                                        .focused_arc()
+                                        .unwrap()
+                                        .lock()
+                                        .unwrap()
+                                        .grid()
+                                        .cursor
+                                        .point,
+                                );
+                                let window_id = self.app.window.as_ref().unwrap().id();
+                                self.app.window_event(
+                                    event_loop,
+                                    window_id,
+                                    WindowEvent::Ime(winit::event::Ime::Commit(
+                                        "hidden-shell-input-probe".into(),
+                                    )),
+                                );
+                            }
                         }
                         self.settled_frames = self.frames;
                     } else {
-                        assert_eq!(
-                            self.frames, self.settled_frames,
-                            "idle frames keep redrawing"
-                        );
+                        // The injected IME event itself requests a UI repaint. Allow it to
+                        // settle before measuring the full-window overview's idle frames.
+                        if !(self.overview && self.phase == 5) {
+                            assert_eq!(
+                                self.frames, self.settled_frames,
+                                "idle frames keep redrawing"
+                            );
+                        }
                         assert!(self.app.egui_repaint_at.is_none());
                         assert!(self.app.animating.is_empty());
                         assert_eq!(event_loop.control_flow(), ControlFlow::Wait);
-                        if self.phase == 5 {
+                        if self.phase == if self.overview { 7 } else { 5 } {
+                            if let Some(cursor) = self.hidden_cursor {
+                                assert_eq!(
+                                    self.app
+                                        .focused_arc()
+                                        .unwrap()
+                                        .lock()
+                                        .unwrap()
+                                        .grid()
+                                        .cursor
+                                        .point,
+                                    cursor,
+                                    "input leaked to the hidden shell"
+                                );
+                            }
                             event_loop.exit();
                             return;
                         }
                         if self.phase == 1 {
-                            self.app.show_settings = true;
+                            if self.overview {
+                                self.app.overview = crate::overview::Overview::demo();
+                            } else {
+                                self.app.show_settings = true;
+                            }
                             self.app.request_redraw();
-                        } else {
+                        } else if self.phase == 3 {
+                            if self.overview {
+                                self.app.animating.insert(self.app.focus());
+                                let _ =
+                                    self.app.window.as_ref().unwrap().request_inner_size(
+                                        winit::dpi::LogicalSize::new(420.0, 700.0),
+                                    );
+                            }
                             self.app.egui_repaint_at =
                                 Some(Instant::now() + Duration::from_millis(100));
                         }
@@ -6563,10 +6681,13 @@ mod tests {
             settled_frames: 0,
             phase: 0,
             check_at: Instant::now(),
+            overview,
+            hidden_cursor: None,
         };
         event_loop.run_app(&mut test).unwrap();
         assert_eq!(
-            test.phase, 5,
+            test.phase,
+            if overview { 7 } else { 5 },
             "test must finish all idle and delayed repaint checks"
         );
         drop(test);
