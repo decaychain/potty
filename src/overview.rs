@@ -1,4 +1,4 @@
-//! Opt-in session overview preview. Fixtures never enter the live notification registry.
+//! Session overview. Demo fixtures never enter the live session registry.
 
 use crate::{
     chrome_accent, chrome_bg, chrome_error, chrome_hover, chrome_magenta, chrome_muted,
@@ -36,6 +36,8 @@ enum WorkState {
     NeedsYou,
     Finished,
     Unknown,
+    ResponseReady,
+    Ended,
 }
 
 impl WorkState {
@@ -45,6 +47,8 @@ impl WorkState {
             Self::NeedsYou => "Needs you",
             Self::Finished => "Finished",
             Self::Unknown => "Unknown",
+            Self::ResponseReady => "Response ready",
+            Self::Ended => "Ended",
         }
     }
 
@@ -52,27 +56,27 @@ impl WorkState {
         match self {
             Self::Working => chrome_accent(),
             Self::NeedsYou => chrome_warn(),
-            Self::Finished => egui::Color32::from_rgb(126, 216, 161),
-            Self::Unknown => chrome_muted(),
+            Self::Finished | Self::ResponseReady => egui::Color32::from_rgb(126, 216, 161),
+            Self::Unknown | Self::Ended => chrome_muted(),
         }
     }
 }
 
-struct SampleSession {
-    id: &'static str,
-    title: &'static str,
-    tool: &'static str,
-    host: &'static str,
-    cwd: &'static str,
+struct SampleSession<'a> {
+    id: &'a str,
+    title: &'a str,
+    tool: &'a str,
+    host: &'a str,
+    cwd: &'a str,
     state: WorkState,
-    availability: Option<&'static str>,
-    summary: &'static str,
-    next: &'static str,
-    age: &'static str,
-    milestones: &'static [&'static str],
+    availability: Option<&'a str>,
+    summary: &'a str,
+    next: &'a str,
+    age: &'a str,
+    milestones: &'a [&'a str],
 }
 
-const SAMPLES: &[SampleSession] = &[
+const SAMPLES: &[SampleSession<'static>] = &[
     SampleSession {
         id: "clipboard",
         title: "Ubuntu clipboard support",
@@ -188,21 +192,53 @@ pub struct Overview {
     side: PanelSide,
     panel_rect: Option<egui::Rect>,
     filter: Filter,
-    expanded: Option<&'static str>,
-    dismissed: std::collections::HashSet<&'static str>,
+    expanded: Option<String>,
+    dismissed: std::collections::HashSet<String>,
+    demo: bool,
+    show_ended: bool,
+    pub store: potty::agent::Store,
+    pub locations: std::collections::HashMap<String, u64>,
+    pub actions: Vec<OverviewAction>,
+}
+
+pub enum OverviewAction {
+    Open(String),
+    Dismiss(potty::agent::Record),
 }
 
 impl Overview {
     pub fn demo() -> Self {
         Self {
+            demo: true,
             enabled: true,
             open: true,
             ..Self::default()
         }
     }
 
+    pub fn live() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
+    }
+
+    pub fn button_visible(&self) -> bool {
+        self.enabled
+            && (self.open
+                || if self.demo {
+                    SAMPLES.iter().any(|session| {
+                        session.state != WorkState::Ended && !self.dismissed.contains(session.id)
+                    })
+                } else {
+                    self.store.records.values().any(|record| {
+                        record.visible() && record.state != potty::agent::State::Ended
+                    })
+                })
     }
 
     pub fn closes_on_escape(&self) -> bool {
@@ -308,11 +344,13 @@ impl Overview {
                     .strong()
                     .color(chrome_text()),
             );
-            ui.label(
-                egui::RichText::new("Sample data")
-                    .small()
-                    .color(chrome_magenta()),
-            );
+            if self.demo {
+                ui.label(
+                    egui::RichText::new("Sample data")
+                        .small()
+                        .color(chrome_magenta()),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, "x", "Close session overview").clicked() {
                     self.open = false;
@@ -329,7 +367,10 @@ impl Overview {
                         ui.selectable_value(&mut self.side, PanelSide::Right, "Right");
                     });
                     ui.separator();
-                    if ui.button("Reset sample sessions").clicked() {
+                    if !self.demo {
+                        ui.checkbox(&mut self.show_ended, "Show ended sessions");
+                    }
+                    if self.demo && ui.button("Reset sample sessions").clicked() {
                         self.dismissed.clear();
                         self.expanded = None;
                         self.filter = Filter::All;
@@ -341,11 +382,29 @@ impl Overview {
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             for (filter, label) in [
-                (Filter::All, "All"),
+                (
+                    Filter::All,
+                    if self.demo || self.show_ended {
+                        "All"
+                    } else {
+                        "Current"
+                    },
+                ),
                 (Filter::NeedsYou, "Needs you"),
-                (Filter::Finished, "Finished"),
+                (
+                    Filter::Finished,
+                    if self.demo { "Finished" } else { "Ready" },
+                ),
             ] {
-                let count = SAMPLES.iter().filter(|s| self.matches(s, filter)).count();
+                let count = if self.demo {
+                    SAMPLES.iter().filter(|s| self.matches(s, filter)).count()
+                } else {
+                    self.store
+                        .records
+                        .values()
+                        .filter(|r| self.matches_live(r, filter))
+                        .count()
+                };
                 ui.selectable_value(&mut self.filter, filter, format!("{label} {count}"));
             }
         });
@@ -355,13 +414,17 @@ impl Overview {
             .id_salt("session-overview-list")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if !self.demo {
+                    self.live_rows(ui);
+                    return;
+                }
                 if !SAMPLES.iter().any(|s| self.matches(s, self.filter)) {
                     ui.add_space(20.0);
                     ui.label(egui::RichText::new("No sessions").color(chrome_muted()));
                 }
                 for session in SAMPLES {
                     if self.matches(session, self.filter) {
-                        ui.push_id(session.id, |ui| self.row(ui, session));
+                        ui.push_id(session.id, |ui| self.row(ui, session, "Agent briefing"));
                     }
                 }
             });
@@ -372,12 +435,139 @@ impl Overview {
             && match filter {
                 Filter::All => true,
                 Filter::NeedsYou => session.state == WorkState::NeedsYou,
-                Filter::Finished => session.state == WorkState::Finished,
+                Filter::Finished => matches!(
+                    session.state,
+                    WorkState::Finished | WorkState::ResponseReady
+                ),
             }
     }
 
-    fn row(&mut self, ui: &mut egui::Ui, session: &SampleSession) {
-        let expanded = self.expanded == Some(session.id);
+    fn live_rows(&mut self, ui: &mut egui::Ui) {
+        use potty::agent::State;
+        let records: Vec<_> = self
+            .store
+            .records
+            .values()
+            .filter(|r| self.matches_live(r, self.filter))
+            .cloned()
+            .collect();
+        if records.is_empty() {
+            ui.add_space(20.0);
+            ui.label(egui::RichText::new("No sessions").color(chrome_muted()));
+        }
+        for r in records {
+            let key = r.key();
+            let has_briefing = r.briefing.is_some();
+            let source = if has_briefing {
+                if r.prompt_at > r.briefing_at {
+                    "Agent briefing (older than prompt)"
+                } else {
+                    "Agent briefing"
+                }
+            } else {
+                if r.response_at > r.prompt_at && !r.response.is_empty() {
+                    "Latest response (no briefing)"
+                } else {
+                    "Latest prompt (no briefing)"
+                }
+            };
+            let ts = if has_briefing {
+                r.briefing_at
+            } else if r.response_at > r.prompt_at && !r.response.is_empty() {
+                r.response_at
+            } else if !r.prompt.is_empty() {
+                r.prompt_at
+            } else {
+                r.state_at
+            };
+            let age = format!(
+                "{}m ago",
+                potty::agent::now().saturating_sub(ts) / 60_000_000_000
+            );
+            let fallback_title = if r.prompt.is_empty() {
+                "Agent session"
+            } else {
+                r.prompt.trim().lines().next().unwrap_or("Agent session")
+            };
+            let summary = r
+                .briefing
+                .as_ref()
+                .map(|b| b.summary.as_str())
+                .unwrap_or_else(|| {
+                    if r.response_at > r.prompt_at && !r.response.is_empty() {
+                        &r.response
+                    } else {
+                        &r.prompt
+                    }
+                });
+            let next = if r.state == State::NeedsYou {
+                "Approval requested in the agent"
+            } else {
+                r.briefing
+                    .as_ref()
+                    .map(|b| b.next.as_str())
+                    .unwrap_or(match r.state {
+                        State::NeedsYou => "Approval requested",
+                        State::ResponseReady => "Review the response",
+                        State::Ended => "Session ended",
+                        _ => "No next step reported",
+                    })
+            };
+            let milestones: Vec<&str> = r
+                .briefing
+                .as_ref()
+                .map(|b| b.milestones.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            let row = SampleSession {
+                id: &key,
+                title: r
+                    .briefing
+                    .as_ref()
+                    .map(|b| b.title.as_str())
+                    .unwrap_or(fallback_title),
+                tool: match r.tool {
+                    potty::notify::Tool::Codex => "Codex",
+                    potty::notify::Tool::Claude => "Claude",
+                    _ => "Agent",
+                },
+                host: &r.host,
+                cwd: &r.cwd,
+                state: match r.state {
+                    State::Working => WorkState::Working,
+                    State::NeedsYou => WorkState::NeedsYou,
+                    State::ResponseReady => WorkState::ResponseReady,
+                    State::Ended => WorkState::Ended,
+                    State::Unknown => WorkState::Unknown,
+                },
+                availability: (r.state != State::Ended && !self.locations.contains_key(&key))
+                    .then_some("Pane unavailable"),
+                summary,
+                next,
+                age: &age,
+                milestones: &milestones,
+            };
+            ui.push_id(&key, |ui| self.row(ui, &row, source));
+            if self.expanded.as_deref() == Some(&key) && has_briefing && r.prompt_at > r.briefing_at
+            {
+                ui.label(
+                    egui::RichText::new("Latest prompt (hook excerpt)")
+                        .small()
+                        .color(chrome_muted()),
+                );
+                ui.add(egui::Label::new(&r.prompt).wrap());
+                ui.separator();
+            }
+        }
+    }
+
+    fn matches_live(&self, record: &potty::agent::Record, filter: Filter) -> bool {
+        record.visible()
+            && (self.show_ended || record.state != potty::agent::State::Ended)
+            && live_matches(record.state, filter)
+    }
+
+    fn row(&mut self, ui: &mut egui::Ui, session: &SampleSession, source: &str) {
+        let expanded = self.expanded.as_deref() == Some(session.id);
         let background = ui.painter().add(egui::Shape::Noop);
         let row = egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(8, 9))
@@ -453,7 +643,7 @@ impl Overview {
                 .on_hover_text(next);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("Agent briefing | {}", session.age))
+                        egui::RichText::new(format!("{source} | {}", session.age))
                             .small()
                             .color(chrome_muted()),
                     );
@@ -501,14 +691,18 @@ impl Overview {
             );
         }
         if response.clicked() {
-            self.expanded = if expanded { None } else { Some(session.id) };
+            self.expanded = if expanded {
+                None
+            } else {
+                Some(session.id.to_owned())
+            };
         }
         if expanded {
             egui::Frame::NONE
                 .inner_margin(egui::Margin::symmetric(8, 8))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("Briefing")
+                        egui::RichText::new(source)
                             .small()
                             .strong()
                             .color(chrome_muted()),
@@ -527,10 +721,24 @@ impl Overview {
                     }
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.add_enabled(false, egui::Button::new("Open pane"))
-                            .on_disabled_hover_text("Sample session has no linked pane");
+                        if ui
+                            .add_enabled(
+                                self.locations.contains_key(session.id),
+                                egui::Button::new("Open pane"),
+                            )
+                            .on_disabled_hover_text("No available linked pane")
+                            .clicked()
+                        {
+                            self.actions
+                                .push(OverviewAction::Open(session.id.to_owned()));
+                        }
                         if ui.button("Dismiss").clicked() {
-                            self.dismissed.insert(session.id);
+                            if self.demo {
+                                self.dismissed.insert(session.id.to_owned());
+                            } else if let Some(record) = self.store.records.get_mut(session.id) {
+                                record.dismissed = record.revision();
+                                self.actions.push(OverviewAction::Dismiss(record.clone()));
+                            }
                             self.expanded = None;
                         }
                     });
@@ -540,13 +748,130 @@ impl Overview {
     }
 }
 
+fn live_matches(state: potty::agent::State, filter: Filter) -> bool {
+    match filter {
+        Filter::All => true,
+        Filter::NeedsYou => state == potty::agent::State::NeedsYou,
+        Filter::Finished => state == potty::agent::State::ResponseReady,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn overview_button_tracks_current_sessions_independently_of_filters() {
+        use potty::agent::State;
+
+        let mut overview = Overview::live();
+        assert!(!overview.button_visible());
+        let mut record = potty::agent::hook(
+            potty::notify::Tool::Claude,
+            &serde_json::json!({"hook_event_name":"SessionStart", "session_id":"current"}),
+            "local".into(),
+            "host".into(),
+            Some(1),
+        )
+        .unwrap();
+        overview.filter = Filter::NeedsYou;
+        for state in [
+            State::Unknown,
+            State::Working,
+            State::NeedsYou,
+            State::ResponseReady,
+        ] {
+            record.state = state;
+            record.state_at += 1;
+            overview.store.merge(record.clone());
+            assert!(overview.button_visible());
+        }
+        record.state = State::Ended;
+        record.state_at += 1;
+        overview.store.merge(record.clone());
+        overview.show_ended = true;
+        assert!(
+            !overview.button_visible(),
+            "history must not keep the button visible"
+        );
+        overview.open = true;
+        assert!(overview.button_visible(), "an open panel keeps its toggle");
+        overview.open = false;
+
+        record.state = State::Working;
+        record.state_at += 1;
+        overview.store.merge(record.clone());
+        assert!(overview.button_visible());
+        record.dismissed = record.revision();
+        overview.store.merge(record.clone());
+        assert!(!overview.button_visible());
+        record.state_at += 1;
+        overview.store.merge(record);
+        assert!(
+            overview.button_visible(),
+            "new activity restores the button"
+        );
+        overview.enabled = false;
+        assert!(!overview.button_visible());
+    }
+
+    #[test]
+    fn overview_button_remains_available_for_empty_open_panels_and_demo_sessions() {
+        let mut overview = Overview::live();
+        overview.toggle();
+        assert!(overview.button_visible());
+        overview.toggle();
+        assert!(!overview.button_visible());
+
+        let mut overview = Overview::demo();
+        overview.open = false;
+        assert!(overview.button_visible());
+        overview
+            .dismissed
+            .extend(SAMPLES.iter().map(|s| s.id.to_owned()));
+        assert!(!overview.button_visible());
+        overview.toggle();
+        assert!(overview.button_visible());
+    }
+
+    #[test]
+    fn ended_sessions_are_history_not_duplicate_current_panes() {
+        let mut overview = Overview::live();
+        let active = potty::agent::hook(potty::notify::Tool::Claude,
+            &serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"current", "prompt":"PTT-128"}),
+            "local".into(), "host".into(), Some(1)).unwrap();
+        let mut ended = active.clone();
+        ended.session = "old".into();
+        ended.state = potty::agent::State::Ended;
+        ended.state_at += 1; // Even a late end event must not displace the current session.
+        overview.store.merge(active.clone());
+        overview.store.merge(ended.clone());
+        assert!(overview.matches_live(&active, Filter::All));
+        assert!(!overview.matches_live(&ended, Filter::All));
+        overview.show_ended = true;
+        assert!(overview.matches_live(&ended, Filter::All));
+        overview.show_ended = false;
+        overview.store.merge(ended.clone());
+        assert!(!overview.matches_live(&overview.store.records[&ended.key()], Filter::All));
+        assert_eq!(
+            overview.store.records.len(),
+            2,
+            "history is retained, not merged by pane"
+        );
+
+        ended.state = potty::agent::State::Working;
+        ended.state_at += 1;
+        overview.store.merge(ended.clone());
+        assert!(overview.matches_live(&overview.store.records[&ended.key()], Filter::All));
+        assert!(
+            overview.matches_live(&active, Filter::All),
+            "two active sessions in one pane stay distinct"
+        );
+    }
+
+    #[test]
     #[allow(deprecated)]
-    fn overview_controls_expand_filter_and_dismiss_sample_rows() {
+    fn overview_controls_expand_filter_and_dismiss_sample_and_live_rows() {
         fn frame(
             ctx: &egui::Context,
             overview: &mut Overview,
@@ -602,7 +927,7 @@ mod tests {
         let mut overview = Overview::demo();
         frame(&ctx, &mut overview, vec![]);
         click(&ctx, &mut overview, "Ubuntu clipboard support");
-        assert_eq!(overview.expanded, Some("clipboard"));
+        assert_eq!(overview.expanded.as_deref(), Some("clipboard"));
         click(&ctx, &mut overview, "Needs you 2");
         assert!(overview.filter == Filter::NeedsYou);
         click(&ctx, &mut overview, "Dismiss");
@@ -610,7 +935,7 @@ mod tests {
         assert_eq!(overview.expanded, None);
         click(&ctx, &mut overview, "Finished 1");
         click(&ctx, &mut overview, "Idle CPU regression");
-        assert_eq!(overview.expanded, Some("idle"));
+        assert_eq!(overview.expanded.as_deref(), Some("idle"));
         click(&ctx, &mut overview, "Dismiss");
         let output = frame(&ctx, &mut overview, vec![]);
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
@@ -625,6 +950,39 @@ mod tests {
         click(&ctx, &mut overview, "Reset sample sessions");
         assert!(overview.dismissed.is_empty());
         assert!(overview.filter == Filter::All);
+
+        let mut overview = Overview::live();
+        overview.open = true;
+        let record = potty::agent::hook(potty::notify::Tool::Codex,
+            &serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"live", "prompt":"Review transport"}),
+            "local".into(), "host".into(), Some(1)).unwrap();
+        let key = record.key();
+        overview.store.merge(record.clone());
+        overview.locations.insert(key.clone(), 1);
+        frame(&ctx, &mut overview, vec![]);
+        click(&ctx, &mut overview, "Review transport");
+        assert_eq!(overview.expanded.as_deref(), Some(key.as_str()));
+        click(&ctx, &mut overview, "Open pane");
+        assert!(matches!(overview.actions.pop(), Some(OverviewAction::Open(k)) if k == key));
+
+        let mut briefing = record.clone();
+        briefing.briefing = Some(potty::agent::Briefing {
+            title: "Old task".into(),
+            summary: "Earlier work".into(),
+            ..Default::default()
+        });
+        briefing.briefing_at = record.prompt_at - 1;
+        overview.store.merge(briefing);
+        let output = frame(&ctx, &mut overview, vec![]);
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+            egui::Shape::Text(t) if t.galley.job.text.contains("older than prompt"))));
+        click(&ctx, &mut overview, "Dismiss");
+        assert!(matches!(overview.actions.pop(), Some(OverviewAction::Dismiss(r)) if !r.visible()));
+        overview.store.merge(record);
+        assert!(
+            !overview.store.records[&key].visible(),
+            "old replay must stay hidden"
+        );
     }
 
     #[test]
@@ -650,7 +1008,7 @@ mod tests {
                 overview.mode = mode;
                 overview.side = side;
                 for expanded in [None, Some("packaging")] {
-                    overview.expanded = expanded;
+                    overview.expanded = expanded.map(str::to_owned);
                     for _ in 0..3 {
                         let output = ctx.run(
                             egui::RawInput {

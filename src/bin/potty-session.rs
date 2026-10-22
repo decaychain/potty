@@ -156,6 +156,8 @@ mod imp {
         layout: Mutex<Option<String>>,
         /// Attention notes raised while detached, replayed on the next attach.
         pending_notes: Mutex<HashMap<(String, String), feed::Note>>,
+        overview: Mutex<potty::agent::Store>,
+        overview_origin: String,
         notify_sock: PathBuf,
     }
 
@@ -328,6 +330,18 @@ mod imp {
 
     /// Replay stored notes to the client that just attached.
     fn replay_pending_notes(session: &Session, client_id: u64) {
+        {
+            let store = session.overview.lock().unwrap();
+            for record in store.records.values() {
+                send_to(
+                    session,
+                    client_id,
+                    Frame::Control(Control::Notify {
+                        json: potty::agent::Message::json(record.clone()),
+                    }),
+                );
+            }
+        }
         let notes: Vec<feed::Note> = {
             let mut pending = session.pending_notes.lock().unwrap();
             let notes = pending.values().cloned().collect();
@@ -374,6 +388,7 @@ mod imp {
         let session = session.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
                 let mut line = String::new();
                 if BufReader::new(stream.take(64 * 1024))
                     .read_line(&mut line)
@@ -381,13 +396,32 @@ mod imp {
                 {
                     continue;
                 }
-                if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim())
+                if let Some(record) = potty::agent::Message::parse(line.trim()) {
+                    handle_overview(&session, record);
+                } else if let Ok(note) = serde_json::from_str::<feed::Note>(line.trim())
                     && note.v == feed::SCHEMA_VERSION
                 {
                     handle_note(&session, note);
                 }
             }
         });
+    }
+
+    fn handle_overview(session: &Session, mut record: potty::agent::Record) {
+        record.origin = session.overview_origin.clone();
+        let key = record.key();
+        // Serialize update broadcasts with replay so an old attach snapshot cannot win a race.
+        let mut store = session.overview.lock().unwrap();
+        store.merge(record);
+        if let Some(record) = store.records.get(&key) {
+            broadcast(
+                session,
+                Frame::Control(Control::Notify {
+                    json: potty::agent::Message::json(record.clone()),
+                }),
+                None,
+            );
+        }
     }
 
     /// Spawn a shell in a fresh PTY for `opener`: it gets `Opened`; every other attached client is
@@ -653,6 +687,10 @@ mod imp {
                     }
                 }
                 Frame::Control(Control::Notify { json }) => {
+                    if let Some(record) = potty::agent::Message::parse(&json) {
+                        handle_overview(session, record);
+                        continue;
+                    }
                     if let Ok(note) = serde_json::from_str::<feed::Note>(&json)
                         && note.v == feed::SCHEMA_VERSION
                     {
@@ -789,6 +827,8 @@ mod imp {
             focus: AtomicU64::new(0),
             layout: Mutex::new(None),
             pending_notes: Mutex::new(HashMap::new()),
+            overview: Mutex::new(potty::agent::Store::default()),
+            overview_origin: format!("daemon-{}-{}", std::process::id(), potty::agent::now()),
             notify_sock,
         });
         spawn_notify_listener(&session);
@@ -834,6 +874,8 @@ mod imp {
             focus: AtomicU64::new(0),
             layout: Mutex::new(None),
             pending_notes: Mutex::new(HashMap::new()),
+            overview: Mutex::new(potty::agent::Store::default()),
+            overview_origin: format!("daemon-{}-{}", std::process::id(), potty::agent::now()),
             notify_sock: inline_notify_socket_path(),
         });
         serve(&session, 1, std::io::stdin().lock());

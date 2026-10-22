@@ -3,6 +3,7 @@
 //! The attention-feed wire contract, remote protocol, SSH client, and small cross-binary helpers
 //! live here so `potty`, `potty-session`, and `potty-notify` can share them without drift.
 
+pub mod agent;
 pub mod notify;
 pub mod osc133;
 pub mod proto;

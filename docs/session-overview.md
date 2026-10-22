@@ -1,7 +1,229 @@
 # Agent session overview
 
-> Proposal. Status: **UI preview with mock data**. Records the intended experience and a bounded
-> first experiment; helper syntax, wire format, and storage details remain open.
+> Status: **experimental live prototype for Codex and Claude Code**. The setup and limitations
+> below describe implemented behavior; the remaining proposal describes the intended direction.
+
+## Trying live sessions
+
+Build the current binaries, then opt in separately for each agent:
+
+```sh
+cargo build --locked --bins
+./target/debug/potty-notify --install-overview codex --briefing-relay
+./target/debug/potty-notify --install-overview claude
+./target/debug/potty
+```
+
+The installer uses an absolute path to the helper: install it in its final location before
+configuring production hooks. It adds overview hooks alongside existing notification hooks
+and installs `skills/potty-briefing/SKILL.md` in the agent's configuration directory. It respects
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR`, preserves unrelated settings, and refuses to overwrite a
+modified briefing skill. Re-running the installer upgrades an unmodified bundled skill, including
+the original prototype version, and keeps a baseline for later upgrades. Nothing is installed
+automatically by building or launching Potty.
+
+The Codex command above explicitly enables a data-only file relay through trusted hooks. Without
+`--briefing-relay`, publication remains direct and can fail in the agent's shell sandbox. The
+installer does not change sandbox, network, or hook-trust permissions.
+
+Start or resume the agent **inside a pane in the new Potty instance**. Restart an already-running
+agent after installing hooks; Codex may require approving the hooks in `/hooks`. Open the panel
+with the tab-bar Sessions button or menu item. Updates do not open the panel or steal focus.
+The tab-bar button hides when no undismissed, non-ended sessions remain, unless the panel is
+already open. Sessions stays available in the menu, including the pane's right-click menu,
+so an empty panel or session history can still be opened. Waiting agents count as current sessions.
+The default **Current** view excludes ended sessions. Enable **Show ended sessions** in the
+panel menu to inspect or dismiss history. A new agent session can use the same pane without
+being merged with its predecessor; ended history no longer offers navigation to that pane.
+
+### Codex launch mode
+
+Start Codex CLI inside the Potty pane without its shared background server:
+
+```sh
+codex --no-daemon
+```
+
+Codex 0.163.0 uses a shared app-server daemon by default. In the observed failure, the CLI
+inherited the pane's `POTTY_NOTIFY`, `POTTY_PANE`, and `POTTY_INSTANCE`, but the daemon had been
+started outside Potty and had none of them. Hooks therefore returned silently without registering
+the session or supplying a reporting command; agent shell commands also lacked the variables.
+Installing or trusting hooks alone does not repair this environment mismatch.
+
+Use `--no-daemon` for each Codex session, locally or on the remote host. Do not pin a socket or
+pane ID in global Codex configuration or restart the shared daemon inside one chosen pane:
+different panes and Potty instances need their own routing identity. Existing sessions using the
+shared daemon are unaffected by starting a separate non-daemon session.
+
+If registration still fails, check `printenv POTTY_NOTIFY POTTY_PANE` in the launching shell and
+review the overview hooks in Codex's `/hooks`. A registered row with no structured briefing is a
+separate problem: inspect the explicit publisher's error for missing environment or denied socket
+access rather than disabling the sandbox.
+
+### Codex briefing relay
+
+The `--briefing-relay` opt-in adds that flag to Codex's overview hook commands. Re-running the
+installer at the same helper path updates the existing handlers instead of adding duplicates.
+Review and trust the changed hooks in `/hooks`, then restart Codex with `--no-daemon`. Re-running
+`--install-overview codex` without the flag switches those handlers back to direct publication.
+
+SessionStart and UserPromptSubmit supply a reporting command with a session-specific
+`--briefing-file` path. The agent runs that exact command with briefing JSON on stdin. The helper
+validates and atomically queues the data without connecting to a socket or needing `POTTY_*`
+variables in the sandbox. A successful exit means queued, not acknowledged by Potty.
+
+PostToolUse and Stop hooks forward the queued report through the hook's own Potty connection;
+SessionEnd and Interrupt also attempt to flush. These hooks print no relay feedback and never
+request a continuation. The hook validates the session binding, schema, sizes, and timestamp,
+and chooses the socket, pane, and session from its own environment and event. A file cannot
+request command execution, supply an arbitrary destination, or change lifecycle status.
+
+Each outbox holds only the latest report. Successful sends remove it; transport failures leave it
+for a later hook, without model retries. Invalid reports are discarded. Nonblocking locks prevent
+normal concurrent hooks from duplicating delivery. A process crash after sending but before
+removal can cause a replay with the same timestamp, which the overview store merges idempotently.
+No fallback attempts to open a socket from the sandbox if staging fails.
+
+The relay is Unix-only and works on the remote host too, using the same native SSH notification
+path. It needs an updated helper and opted-in remote Codex hooks, not a new daemon protocol.
+If a custom sandbox denies writes to its temporary directory, queuing still fails without
+requesting broader permissions.
+
+### Overview data
+
+Two independent sources populate a row:
+
+- Hooks register the tool session and report working, approval requested, response ready, ended,
+  or unknown. Prompt and final-response excerpts provide a fallback without transcript parsing.
+- A SessionStart hook supplies a session-bound reporting command and the briefing instructions
+  directly to the agent. UserPromptSubmit also supplies a compact reminder and that command,
+  including for agents already running when the helper was updated. The bundled skill asks for
+  a maintained task-level briefing: stable goal/ticket in the title, accumulated progress and
+  current state in the summary, and the next action, external wait, or user decision. Follow-ups
+  such as "push it" should not replace the task identity. Briefings should fit in three short
+  lines: title, one sentence of progress, and one next action or wait, aiming for at most 60
+  words total. Milestones are optional, preferably zero to three short phrases. The skill and
+  prompt/start reminders ask for publication before every final response, including discussion-only
+  and unchanged turns. They do not force extra agent turns.
+
+For example: `PTT-128: New Shiny Dashboard Screen` / `Merge request updated with the overview
+feature` / `Waiting for CI; review the result before merging`. The agent must know those facts;
+the helper does not query JIRA or CI or infer a task from the final response. Rows labelled
+**Latest response (no briefing)** or **Latest prompt (no briefing)** have received no structured
+report. They remain a fallback, not a synthesized task overview. Check whether the agent invoked
+`potty-notify --briefing` and whether direct publication or hook forwarding succeeded if a row
+stays in this state.
+
+**Response ready is not task completion.** A briefing never changes hook status. When another
+prompt arrives without a new briefing, the old briefing remains visibly marked as older than
+the prompt; expanding it also shows the latest prompt excerpt. The agent may omit reports, and
+reported claims are not independently verified. Hook errors do not stop the agent, request
+permissions, or force an extra model turn.
+
+### Before-response reporting
+
+Both providers receive an explicit instruction to publish one concise briefing before every
+final response. This includes text-only discussions and unchanged turns; agents should preserve
+the existing goal and state rather than inventing progress. Publication is an expected workflow
+step, but failures remain best-effort: no extra permissions, retries, or investigation solely
+for a report. Model compliance is not guaranteed, and missing or stale briefings remain possible.
+
+The `Stop` hook records status and the final-response excerpt, and flushes an opted-in outbox.
+It never injects feedback,
+blocks stopping, or requests another model turn. The earlier Claude continuation experiment was
+removed because its visible hook feedback obscured the final answer.
+
+Upgrade/rebuild the helper at the path used by your hooks and re-run
+`potty-notify --install-overview claude` (or `codex --briefing-relay`) to refresh the installed skill, then restart
+the agent. There is no new hook event or daemon protocol requirement for this change. Old
+`*.overview-hooks` metadata directories beside notification sockets are no longer read or written;
+they can be removed once no older helpers use them.
+
+### Publishing a briefing
+
+The publisher accepts plain JSON on stdin, for example using the session ID supplied by the hook:
+
+```sh
+potty-notify --tool claude --briefing --session 'SESSION-ID' <<'JSON'
+{"title":"SSH replay fix","summary":"Reproduced; regression test added, fix unverified.","next":"Implement the boundary fix.","milestones":["Added a failing regression test."]}
+JSON
+```
+
+Wire limits are UTF-8 bytes: title 120, summary 1200, next 600, and five milestones of 300 each.
+These compatibility ceilings are not writing targets; the skill requests the shorter form above.
+Reports replace the previous briefing, including milestones. Invalid reports return a nonzero
+exit status; automatic hooks remain silent and successful on transport or payload failures.
+This first publisher uses Unix sockets, matching the existing notification integration.
+For Codex's relay, use the complete command supplied by the hook, including its `--briefing-file`
+argument; do not guess an outbox path or session ID.
+
+### Remote sessions and retention
+
+Native persistent SSH sessions require the new **potty-session and potty-notify on the remote**,
+plus hooks installed in the remote agent's configuration. No socket forwarding is needed.
+The daemon retains records while detached, replays them to attaching clients, and broadcasts
+updates and dismissals to all attached clients. Dismissal hides the current revision; a genuinely
+new hook or briefing update may surface it again. A locally dismissed disconnected entry is
+reconciled with the daemon on reconnect. Pane navigation uses current remote-to-local routes.
+
+Records and dismissal watermarks are bounded to the 128 most recently updated sessions per
+store and live only in memory. Remote persistence lasts for the daemon's lifetime; local
+records last for the GUI's lifetime. Retention guarantees end on eviction. A missing pane or
+disconnected session remains dismissible and is marked unavailable, with its last known status.
+Acknowledging an attention notification does not delete a briefing, and opening a briefing's
+pane does not acknowledge notifications.
+
+### Privacy and experiment boundaries
+
+Installing the hooks opts into collecting up to 1600 characters from submitted prompts and
+final responses, along with session IDs, host, working directory, and agent-written reports.
+These can contain sensitive project information. Overview records stay in local process memory or the
+remote daemon and travel through the existing private socket/SSH path. The optional relay also
+temporarily stores queued briefing data on disk as described below. Potty does not call a
+separate model service, scrape terminals, read transcripts, dump environments, or send external telemetry.
+Hooks never request an additional continuation in the existing agent session.
+The skill asks agents to exclude secrets, but cannot enforce semantic redaction.
+
+The relay stores files under the hook's temporary directory, normally
+`/tmp/potty-briefings-<uid>/<session-binding-hash>/` on Linux. Directories are owner-only (0700),
+files owner-only (0600). Binding metadata contains socket path, pane ID, and agent session ID.
+Pending/staging files contain the briefing and timestamp, not prompts or transcripts, and are
+limited to 48 KiB each. Symlinks, multiply linked files, nonregular files, and unsafe permissions
+are rejected. This is not an isolation boundary against other processes running as the same user.
+
+Empty binding directories are retained so overlapping hooks keep locking the same directory.
+Failed sends or interrupted writes can leave briefing data on disk. Reports older than 24 hours
+are discarded on the next flush; there is no background expiry or global disk quota. Remove old
+relay directories only after their sessions have stopped. A system temporary-file cleanup may
+also remove them; a later prompt hook recreates a missing outbox.
+
+This is not yet the entire proposal: cross-window mirroring of local overview rows, user-edited
+names, disk persistence, explicit task-completion/review tracking, and old-daemon capability
+indicators are deferred. Old daemons/clients ignore the new payload and remain usable, but do
+not provide live overview support. Subagent lifecycle events with an `agent_id` are ignored;
+provider events lacking subagent identity cannot be reliably separated from parent activity.
+Nested multiplexers can only navigate to the containing Potty pane. Hook state is a best-effort
+last report, not a liveness monitor; missing exit hooks can leave stale state.
+
+Automated tests cover both providers' payloads, helper socket delivery, independent briefing
+and status updates, silent Stop handling, validation, installer idempotence, remote detached replay, and multi-client
+dismissal. They do not establish whether real models keep briefings useful. For the next trial,
+run both agents through a substantive request, a text-only discussion, an unchanged acknowledgement,
+a changed goal, a permission wait, and a handoff;
+also detach an SSH session mid-task. Check whether the summary and next action help you choose
+the right pane without opening it. Count missing, stale, and misleading briefings separately.
+
+Relay tests cover identity separation, invalid data, links and permissions, locking, silent
+flushing, and failure retention. An opt-in Linux smoke test runs the installed Codex sandbox
+without making a model request, verifies that direct socket publication is denied, then checks
+file queuing and hook delivery:
+
+```sh
+cargo test --test briefing_relay codex_workspace_sandbox_blocks_direct_socket_but_allows_file_relay -- --ignored
+```
+
+Hook contracts: [Codex hooks](https://learn.chatgpt.com/docs/hooks) and
+[Claude Code hooks](https://code.claude.com/docs/en/hooks).
 
 ## Trying the UI preview
 
@@ -10,7 +232,7 @@ cargo run --bin potty -- --overview-demo
 ```
 
 This explicitly enables a separate, in-memory sample dataset and opens the overview. Normal
-launches do not show it. The panel is labelled "Sample data" and does not read or change live
+launches use live records and leave the panel closed. The preview is labelled "Sample data" and does not change live
 agent notifications, start agent processes, or connect to the sample hosts.
 
 The preview includes six sessions, status filters, expandable briefings and milestones, dismissal,
@@ -20,7 +242,7 @@ instance, including closing and reopening the panel. The tab-bar overview button
 menu item toggle it. Docked mode reserves space and supports resizing; floating mode overlays the
 terminal without changing its dimensions. Narrow windows use the central area and suppress input
 to the hidden shell in either mode. Escape closes the floating or full-window view. Pane navigation
-is disabled for samples; editable names, live updates, and persistence are not implemented yet.
+is disabled for samples. Display preferences are not saved across application restarts.
 
 ## Problem and goal
 

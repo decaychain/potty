@@ -10,11 +10,15 @@
 //!   potty-notify --install-hook claude   # wire the hooks into ~/.claude/settings.json
 //!   potty-notify --install-hook codex    # wire `notify` + hooks into ~/.codex/config.toml
 //!
-//! It always exits 0 and never blocks the tool: with no socket (a shell outside potty) it
-//! silently does nothing, so a session behaves exactly as it would without the hook installed.
+//! Notification hooks exit 0 and fail silently when no socket is available. The opt-in overview
+//! integration supplies before-response reminders but never requests a Stop continuation.
+//! Explicit installers and briefing publications return errors to their callers.
 
 use std::io::Read;
 use std::path::PathBuf;
+
+#[path = "potty-notify/overview.rs"]
+mod overview;
 
 use lexopt::prelude::{Long, Short, Value};
 use potty::notify::{
@@ -23,6 +27,9 @@ use potty::notify::{
 };
 
 fn main() {
+    if overview::run() {
+        return;
+    }
     let mut tool = Tool::Other;
     let mut kind = Kind::Raise;
     let mut positional: Option<String> = None;
@@ -283,6 +290,11 @@ USAGE:
                                                   stdin, or from Codex `notify` argv.
                                                   --clear retracts a note (Claude UserPromptSubmit).
   potty-notify --install-hook <claude|codex>     Wire the hook into the tool's config (idempotent).
+  potty-notify --install-overview <claude|codex> Install experimental session hooks and briefing skill.
+                      [--briefing-relay]       Opt in to Codex's data-only file relay via trusted hooks.
+  potty-notify --tool <claude|codex> --briefing --session <id>
+                                               Publish a briefing JSON object from stdin.
+                      [--briefing-file <path>] Queue a Codex briefing at the path supplied by its hook.
   potty-notify --print-ssh-config [host]         Print an ~/.ssh/config block to forward over SSH
                                                   (simple; one session per host at a time).
   potty-notify --print-ssh-wrapper               Print a shell `ssh` wrapper with per-pane sockets
@@ -296,7 +308,7 @@ ENV (potty sets these per pane; you don't):
   POTTY_NOTIFY   socket to send notes to
   POTTY_PANE     pane id, for click-to-jump correlation
 
-See docs/attention-feed.md for the design and the SSH/Zellij setup.
+See docs/attention-feed.md for the SSH/Zellij setup and docs/session-overview.md for briefings.
 "
     );
 }
@@ -412,9 +424,9 @@ fn install_claude() -> std::io::Result<()> {
         let present = arr.iter().any(|m| {
             m.get("hooks").and_then(Value::as_array).is_some_and(|hs| {
                 hs.iter().any(|h| {
-                    h.get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|c| c.contains("potty-notify"))
+                    h.get("command").and_then(Value::as_str).is_some_and(|c| {
+                        c.contains("potty-notify") && !c.contains("--overview-hook")
+                    })
                 })
             })
         });
@@ -574,7 +586,9 @@ fn handler_is_potty_hook(handler: &toml_edit::Table) -> bool {
         .get("command")
         .and_then(toml_edit::Item::as_value)
         .and_then(toml_edit::Value::as_str)
-        .is_some_and(|command| command.contains("potty-notify"))
+        .is_some_and(|command| {
+            command.contains("potty-notify") && !command.contains("--overview-hook")
+        })
 }
 
 #[cfg(test)]

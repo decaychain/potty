@@ -92,6 +92,76 @@ fn send_note(sock: &Path, session: &str, kind: Kind) {
     stream.write_all(line.as_bytes()).expect("write note");
 }
 
+#[test]
+fn overview_survives_detach_and_dismissal_is_replayed_to_all_clients() {
+    use potty::agent::{self, Briefing, Message};
+    let sock = std::env::temp_dir().join(format!("potty-overview-{}.sock", tag()));
+    let daemon = start_daemon(&sock);
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 2 }));
+    c1.send(Frame::Control(Control::Open {
+        pane: 1,
+        cols: 80,
+        rows: 24,
+        cwd_from: None,
+    }));
+    assert!(c1.wait(|_, ctrl| {
+        ctrl.iter()
+            .any(|c| matches!(c, Control::Opened { pane: 1 }))
+    }));
+    c1.disconnect();
+
+    let mut record = agent::hook(Tool::Codex, &serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"overview-session", "prompt":"Fix replay"}), "helper-socket".into(), "remote-test".into(), Some(1)).unwrap();
+    record.briefing = Some(Briefing {
+        title: "Replay fix".into(),
+        summary: "Regression passes".into(),
+        ..Default::default()
+    });
+    record.briefing_at = agent::now();
+    let mut socket = UnixStream::connect(notify_socket(&sock)).unwrap();
+    use std::io::Write;
+    writeln!(socket, "{}", Message::json(record)).unwrap();
+    drop(socket);
+
+    let records = |ctrl: &[Control]| -> Vec<agent::Record> {
+        ctrl.iter()
+            .filter_map(|c| match c {
+                Control::Notify { json } => Message::parse(json),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c2.wait(|_, ctrl| records(ctrl).iter().any(|r| r.briefing.is_some())));
+    let mut record = records(&c2.collected.lock().unwrap().1).pop().unwrap();
+    assert!(record.origin.starts_with("daemon-"));
+    let mut c3 = Client::connect(&sock);
+    c3.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c3.wait(|_, ctrl| records(ctrl).iter().any(|r| r.visible())));
+    record.dismissed = record.revision();
+    c2.send(Frame::Control(Control::Notify {
+        json: Message::json(record.clone()),
+    }));
+    assert!(c3.wait(|_, ctrl| records(ctrl).iter().any(|r| !r.visible())));
+    c2.disconnect();
+    c3.disconnect();
+
+    let mut c4 = Client::connect(&sock);
+    c4.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c4.wait(|_, ctrl| ctrl.iter().any(|c| matches!(c, Control::Ready))));
+    let replayed = records(&c4.collected.lock().unwrap().1);
+    c4.disconnect();
+    cleanup(daemon, &sock);
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].key(), record.key());
+    assert!(!replayed[0].visible());
+    assert_eq!(
+        replayed[0].briefing.as_ref().unwrap().summary,
+        "Regression passes"
+    );
+}
+
 /// Spawn the daemon directly on `sock` (bypassing the attach relay) and wait until it's listening.
 fn start_daemon(sock: &Path) -> Child {
     let _ = std::fs::remove_file(sock);

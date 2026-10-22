@@ -116,6 +116,7 @@ enum UserEvent {
     PaneExited(PaneId),
     /// An attention note arrived from this instance's own helper/socket path.
     Notify(feed::Note),
+    OverviewRecord(potty::agent::Record),
     /// A note forwarded by another live potty instance. Already fanned out; don't rebroadcast it.
     PeerNotify(feed::Note),
     /// Another instance's feed asked this process to activate one of its notes.
@@ -1289,6 +1290,53 @@ fn icon_button(ui: &mut egui::Ui, text: &str, hover: &str) -> egui::Response {
     .on_hover_text(hover)
 }
 
+fn paint_overview_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let rect = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+    let stroke = egui::Stroke::new(1.5, color);
+    painter.rect_stroke(rect, 2, stroke, egui::StrokeKind::Inside);
+    painter.line_segment(
+        [
+            rect.left_top() + egui::vec2(5.0, 0.0),
+            rect.left_bottom() + egui::vec2(5.0, 0.0),
+        ],
+        stroke,
+    );
+    for y in [5.0, 8.0, 11.0] {
+        painter.line_segment(
+            [
+                rect.left_top() + egui::vec2(8.0, y),
+                rect.left_top() + egui::vec2(12.5, y),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn overview_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let response = ui.add_sized(
+        egui::vec2(24.0, 24.0),
+        egui::Button::new("")
+            .selected(open)
+            .corner_radius(egui::CornerRadius::same(6)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            open,
+            "Toggle session overview",
+        )
+    });
+    if ui.is_rect_visible(response.rect) {
+        paint_overview_icon(
+            ui.painter(),
+            response.rect.center(),
+            if open { chrome_accent() } else { chrome_text() },
+        );
+    }
+    response.on_hover_text("Toggle session overview")
+}
+
 fn chrome_text_edit<'a>(text: &'a mut String, hint: &'static str) -> egui::TextEdit<'a> {
     egui::TextEdit::singleline(text)
         .hint_text(hint)
@@ -1309,17 +1357,26 @@ fn menu_item(ui: &mut egui::Ui, icon: &str, label: &str, hint: Option<&str>) -> 
         };
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(6), fill);
-        ui.painter().text(
-            rect.left_center() + egui::vec2(9.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            icon,
-            egui::FontId::monospace(12.0),
-            if response.hovered() {
-                chrome_magenta()
-            } else {
-                chrome_accent()
-            },
-        );
+        let icon_color = if response.hovered() {
+            chrome_magenta()
+        } else {
+            chrome_accent()
+        };
+        if icon == "[]" {
+            paint_overview_icon(
+                ui.painter(),
+                rect.left_center() + egui::vec2(17.0, 0.0),
+                icon_color,
+            );
+        } else {
+            ui.painter().text(
+                rect.left_center() + egui::vec2(9.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                icon,
+                egui::FontId::monospace(12.0),
+                icon_color,
+            );
+        }
         ui.painter().text(
             rect.left_center() + egui::vec2(42.0, 0.0),
             egui::Align2::LEFT_CENTER,
@@ -1830,10 +1887,11 @@ fn build_ui(
     detachable_panes: &std::collections::HashSet<PaneId>,
     context_menu_pane: Option<PaneId>,
 ) {
-    // The tab bar earns its space with more than one tab, or once the attention feed has latched
-    // it on (it hosts the bell). Otherwise the menu lives on the pane's right-click
+    // The tab bar earns its space with more than one tab, current overview sessions, an open
+    // overview, or a latched attention feed. Otherwise the menu lives on the pane's right-click
     // (shift-right-click when an app has grabbed the mouse).
-    let show_chrome = ws.tabs.len() > 1 || chrome_latched || overview.enabled;
+    let show_overview_button = overview.button_visible();
+    let show_chrome = ws.tabs.len() > 1 || chrome_latched || show_overview_button;
     if show_chrome {
         egui::TopBottomPanel::top("tabbar")
             .frame(tabbar_frame())
@@ -1868,9 +1926,7 @@ fn build_ui(
                         ui.menu_button("☰", |ui| {
                             full_menu(ui, actions, cfg, None, focus_detachable, overview.enabled)
                         });
-                        if overview.enabled
-                            && icon_button(ui, "[]", "Toggle session overview").clicked()
-                        {
+                        if show_overview_button && overview_button(ui, overview.open).clicked() {
                             actions.push(Action::ToggleOverview);
                         }
                         // Attention-feed bell — present once the feed has latched the bar on. Shows
@@ -2765,6 +2821,7 @@ struct App {
     shortcut_capture: Option<MenuAction>,
 
     overview: overview::Overview,
+    overview_remote: HashMap<String, ConnId>,
 
     /// Panes whose cached render is stale and must be re-prepared next frame (damage tracking).
     dirty: std::collections::HashSet<PaneId>,
@@ -2947,7 +3004,8 @@ impl App {
             show_settings: false,
             settings_page: SettingsPage::Font,
             shortcut_capture: None,
-            overview: overview::Overview::default(),
+            overview: overview::Overview::live(),
+            overview_remote: HashMap::new(),
             dirty: std::collections::HashSet::new(),
             visible: std::collections::HashSet::new(),
             last_rect: HashMap::new(),
@@ -4115,6 +4173,24 @@ impl App {
                 }
             }
             Frame::Control(Control::Notify { json }) => {
+                if let Some(record) = potty::agent::Message::parse(&json) {
+                    if let Some(local) = self.overview.store.records.get(&record.key())
+                        && local.dismissed > record.dismissed
+                        && let Some(connection) = self.connections.get(&conn)
+                    {
+                        let mut dismissal = record.clone();
+                        dismissal.dismissed = local.dismissed;
+                        let _ = connection
+                            .outbound
+                            .try_send(Frame::Control(Control::Notify {
+                                json: potty::agent::Message::json(dismissal),
+                            }));
+                    }
+                    self.overview_remote.insert(record.key(), conn);
+                    self.overview.store.merge(record);
+                    self.request_redraw();
+                    return;
+                }
                 if let Ok(remote_note) = serde_json::from_str::<feed::Note>(&json)
                     && remote_note.v == feed::SCHEMA_VERSION
                 {
@@ -5469,6 +5545,24 @@ impl App {
             .flat_map(|c| c.routes.values().copied())
             .collect();
         let auth_inputs = &mut self.auth_inputs;
+        self.overview_remote
+            .retain(|key, _| self.overview.store.records.contains_key(key));
+        self.overview.locations.clear();
+        for (key, record) in &self.overview.store.records {
+            if record.state == potty::agent::State::Ended {
+                continue;
+            }
+            let pane = if let Some(conn) = self.overview_remote.get(key) {
+                self.connections
+                    .get(conn)
+                    .and_then(|c| record.pane.and_then(|id| c.routes.get(&id).copied()))
+            } else {
+                record.pane
+            };
+            if let Some(pane) = pane.filter(|p| self.workspace.tab_of(*p).is_some()) {
+                self.overview.locations.insert(key.clone(), pane);
+            }
+        }
         let mut connect_progress_active = false;
         let connect_host = &mut self.connect_host;
         let connect_name = &mut self.connect_name;
@@ -5585,6 +5679,34 @@ impl App {
                 Action::NewLocalTab => self.new_tab(true),
                 a => apply(&mut self.workspace, a),
             }
+        }
+        for action in std::mem::take(&mut self.overview.actions) {
+            match action {
+                overview::OverviewAction::Open(key) => {
+                    if let Some(&pane) = self.overview.locations.get(&key)
+                        && let Some(tab) = self.workspace.tab_of(pane)
+                    {
+                        self.workspace.active = tab;
+                        self.workspace.tabs[tab].focus = pane;
+                        // A full-width overview must uncover the selected terminal.
+                        if self.overview.covers_terminal {
+                            self.overview.open = false;
+                        }
+                    }
+                }
+                overview::OverviewAction::Dismiss(record) => {
+                    if let Some(conn) = self
+                        .overview_remote
+                        .get(&record.key())
+                        .and_then(|id| self.connections.get(id))
+                    {
+                        let _ = conn.outbound.try_send(Frame::Control(Control::Notify {
+                            json: potty::agent::Message::json(record),
+                        }));
+                    }
+                }
+            }
+            self.request_redraw();
         }
         // Actions may have created/destroyed panes — keep a terminal per leaf. (The `leaves`
         // rects reflect the pre-action layout for this frame; egui requests a repaint after the
@@ -5997,6 +6119,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PaneExited(id) => self.close_pane(event_loop, id),
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_local_note(note),
+            UserEvent::OverviewRecord(record) => {
+                self.overview.store.merge(record);
+                self.request_redraw();
+            }
             UserEvent::PeerNotify(note) => self.on_peer_note(note),
             UserEvent::PeerFocus {
                 instance,
@@ -6321,6 +6447,7 @@ fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>, instance_path: &Path)
     fn spawn_acceptor(proxy: EventLoopProxy<UserEvent>, listener: UnixListener) {
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 // Cap the read so a rogue client can't make us allocate unbounded.
                 let mut line = String::new();
                 if BufReader::new(stream.take(64 * 1024))
@@ -6357,6 +6484,10 @@ fn spawn_notify_listener(_proxy: EventLoopProxy<UserEvent>, _instance_path: &Pat
 
 #[cfg(unix)]
 fn handle_notify_line(proxy: &EventLoopProxy<UserEvent>, line: &str) {
+    if let Some(record) = potty::agent::Message::parse(line) {
+        let _ = proxy.send_event(UserEvent::OverviewRecord(record));
+        return;
+    }
     if let Ok(msg) = serde_json::from_str::<feed::InstanceMessage>(line) {
         let event = match msg {
             feed::InstanceMessage::Note { note } => UserEvent::PeerNotify(note),
@@ -6435,6 +6566,85 @@ mod tests {
     use crate::config::Config;
     use std::collections::HashSet;
     use winit::event::MouseButton;
+
+    #[test]
+    #[allow(deprecated)]
+    fn overview_icon_is_drawn_at_a_fixed_size_and_button_is_clickable() {
+        for scale in [1.0, 2.0] {
+            for open in [false, true] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                let frame = |events| {
+                    let mut rect = egui::Rect::NOTHING;
+                    let mut clicked = false;
+                    let output = ctx.run(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let response = super::overview_button(ui, open);
+                                rect = response.rect;
+                                clicked = response.clicked();
+                            });
+                        },
+                    );
+                    assert_eq!(rect.size(), egui::vec2(24.0, 24.0));
+                    assert!(
+                        output.shapes.iter().all(|s| match &s.shape {
+                            egui::Shape::Text(t) => t.galley.job.text.is_empty(),
+                            _ => true,
+                        }),
+                        "the icon must not depend on font glyphs"
+                    );
+                    let lines: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|s| match &s.shape {
+                            egui::Shape::LineSegment { points, .. } => Some(points),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(lines.len(), 4);
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|points| points.iter().all(|p| rect.contains(*p)))
+                    );
+                    (rect.center(), clicked)
+                };
+                let (pos, _) = frame(vec![]);
+                frame(vec![egui::Event::PointerMoved(pos)]);
+                for pressed in [true, false] {
+                    let (_, clicked) = frame(vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    }]);
+                    assert_eq!(clicked, !pressed);
+                }
+                let output = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        super::menu_item(ui, "[]", "Sessions", None);
+                    });
+                });
+                assert!(output.shapes.iter().all(|s| match &s.shape {
+                    egui::Shape::Text(t) => t.galley.job.text != "[]",
+                    _ => true,
+                }));
+                assert_eq!(
+                    output
+                        .shapes
+                        .iter()
+                        .filter(|s| matches!(s.shape, egui::Shape::LineSegment { .. }))
+                        .count(),
+                    4
+                );
+            }
+        }
+    }
 
     #[test]
     #[allow(deprecated)]
