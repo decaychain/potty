@@ -58,6 +58,40 @@ pub fn excerpt(s: &str, max: usize) -> String {
         .collect()
 }
 
+/// A turn-end snapshot, not a process liveness check. No commands or task output are retained.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Background {
+    pub tasks: u32,
+    pub monitors: u32,
+}
+
+impl Background {
+    fn from_hook(payload: &serde_json::Value) -> Option<Self> {
+        let tasks = payload.get("background_tasks")?.as_array()?;
+        if tasks.len() > 1024 {
+            return None;
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut snapshot = Self {
+            tasks: 0,
+            monitors: 0,
+        };
+        for task in tasks {
+            let id = task.get("id")?.as_str()?;
+            let kind = task.get("type")?.as_str()?;
+            let status = task.get("status")?.as_str()?;
+            if id.is_empty() {
+                return None;
+            }
+            if matches!(status, "running" | "pending") && ids.insert(id) {
+                snapshot.tasks += 1;
+                snapshot.monitors += u32::from(kind == "monitor");
+            }
+        }
+        Some(snapshot)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     pub origin: String,
@@ -80,6 +114,10 @@ pub struct Record {
     #[serde(default)]
     pub briefing_at: u64,
     #[serde(default)]
+    pub background: Option<Background>,
+    #[serde(default)]
+    pub background_at: u64,
+    #[serde(default)]
     pub dismissed: u64,
 }
 
@@ -92,6 +130,7 @@ impl Record {
             .max(self.prompt_at)
             .max(self.response_at)
             .max(self.briefing_at)
+            .max(self.background_at)
     }
     pub fn visible(&self) -> bool {
         self.revision() > self.dismissed
@@ -106,6 +145,10 @@ impl Record {
             && valid_text(&self.prompt, 8192)
             && valid_text(&self.response, 8192)
             && self.briefing.as_ref().is_none_or(Briefing::valid)
+            && self
+                .background
+                .as_ref()
+                .is_none_or(|b| b.monitors <= b.tasks && b.tasks <= 1024)
             && self.revision() > 0
     }
 }
@@ -161,6 +204,10 @@ impl Store {
             if incoming.briefing_at > old.briefing_at {
                 old.briefing = incoming.briefing;
                 old.briefing_at = incoming.briefing_at;
+            }
+            if incoming.background_at > old.background_at {
+                old.background = incoming.background;
+                old.background_at = incoming.background_at;
             }
             old.dismissed = old.dismissed.max(incoming.dismissed);
         } else {
@@ -220,6 +267,8 @@ pub fn hook(
         response_at: 0,
         briefing: None,
         briefing_at: 0,
+        background: None,
+        background_at: 0,
         dismissed: 0,
     };
     if event == "UserPromptSubmit" {
@@ -242,12 +291,105 @@ pub fn hook(
         );
         record.response_at = ts;
     }
+    if tool == Tool::Claude && matches!(event, "Stop" | "SessionStart" | "SessionEnd") {
+        record.background_at = ts;
+        if event == "Stop" {
+            record.background = Background::from_hook(payload);
+        }
+    }
     record.valid().then_some(record)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_snapshots_are_independent_and_missing_is_not_zero() {
+        let stop = |extra: serde_json::Value| {
+            let mut payload = serde_json::json!({"hook_event_name":"Stop", "session_id":"a"});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            hook(
+                Tool::Claude,
+                &payload,
+                "origin".into(),
+                "host".into(),
+                Some(1),
+            )
+            .unwrap()
+        };
+        let running = stop(serde_json::json!({"background_tasks":[
+            {"id":"shell", "type":"shell", "status":"running", "command":"sensitive"},
+            {"id":"watch", "type":"monitor", "status":"pending"},
+            {"id":"watch", "type":"monitor", "status":"pending"},
+            {"id":"done", "type":"shell", "status":"completed"}
+        ]}));
+        assert_eq!(running.state, State::ResponseReady);
+        assert_eq!(
+            running.background,
+            Some(Background {
+                tasks: 2,
+                monitors: 1
+            })
+        );
+        let wire = Message::json(running.clone());
+        assert!(!wire.contains("sensitive"));
+        assert_eq!(
+            Message::parse(&wire).unwrap().background,
+            running.background
+        );
+        let mut store = Store::default();
+        store.merge(running.clone());
+        let mut working = running.clone();
+        working.state = State::Working;
+        working.state_at += 1;
+        working.background = None;
+        working.background_at = 0;
+        store.merge(working);
+        assert_eq!(store.records[&running.key()].background, running.background);
+        let empty = stop(serde_json::json!({"background_tasks":[]}));
+        assert_eq!(
+            empty.background,
+            Some(Background {
+                tasks: 0,
+                monitors: 0
+            })
+        );
+        store.merge(empty.clone());
+        store.merge(running.clone());
+        assert_eq!(store.records[&running.key()].background, empty.background);
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"background_tasks":[{}]}),
+        ] {
+            let unknown = stop(extra);
+            store.merge(unknown.clone());
+            assert!(store.records[&unknown.key()].background.is_none());
+            assert!(unknown.background_at > 0);
+        }
+        for event in ["SessionStart", "SessionEnd"] {
+            let reset = hook(
+                Tool::Claude,
+                &serde_json::json!({"hook_event_name":event, "session_id":"a"}),
+                "origin".into(),
+                "host".into(),
+                Some(1),
+            )
+            .unwrap();
+            assert!(reset.background.is_none());
+            assert!(reset.background_at > running.background_at);
+        }
+        let mut legacy = serde_json::to_value(running).unwrap();
+        legacy.as_object_mut().unwrap().remove("background");
+        legacy.as_object_mut().unwrap().remove("background_at");
+        let legacy: Record = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.valid());
+        assert!(legacy.background.is_none());
+        assert_eq!(legacy.background_at, 0);
+    }
     fn sample() -> Record {
         hook(Tool::Codex, &serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"a", "prompt":"Fix it"}), "origin".into(), "host".into(), Some(1)).unwrap()
     }

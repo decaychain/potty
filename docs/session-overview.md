@@ -157,6 +157,29 @@ This first publisher uses Unix sockets, matching the existing notification integ
 For Codex's relay, use the complete command supplied by the hook, including its `--briefing-file`
 argument; do not guess an outbox path or session ID.
 
+### Overview interactions
+
+Opening the overview hides the notification popup without clearing its entries or bell count.
+New notifications do not auto-open the popup while the overview is visible; the bell still
+opens it explicitly. Closing the overview does not replay suppressed popups.
+
+Click a session row to switch to its pane; an already-expanded inactive row stays expanded.
+Clicking it again while focused toggles its briefing. The focused pane's
+rows are highlighted, and switching panes or reopening the panel reveals its first matching
+row. Filters are respected, and ordinary updates do not pull the list away from manual scrolling.
+Sessions sharing a resolved pane are adjacent, without assuming a parent/child relationship.
+Prompt excerpts, including the expanded stale-briefing prompt, are limited to four wrapped lines.
+
+Claude's [Stop hook](https://code.claude.com/docs/en/hooks#stop-input) can supply a
+`background_tasks` snapshot. Potty shows a count of reported running/pending tasks, with a monitor
+count when supplied, without replacing the Ready status. This includes background shell jobs;
+no commands, descriptions, task output, or transcripts are retained for this indicator.
+Hover for the report's age. It is refreshed at turn end, not continuously: a job completing or
+being cancelled between turns may remain in the last report until the next Stop event. Missing
+or malformed snapshots mean unknown, not zero, and session start/end clears the old snapshot.
+Older Claude versions without this field show no indicator. No hook reinstallation is needed,
+but update `potty-notify`, the GUI, and (for remote forwarding/replay of this field) `potty-session`.
+
 ### Remote sessions and retention
 
 Native persistent SSH sessions require the new **potty-session and potty-notify on the remote**,

@@ -118,6 +118,11 @@ fn overview_survives_detach_and_dismissal_is_replayed_to_all_clients() {
         ..Default::default()
     });
     record.briefing_at = agent::now();
+    record.background = Some(agent::Background {
+        tasks: 2,
+        monitors: 1,
+    });
+    record.background_at = agent::now();
     let mut socket = UnixStream::connect(notify_socket(&sock)).unwrap();
     use std::io::Write;
     writeln!(socket, "{}", Message::json(record)).unwrap();
@@ -136,6 +141,13 @@ fn overview_survives_detach_and_dismissal_is_replayed_to_all_clients() {
     assert!(c2.wait(|_, ctrl| records(ctrl).iter().any(|r| r.briefing.is_some())));
     let mut record = records(&c2.collected.lock().unwrap().1).pop().unwrap();
     assert!(record.origin.starts_with("daemon-"));
+    assert_eq!(
+        record.background,
+        Some(agent::Background {
+            tasks: 2,
+            monitors: 1
+        })
+    );
     let mut c3 = Client::connect(&sock);
     c3.send(Frame::Control(Control::Hello { version: 2 }));
     assert!(c3.wait(|_, ctrl| records(ctrl).iter().any(|r| r.visible())));
@@ -155,6 +167,8 @@ fn overview_survives_detach_and_dismissal_is_replayed_to_all_clients() {
     cleanup(daemon, &sock);
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].key(), record.key());
+    assert_eq!(replayed[0].background, record.background);
+    assert_eq!(replayed[0].background_at, record.background_at);
     assert!(!replayed[0].visible());
     assert_eq!(
         replayed[0].briefing.as_ref().unwrap().summary,

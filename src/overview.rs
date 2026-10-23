@@ -71,6 +71,7 @@ struct SampleSession<'a> {
     state: WorkState,
     availability: Option<&'a str>,
     summary: &'a str,
+    newer_prompt: Option<&'a str>,
     next: &'a str,
     age: &'a str,
     milestones: &'a [&'a str],
@@ -86,6 +87,7 @@ const SAMPLES: &[SampleSession<'static>] = &[
         state: WorkState::NeedsYou,
         availability: None,
         summary: "X11 backend implemented; selection tests pass.",
+        newer_prompt: None,
         next: "Approve the integration test on Ubuntu.",
         age: "4m ago",
         milestones: &[
@@ -103,6 +105,7 @@ const SAMPLES: &[SampleSession<'static>] = &[
         state: WorkState::Working,
         availability: None,
         summary: "Checking escape-sequence boundaries after reattach.",
+        newer_prompt: None,
         next: "Run repeated detach and replay cycles.",
         age: "1m ago",
         milestones: &[
@@ -120,6 +123,7 @@ const SAMPLES: &[SampleSession<'static>] = &[
         state: WorkState::NeedsYou,
         availability: None,
         summary: "Unsigned package builds; signing identity is missing.",
+        newer_prompt: None,
         next: "Choose whether to ship an unsigned preview.",
         age: "12m ago",
         milestones: &[
@@ -137,6 +141,7 @@ const SAMPLES: &[SampleSession<'static>] = &[
         state: WorkState::Finished,
         availability: None,
         summary: "Redraw loop fixed; idle measurements are clean.",
+        newer_prompt: None,
         next: "Review the patch and test results.",
         age: "23m ago",
         milestones: &[
@@ -154,6 +159,7 @@ const SAMPLES: &[SampleSession<'static>] = &[
         state: WorkState::Working,
         availability: Some("Disconnected"),
         summary: "Last report: measuring large scrollback workloads.",
+        newer_prompt: None,
         next: "Check results after reconnecting.",
         age: "2h ago",
         milestones: &[
@@ -171,6 +177,7 @@ const SAMPLES: &[SampleSession<'static>] = &[
         state: WorkState::Unknown,
         availability: Some("Pane closed"),
         summary: "Drafted migration notes; no completion was reported.",
+        newer_prompt: None,
         next: "Review the saved notes or dismiss this entry.",
         age: "Yesterday",
         milestones: &[
@@ -196,6 +203,9 @@ pub struct Overview {
     dismissed: std::collections::HashSet<String>,
     demo: bool,
     show_ended: bool,
+    focused_pane: Option<u64>,
+    reveal_focus: bool,
+    was_open: bool,
     pub store: potty::agent::Store,
     pub locations: std::collections::HashMap<String, u64>,
     pub actions: Vec<OverviewAction>,
@@ -227,6 +237,13 @@ impl Overview {
         self.open = !self.open;
     }
 
+    pub fn sync_focus(&mut self, pane: u64) {
+        if self.focused_pane != Some(pane) {
+            self.focused_pane = Some(pane);
+            self.reveal_focus = true;
+        }
+    }
+
     pub fn button_visible(&self) -> bool {
         self.enabled
             && (self.open
@@ -255,6 +272,10 @@ impl Overview {
         self.covers_terminal = false;
         self.pointer_over = false;
         self.panel_rect = None;
+        if self.open && !self.was_open {
+            self.reveal_focus = true;
+        }
+        self.was_open = self.open;
         if !self.enabled || !self.open {
             return false;
         }
@@ -424,7 +445,9 @@ impl Overview {
                 }
                 for session in SAMPLES {
                     if self.matches(session, self.filter) {
-                        ui.push_id(session.id, |ui| self.row(ui, session, "Agent briefing"));
+                        ui.push_id(session.id, |ui| {
+                            self.row(ui, session, "Agent briefing", false, None)
+                        });
                     }
                 }
             });
@@ -442,15 +465,42 @@ impl Overview {
             }
     }
 
-    fn live_rows(&mut self, ui: &mut egui::Ui) {
-        use potty::agent::State;
-        let records: Vec<_> = self
+    fn sorted_records(&self) -> Vec<potty::agent::Record> {
+        let mut records: Vec<_> = self
             .store
             .records
             .values()
             .filter(|r| self.matches_live(r, self.filter))
             .cloned()
             .collect();
+        // Resolved panes group local and remote sessions alike. Detached sessions use their
+        // original transport identity so equal remote pane IDs never group unrelated hosts.
+        records.sort_by_cached_key(|r| {
+            let key = r.key();
+            match self.locations.get(&key) {
+                Some(pane) => (0, *pane, String::new(), String::new(), None, key),
+                None => (1, 0, r.origin.clone(), r.host.clone(), r.pane, key),
+            }
+        });
+        records
+    }
+
+    fn live_rows(&mut self, ui: &mut egui::Ui) {
+        use potty::agent::State;
+        let records = self.sorted_records();
+        let reveal = self
+            .reveal_focus
+            .then(|| {
+                records.iter().find_map(|r| {
+                    let key = r.key();
+                    self.locations
+                        .get(&key)
+                        .copied()
+                        .filter(|pane| Some(*pane) == self.focused_pane)
+                        .map(|_| key)
+                })
+            })
+            .flatten();
         if records.is_empty() {
             ui.add_space(20.0);
             ui.label(egui::RichText::new("No sessions").color(chrome_muted()));
@@ -458,6 +508,8 @@ impl Overview {
         for r in records {
             let key = r.key();
             let has_briefing = r.briefing.is_some();
+            let prompt_only =
+                !has_briefing && (r.response_at <= r.prompt_at || r.response.is_empty());
             let source = if has_briefing {
                 if r.prompt_at > r.briefing_at {
                     "Agent briefing (older than prompt)"
@@ -485,9 +537,12 @@ impl Overview {
                 potty::agent::now().saturating_sub(ts) / 60_000_000_000
             );
             let fallback_title = if r.prompt.is_empty() {
-                "Agent session"
+                "Agent session".to_owned()
             } else {
-                r.prompt.trim().lines().next().unwrap_or("Agent session")
+                potty::agent::excerpt(
+                    r.prompt.trim().lines().next().unwrap_or("Agent session"),
+                    120,
+                )
             };
             let summary = r
                 .briefing
@@ -524,7 +579,7 @@ impl Overview {
                     .briefing
                     .as_ref()
                     .map(|b| b.title.as_str())
-                    .unwrap_or(fallback_title),
+                    .unwrap_or(&fallback_title),
                 tool: match r.tool {
                     potty::notify::Tool::Codex => "Codex",
                     potty::notify::Tool::Claude => "Claude",
@@ -542,22 +597,26 @@ impl Overview {
                 availability: (r.state != State::Ended && !self.locations.contains_key(&key))
                     .then_some("Pane unavailable"),
                 summary,
+                newer_prompt: (has_briefing && r.prompt_at > r.briefing_at).then_some(&r.prompt),
                 next,
                 age: &age,
                 milestones: &milestones,
             };
-            ui.push_id(&key, |ui| self.row(ui, &row, source));
-            if self.expanded.as_deref() == Some(&key) && has_briefing && r.prompt_at > r.briefing_at
-            {
-                ui.label(
-                    egui::RichText::new("Latest prompt (hook excerpt)")
-                        .small()
-                        .color(chrome_muted()),
-                );
-                ui.add(egui::Label::new(&r.prompt).wrap());
-                ui.separator();
+            let background = r
+                .background
+                .as_ref()
+                .filter(|b| b.tasks > 0 && r.state != State::Ended)
+                .map(|b| (b, r.background_at));
+            let response = ui.push_id(&key, |ui| {
+                self.row(ui, &row, source, prompt_only, background)
+            });
+            if reveal.as_deref() == Some(&key) {
+                response.inner.scroll_to_me(None);
+                self.reveal_focus = false;
             }
         }
+        // Do not keep pulling the scroll position toward a filtered-out or missing session.
+        self.reveal_focus = false;
     }
 
     fn matches_live(&self, record: &potty::agent::Record, filter: Filter) -> bool {
@@ -566,186 +625,242 @@ impl Overview {
             && live_matches(record.state, filter)
     }
 
-    fn row(&mut self, ui: &mut egui::Ui, session: &SampleSession, source: &str) {
+    fn row(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &SampleSession,
+        source: &str,
+        prompt_only: bool,
+        background_tasks: Option<(&potty::agent::Background, u64)>,
+    ) -> egui::Response {
         let expanded = self.expanded.as_deref() == Some(session.id);
+        let linked = self.locations.get(session.id).copied();
+        let focused = linked.is_some() && linked == self.focused_pane;
         let background = ui.painter().add(egui::Shape::Noop);
-        let row = egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(8, 9))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 3.0;
-                ui.spacing_mut().interact_size.y = ui.text_style_height(&egui::TextStyle::Body);
-                ui.horizontal(|ui| {
-                    let status = if session.availability.is_some() {
-                        format!("Last: {}", session.state.label().to_lowercase())
-                    } else {
-                        session.state.label().to_owned()
-                    };
-                    let status_width = ui.fonts_mut(|fonts| {
-                        fonts
-                            .layout_no_wrap(
-                                status.clone(),
-                                egui::TextStyle::Small.resolve(ui.style()),
-                                session.state.color(),
-                            )
-                            .size()
-                            .x
-                    });
-                    let title_width = (ui.available_width() - status_width - 30.0).max(30.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(title_width, ui.text_style_height(&egui::TextStyle::Body)),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(session.title).strong())
-                                    .truncate(),
-                            )
-                        },
-                    )
-                    .inner
-                    .on_hover_text(session.title);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(if expanded { "v" } else { ">" });
-                        ui.label(
-                            egui::RichText::new(status)
-                                .small()
-                                .color(session.state.color()),
-                        );
-                    });
-                });
-                let location = format!("{} | {} | {}", session.tool, session.host, session.cwd);
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&location).small().color(chrome_muted()))
-                        .truncate(),
-                )
-                .on_hover_text(location);
-                ui.add(egui::Label::new(session.summary).truncate())
-                    .on_hover_text(session.summary);
-                let next = format!(
-                    "{}: {}",
-                    if session.state == WorkState::NeedsYou {
-                        "Needs you"
-                    } else {
-                        "Next"
-                    },
-                    session.next
-                );
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&next).color(
-                        if session.state == WorkState::NeedsYou {
-                            chrome_warn()
+        let builder = egui::UiBuilder::new().sense(egui::Sense::click());
+        let item = ui.scope_builder(builder, |ui| {
+            let row = egui::Frame::NONE
+                .inner_margin(egui::Margin::symmetric(8, 9))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.spacing_mut().interact_size.y = ui.text_style_height(&egui::TextStyle::Body);
+                    ui.horizontal(|ui| {
+                        let status = if session.availability.is_some() {
+                            format!("Last: {}", session.state.label().to_lowercase())
                         } else {
-                            chrome_muted()
-                        },
-                    ))
-                    .truncate(),
-                )
-                .on_hover_text(next);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{source} | {}", session.age))
-                            .small()
-                            .color(chrome_muted()),
-                    );
-                    if let Some(availability) = session.availability {
-                        ui.label(
-                            egui::RichText::new(availability)
-                                .small()
-                                .color(chrome_error()),
-                        );
-                    } else if session.state == WorkState::Finished {
-                        ui.label(
-                            egui::RichText::new("Unreviewed")
-                                .small()
-                                .color(chrome_warn()),
-                        );
+                            session.state.label().to_owned()
+                        };
+                        let status_width = ui.fonts_mut(|fonts| {
+                            fonts
+                                .layout_no_wrap(
+                                    status.clone(),
+                                    egui::TextStyle::Small.resolve(ui.style()),
+                                    session.state.color(),
+                                )
+                                .size()
+                                .x
+                        });
+                        let title_width = (ui.available_width() - status_width - 30.0).max(30.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(title_width, ui.text_style_height(&egui::TextStyle::Body)),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(session.title).strong())
+                                        .truncate(),
+                                )
+                            },
+                        )
+                        .inner
+                        .on_hover_text(session.title);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(if expanded { "v" } else { ">" });
+                            ui.label(
+                                egui::RichText::new(status)
+                                    .small()
+                                    .color(session.state.color()),
+                            );
+                        });
+                    });
+                    let location = format!("{} | {} | {}", session.tool, session.host, session.cwd);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&location).small().color(chrome_muted()))
+                            .truncate(),
+                    )
+                    .on_hover_text(location);
+                    if prompt_only {
+                        prompt_excerpt(ui, session.summary);
+                    } else {
+                        ui.add(egui::Label::new(session.summary).truncate())
+                            .on_hover_text(session.summary);
                     }
+                    let next = format!(
+                        "{}: {}",
+                        if session.state == WorkState::NeedsYou {
+                            "Needs you"
+                        } else {
+                            "Next"
+                        },
+                        session.next
+                    );
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&next).color(
+                            if session.state == WorkState::NeedsYou {
+                                chrome_warn()
+                            } else {
+                                chrome_muted()
+                            },
+                        ))
+                        .truncate(),
+                    )
+                    .on_hover_text(next);
+                    if let Some((background, at)) = background_tasks {
+                        let label = format!(
+                            "Background: {} {}{}",
+                            background.tasks,
+                            if background.tasks == 1 { "task" } else { "tasks" },
+                            if background.monitors > 0 {
+                                format!(" ({} {})", background.monitors,
+                                    if background.monitors == 1 { "monitor" } else { "monitors" })
+                            } else { String::new() },
+                        );
+                        ui.label(egui::RichText::new(label).small().color(crate::chrome_accent()))
+                            .on_hover_text(format!(
+                                "Last reported at turn end, {}m ago. Refreshed on the next turn end; not a live process check.",
+                                potty::agent::now().saturating_sub(at) / 60_000_000_000,
+                            ));
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{source} | {}", session.age))
+                                .small()
+                                .color(chrome_muted()),
+                        );
+                        if let Some(availability) = session.availability {
+                            ui.label(
+                                egui::RichText::new(availability)
+                                    .small()
+                                    .color(chrome_error()),
+                            );
+                        } else if session.state == WorkState::Finished {
+                            ui.label(
+                                egui::RichText::new("Unreviewed")
+                                    .small()
+                                    .color(chrome_warn()),
+                            );
+                        }
+                    });
                 });
-            });
-        let response = ui
-            .interact(
-                row.response.rect,
-                ui.id().with("expand"),
-                egui::Sense::click(),
-            )
+            if session.state == WorkState::NeedsYou {
+                let rect = row.response.rect;
+                ui.painter().line_segment(
+                    [
+                        rect.left_top() + egui::vec2(0.0, 9.0),
+                        rect.left_bottom() - egui::vec2(0.0, 9.0),
+                    ],
+                    egui::Stroke::new(2.0, chrome_warn()),
+                );
+            }
+            if expanded {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(8, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(source)
+                                .small()
+                                .strong()
+                                .color(chrome_muted()),
+                        );
+                        if !prompt_only {
+                            ui.add(egui::Label::new(session.summary).wrap());
+                        }
+                        ui.add(egui::Label::new(session.next).wrap());
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("Milestones")
+                                .small()
+                                .strong()
+                                .color(chrome_muted()),
+                        );
+                        for milestone in session.milestones {
+                            ui.add(egui::Label::new(format!("- {milestone}")).wrap());
+                        }
+                        if let Some(prompt) = session.newer_prompt {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("Latest prompt (hook excerpt)")
+                                    .small()
+                                    .color(chrome_muted()),
+                            );
+                            prompt_excerpt(ui, prompt);
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Dismiss").clicked() {
+                                if self.demo {
+                                    self.dismissed.insert(session.id.to_owned());
+                                } else if let Some(record) = self.store.records.get_mut(session.id) {
+                                    record.dismissed = record.revision();
+                                    self.actions.push(OverviewAction::Dismiss(record.clone()));
+                                }
+                                self.expanded = None;
+                            }
+                        });
+                    });
+            }
+        });
+        let response = item
+            .response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(if expanded {
+            .on_hover_text(if linked.is_some() {
+                "Switch to pane"
+            } else if expanded {
                 "Collapse briefing"
             } else {
                 "Expand briefing and milestones"
             });
-        if response.hovered() || expanded {
-            ui.painter().set(
-                background,
-                egui::Shape::rect_filled(row.response.rect, 0, chrome_hover()),
-            );
-        }
-        if session.state == WorkState::NeedsYou {
-            let rect = row.response.rect;
-            ui.painter().line_segment(
-                [
-                    rect.left_top() + egui::vec2(0.0, 9.0),
-                    rect.left_bottom() - egui::vec2(0.0, 9.0),
-                ],
-                egui::Stroke::new(2.0, chrome_warn()),
-            );
-        }
         if response.clicked() {
-            self.expanded = if expanded {
+            if linked.is_some() {
+                self.actions
+                    .push(OverviewAction::Open(session.id.to_owned()));
+            }
+            self.expanded = if expanded && (focused || linked.is_none()) {
                 None
             } else {
                 Some(session.id.to_owned())
             };
         }
-        if expanded {
-            egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(8, 8))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(source)
-                            .small()
-                            .strong()
-                            .color(chrome_muted()),
-                    );
-                    ui.add(egui::Label::new(session.summary).wrap());
-                    ui.add(egui::Label::new(session.next).wrap());
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("Milestones")
-                            .small()
-                            .strong()
-                            .color(chrome_muted()),
-                    );
-                    for milestone in session.milestones {
-                        ui.add(egui::Label::new(format!("- {milestone}")).wrap());
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(
-                                self.locations.contains_key(session.id),
-                                egui::Button::new("Open pane"),
-                            )
-                            .on_disabled_hover_text("No available linked pane")
-                            .clicked()
-                        {
-                            self.actions
-                                .push(OverviewAction::Open(session.id.to_owned()));
-                        }
-                        if ui.button("Dismiss").clicked() {
-                            if self.demo {
-                                self.dismissed.insert(session.id.to_owned());
-                            } else if let Some(record) = self.store.records.get_mut(session.id) {
-                                record.dismissed = record.revision();
-                                self.actions.push(OverviewAction::Dismiss(record.clone()));
-                            }
-                            self.expanded = None;
-                        }
-                    });
-                });
+        let item_rect = response.rect;
+        if response.hovered() || focused {
+            ui.painter().set(
+                background,
+                egui::Shape::rect_filled(item_rect, 0, chrome_hover()),
+            );
+        }
+        if focused {
+            ui.painter()
+                .rect_stroke(item_rect, 0, active_item_stroke(), egui::StrokeKind::Inside);
         }
         ui.separator();
+        response
     }
+}
+
+fn active_item_stroke() -> egui::Stroke {
+    egui::Stroke::new(1.0, chrome_hover().lerp_to_gamma(chrome_muted(), 0.10))
+}
+
+fn prompt_excerpt(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let mut job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        chrome_text(),
+        ui.available_width(),
+    );
+    job.wrap.max_rows = 4;
+    job.wrap.break_anywhere = true;
+    ui.add(egui::Label::new(job).wrap())
 }
 
 fn live_matches(state: potty::agent::State, filter: Filter) -> bool {
@@ -759,6 +874,272 @@ fn live_matches(state: potty::agent::State, filter: Filter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_session(session: &str, pane: u64) -> potty::agent::Record {
+        potty::agent::hook(
+            potty::notify::Tool::Claude,
+            &serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":session,
+                "prompt":format!("Task {session}")}),
+            "local".into(),
+            "host".into(),
+            Some(pane),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sessions_group_by_resolved_pane_without_merging_identities() {
+        let mut overview = Overview::live();
+        for (session, pane) in [("a", 1), ("b", 2), ("c", 1)] {
+            let mut record = live_session(session, pane);
+            if session == "c" {
+                record.tool = potty::notify::Tool::Codex;
+                record.origin = "remote".into();
+                record.pane = Some(90);
+            }
+            overview.locations.insert(record.key(), pane);
+            overview.store.merge(record);
+        }
+        let order = || {
+            overview
+                .sorted_records()
+                .into_iter()
+                .map(|r| r.session)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(), ["a", "c", "b"]);
+        assert_eq!(overview.store.records.len(), 3);
+        overview.locations.clear();
+        let records = overview.sorted_records();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.session.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn prompt_excerpts_never_exceed_four_wrapped_lines() {
+        for width in [120.0, 280.0, 500.0] {
+            for font_size in [13.0, 22.0] {
+                let ctx = egui::Context::default();
+                crate::apply_chrome_style(&ctx, font_size);
+                for text in [
+                    "long pasted text ".repeat(100),
+                    "a\nb\nc\nd\ne\nf".into(),
+                    "x".repeat(1600),
+                ] {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 900.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                prompt_excerpt(ui, &text);
+                            });
+                        },
+                    );
+                    let galley = output
+                        .shapes
+                        .iter()
+                        .find_map(|s| match &s.shape {
+                            egui::Shape::Text(t) => Some(&t.galley),
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(galley.rows.len(), 4);
+                    assert!(galley.elided);
+                    assert!(galley.size().x <= width);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn active_outline_is_subtle_and_contains_expanded_details() {
+        let stroke = active_item_stroke();
+        for (border, fill) in stroke.color.to_array()[..3]
+            .iter()
+            .zip(&chrome_hover().to_array()[..3])
+        {
+            assert!(*border > *fill && *border - *fill <= 12);
+        }
+        let ctx = egui::Context::default();
+        crate::apply_chrome_style(&ctx, 13.0);
+        let mut overview = Overview::live();
+        overview.open = true;
+        let mut record = live_session("active", 1);
+        record.briefing = Some(potty::agent::Briefing {
+            title: "Active task".into(),
+            summary: "Expanded summary".into(),
+            next: "Next action".into(),
+            milestones: vec!["Completed step".into()],
+        });
+        record.briefing_at = record.prompt_at - 1;
+        let key = record.key();
+        overview.locations.insert(key.clone(), 1);
+        overview.store.merge(record);
+        overview.sync_focus(1);
+        let mut collapsed_height = 0.0;
+        for expanded in [false, true] {
+            overview.expanded = expanded.then(|| key.clone());
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(420.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    overview.show(ctx);
+                },
+            );
+            let outline = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.stroke == stroke => Some(r.rect),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Rect(r) if r.rect == outline && r.fill == chrome_hover())));
+            if expanded {
+                assert!(outline.height() > collapsed_height);
+                for label in [
+                    "Active task",
+                    "Expanded summary",
+                    "- Completed step",
+                    "Latest prompt (hook excerpt)",
+                    "Task active",
+                    "Dismiss",
+                ] {
+                    let text_rect = output
+                        .shapes
+                        .iter()
+                        .find_map(|s| match &s.shape {
+                            egui::Shape::Text(t) if t.galley.job.text == label => {
+                                Some(t.visual_bounding_rect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing {label}"));
+                    assert!(outline.contains_rect(text_rect), "outline excludes {label}");
+                }
+            } else {
+                collapsed_height = outline.height();
+            }
+        }
+        overview.sync_focus(999);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                overview.show(ctx);
+            },
+        );
+        assert_eq!(overview.expanded.as_deref(), Some(key.as_str()));
+        let title = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Active task" => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape,
+            egui::Shape::Rect(r) if r.stroke == stroke || (r.fill == chrome_hover() && r.rect.contains(title)))),
+            "an expanded item must lose its active styling when focus moves to an unrelated pane");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn pane_focus_highlights_and_reveals_rows_without_continuous_scroll_requests() {
+        let ctx = egui::Context::default();
+        crate::apply_chrome_style(&ctx, 13.0);
+        let mut overview = Overview::live();
+        overview.open = true;
+        for pane in 1..=20 {
+            let record = live_session(&format!("{pane:02}"), pane);
+            overview.locations.insert(record.key(), pane);
+            overview.store.merge(record);
+        }
+        let mut time = 0.0;
+        let mut frame = |overview: &mut Overview| {
+            time += 0.1;
+            ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    overview.show(ctx);
+                },
+            )
+        };
+        let visible = |output: &egui::FullOutput, title: &str| {
+            output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.job.text == title && s.clip_rect.contains(t.visual_bounding_rect().center())))
+        };
+        overview.sync_focus(1);
+        for _ in 0..4 {
+            frame(&mut overview);
+        }
+        assert!(visible(&frame(&mut overview), "Task 01"));
+        overview.sync_focus(20);
+        assert!(overview.reveal_focus);
+        for _ in 0..6 {
+            frame(&mut overview);
+        }
+        let output = frame(&mut overview);
+        assert!(visible(&output, "Task 20"));
+        assert!(!visible(&output, "Task 01"));
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+            egui::Shape::Rect(r) if r.stroke == active_item_stroke() && s.clip_rect.intersects(r.rect))));
+        overview.sync_focus(20);
+        assert!(
+            !overview.reveal_focus,
+            "ordinary repaint must not reset manual scrolling"
+        );
+        overview.sync_focus(1);
+        for _ in 0..6 {
+            frame(&mut overview);
+        }
+        assert!(visible(&frame(&mut overview), "Task 01"));
+        overview.open = false;
+        frame(&mut overview);
+        overview.sync_focus(20);
+        frame(&mut overview);
+        assert!(
+            overview.reveal_focus,
+            "hidden panel must retain the focus request"
+        );
+        overview.open = true;
+        for _ in 0..6 {
+            frame(&mut overview);
+        }
+        assert!(visible(&frame(&mut overview), "Task 20"));
+    }
 
     #[test]
     fn overview_button_tracks_current_sessions_independently_of_filters() {
@@ -962,8 +1343,27 @@ mod tests {
         frame(&ctx, &mut overview, vec![]);
         click(&ctx, &mut overview, "Review transport");
         assert_eq!(overview.expanded.as_deref(), Some(key.as_str()));
-        click(&ctx, &mut overview, "Open pane");
         assert!(matches!(overview.actions.pop(), Some(OverviewAction::Open(k)) if k == key));
+
+        let mut stopped = record.clone();
+        stopped.state = potty::agent::State::ResponseReady;
+        stopped.state_at += 1;
+        stopped.background = Some(potty::agent::Background {
+            tasks: 2,
+            monitors: 1,
+        });
+        stopped.background_at = stopped.state_at;
+        overview.store.merge(stopped);
+        let output = frame(&ctx, &mut overview, vec![]);
+        for label in ["Response ready", "Background: 2 tasks (1 monitor)"] {
+            assert!(
+                output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(t) if t.galley.job.text == label)),
+                "missing {label}"
+            );
+        }
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape,
+            egui::Shape::Text(t) if t.galley.job.text == "Open pane")));
 
         let mut briefing = record.clone();
         briefing.briefing = Some(potty::agent::Briefing {
@@ -976,8 +1376,37 @@ mod tests {
         let output = frame(&ctx, &mut overview, vec![]);
         assert!(output.shapes.iter().any(|s| matches!(&s.shape,
             egui::Shape::Text(t) if t.galley.job.text.contains("older than prompt"))));
+        for label in ["Old task", "Milestones", "Latest prompt (hook excerpt)"] {
+            overview.sync_focus(999);
+            click(&ctx, &mut overview, label);
+            assert!(matches!(overview.actions.pop(), Some(OverviewAction::Open(k)) if k == key));
+            assert_eq!(
+                overview.expanded.as_deref(),
+                Some(key.as_str()),
+                "focusing an inactive expanded item must preserve its details"
+            );
+            overview.sync_focus(1);
+            click(&ctx, &mut overview, label);
+            assert!(matches!(overview.actions.pop(), Some(OverviewAction::Open(k)) if k == key));
+            assert!(overview.actions.is_empty());
+            assert!(
+                overview.expanded.is_none(),
+                "expanded content must toggle just like the header"
+            );
+            click(&ctx, &mut overview, "Old task");
+            assert!(matches!(overview.actions.pop(), Some(OverviewAction::Open(k)) if k == key));
+            assert_eq!(overview.expanded.as_deref(), Some(key.as_str()));
+        }
         click(&ctx, &mut overview, "Dismiss");
         assert!(matches!(overview.actions.pop(), Some(OverviewAction::Dismiss(r)) if !r.visible()));
+        assert!(
+            overview.actions.is_empty(),
+            "dismiss must not also activate the item"
+        );
+        assert!(
+            overview.expanded.is_none(),
+            "dismiss must not re-expand the item"
+        );
         overview.store.merge(record);
         assert!(
             !overview.store.records[&key].visible(),

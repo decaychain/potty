@@ -254,6 +254,8 @@ impl Relay {
         }
         let mut update = record.clone();
         update.state_at = 0;
+        update.background = None;
+        update.background_at = 0;
         update.prompt.clear();
         update.prompt_at = 0;
         update.response.clear();

@@ -145,6 +145,7 @@ pub fn run() -> bool {
             let mut record = agent::hook(tool, &identity, origin, super::hostname(), pane)
                 .ok_or("invalid session identity")?;
             record.state_at = 0;
+            record.background_at = 0;
             record.briefing_at = agent::now();
             record.briefing = Some(b);
             record

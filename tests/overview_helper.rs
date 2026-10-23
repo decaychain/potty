@@ -106,17 +106,28 @@ fn both_provider_hooks_and_reports_use_the_same_identity() {
             report.state_at, 0,
             "briefings must not overwrite hook status"
         );
+        assert_eq!(
+            report.background_at, 0,
+            "briefings must not clear background reports"
+        );
         assert_eq!(report.briefing.unwrap().title, "SSH restore");
 
         let result = invoke(
             tool,
             &socket,
             &["--overview-hook"],
-            serde_json::json!({"hook_event_name":"Stop", "session_id":"root-session", "last_assistant_message":"Please review"}),
+            serde_json::json!({"hook_event_name":"Stop", "session_id":"root-session", "last_assistant_message":"Please review",
+                "background_tasks":[{"id":"ci", "type":"shell", "status":"running"}]}),
         );
         assert!(result.status.success());
         assert!(result.stdout.is_empty());
-        assert_eq!(read().state, State::ResponseReady);
+        let stopped = read();
+        assert_eq!(stopped.state, State::ResponseReady);
+        if tool == "claude" {
+            assert_eq!(stopped.background.unwrap().tasks, 1);
+        } else {
+            assert!(stopped.background.is_none());
+        }
 
         let result = invoke(
             tool,
