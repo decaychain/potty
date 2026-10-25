@@ -4,9 +4,11 @@
 //! live here so `potty`, `potty-session`, and `potty-notify` can share them without drift.
 
 pub mod agent;
+pub mod contexts;
 pub mod notify;
 pub mod osc133;
 pub mod proto;
 pub mod remote;
+pub mod settings;
 pub mod snapshot;
 pub mod term_env;

@@ -16,6 +16,8 @@ use crate::gridr::{BASE16, Palette, default_ansi};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Saved/Recent overview views and local context persistence; live overview stays available.
+    pub saved_contexts: bool,
     /// None → generic monospace; otherwise a specific family name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
@@ -224,6 +226,7 @@ pub const COLOR_PRESETS: &[ColorPreset] = &[
 impl Default for Config {
     fn default() -> Self {
         Self {
+            saved_contexts: true,
             font_family: None,
             shell: None,
             font_size: 15.0,
@@ -287,12 +290,19 @@ impl Default for Colors {
 }
 
 impl Config {
-    /// Load from disk, falling back to defaults on missing file or parse error.
+    /// Fall back to defaults, but don't enable history on unreadable or invalid configuration.
     pub fn load(path: &PathBuf) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).unwrap_or_else(|_| Self {
+                saved_contexts: false,
+                ..Self::default()
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(_) => Self {
+                saved_contexts: false,
+                ..Self::default()
+            },
+        }
     }
 
     /// Write to disk (creating the parent dir). Best-effort.
@@ -366,16 +376,7 @@ impl Config {
 /// Config file location: `%APPDATA%\potty\potty.toml` on Windows, else
 /// `$XDG_CONFIG_HOME/potty/potty.toml` falling back to `~/.config/...`.
 pub fn config_path() -> PathBuf {
-    #[cfg(windows)]
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(not(windows))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("potty").join("potty.toml")
+    potty::settings::config_path()
 }
 
 pub(crate) fn parse_hex(s: &str) -> Option<Rgb> {
@@ -393,6 +394,42 @@ pub(crate) fn parse_hex(s: &str) -> Option<Rgb> {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn saved_contexts_are_default_on_and_round_trip_when_disabled() {
+        assert!(Config::default().saved_contexts);
+        assert!(
+            toml::from_str::<Config>("font_size = 14")
+                .unwrap()
+                .saved_contexts
+        );
+        let cfg: Config = toml::from_str("saved_contexts = false").unwrap();
+        assert!(!cfg.saved_contexts);
+        assert!(
+            !toml::from_str::<Config>(&toml::to_string(&cfg).unwrap())
+                .unwrap()
+                .saved_contexts
+        );
+    }
+
+    #[test]
+    fn invalid_config_does_not_silently_enable_persistence() {
+        let path = std::env::temp_dir().join(format!(
+            "potty-config-{}-{}.toml",
+            std::process::id(),
+            potty::agent::now()
+        ));
+        assert!(Config::load(&path).saved_contexts);
+        for text in [
+            "saved_contexts = false",
+            "saved_contexts = 'false'",
+            "[broken",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(!Config::load(&path).saved_contexts);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn connection_profile_env_deserializes_from_toml() {

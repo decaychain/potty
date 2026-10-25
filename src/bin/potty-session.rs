@@ -157,6 +157,7 @@ mod imp {
         /// Attention notes raised while detached, replayed on the next attach.
         pending_notes: Mutex<HashMap<(String, String), feed::Note>>,
         overview: Mutex<potty::agent::Store>,
+        contexts: Mutex<Option<Result<potty::contexts::Repository, String>>>,
         overview_origin: String,
         notify_sock: PathBuf,
     }
@@ -330,6 +331,28 @@ mod imp {
 
     /// Replay stored notes to the client that just attached.
     fn replay_pending_notes(session: &Session, client_id: u64) {
+        if let Some(contexts) = &mut *session.contexts.lock().unwrap() {
+            let message = match contexts {
+                Ok(repo) => match repo.refresh() {
+                    Ok(()) => potty::contexts::Message::Snapshot {
+                        snapshot: repo.snapshot.clone(),
+                    },
+                    Err(err) => potty::contexts::Message::Error {
+                        message: err.to_string(),
+                    },
+                },
+                Err(err) => potty::contexts::Message::Error {
+                    message: err.clone(),
+                },
+            };
+            send_to(
+                session,
+                client_id,
+                Frame::Control(Control::Notify {
+                    json: message.json(),
+                }),
+            );
+        }
         {
             let store = session.overview.lock().unwrap();
             for record in store.records.values() {
@@ -421,6 +444,76 @@ mod imp {
                 }),
                 None,
             );
+            let mut contexts = session.contexts.lock().unwrap();
+            if let Some(Ok(repo)) = &mut *contexts {
+                let message = match repo.observe(record) {
+                    Ok(true) => Some(potty::contexts::Message::Snapshot {
+                        snapshot: repo.snapshot.clone(),
+                    }),
+                    Ok(false) => None,
+                    Err(err) => Some(potty::contexts::Message::Error {
+                        message: err.to_string(),
+                    }),
+                };
+                if let Some(message) = message {
+                    broadcast(
+                        session,
+                        Frame::Control(Control::Notify {
+                            json: message.json(),
+                        }),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    fn context_request(session: &Session, client: u64, message: potty::contexts::Message) {
+        let mut contexts = session.contexts.lock().unwrap();
+        let result = match &mut *contexts {
+            Some(Ok(repo)) => repo.apply(&message).map_err(|e| e.to_string()),
+            Some(Err(err)) => Err(err.clone()),
+            None if matches!(message, potty::contexts::Message::Refresh) => return,
+            None => Err("Saved contexts are disabled on this host".into()),
+        };
+        match result {
+            Ok(()) => {
+                if let Some(Ok(repo)) = &*contexts {
+                    let message = potty::contexts::Message::Snapshot {
+                        snapshot: repo.snapshot.clone(),
+                    };
+                    broadcast(
+                        session,
+                        Frame::Control(Control::Notify {
+                            json: message.json(),
+                        }),
+                        None,
+                    );
+                }
+            }
+            Err(message) => {
+                if let Some(Ok(repo)) = &mut *contexts
+                    && repo.refresh().is_ok()
+                {
+                    send_to(
+                        session,
+                        client,
+                        Frame::Control(Control::Notify {
+                            json: potty::contexts::Message::Snapshot {
+                                snapshot: repo.snapshot.clone(),
+                            }
+                            .json(),
+                        }),
+                    );
+                }
+                send_to(
+                    session,
+                    client,
+                    Frame::Control(Control::Notify {
+                        json: potty::contexts::Message::Error { message }.json(),
+                    }),
+                );
+            }
         }
     }
 
@@ -687,6 +780,64 @@ mod imp {
                     }
                 }
                 Frame::Control(Control::Notify { json }) => {
+                    if let Some(potty::contexts::Message::Open {
+                        owner,
+                        id,
+                        pane,
+                        cols,
+                        rows,
+                    }) = potty::contexts::Message::parse(&json)
+                    {
+                        if session.panes.lock().unwrap().contains_key(&pane) {
+                            continue;
+                        }
+                        let cwd = {
+                            let mut contexts = session.contexts.lock().unwrap();
+                            contexts
+                                .as_mut()
+                                .and_then(|r| r.as_mut().ok())
+                                .and_then(|repo| {
+                                    let cwd = (repo.snapshot.owner == owner)
+                                        .then(|| repo.snapshot.contexts.get(&id))
+                                        .flatten()
+                                        .and_then(|c| c.sessions.last())
+                                        .map(|r| PathBuf::from(&r.cwd))
+                                        .filter(|p| valid_cwd(p));
+                                    if cwd.is_some() {
+                                        repo.bind(&id, session.overview_origin.clone(), pane);
+                                    }
+                                    cwd
+                                })
+                        };
+                        if let Some(cwd) = cwd {
+                            take_focus(session, client_id);
+                            open_pane(session, client_id, pane, cols, rows, Some(cwd));
+                        } else {
+                            send_to(
+                                session,
+                                client_id,
+                                Frame::Control(Control::Notify {
+                                    json: potty::contexts::Message::Error {
+                                        message:
+                                            "Saved context or its directory is no longer available"
+                                                .into(),
+                                    }
+                                    .json(),
+                                }),
+                            );
+                            send_to(session, client_id, Frame::Control(Control::Exited { pane }));
+                        }
+                        continue;
+                    }
+                    if let Some(
+                        message @ (potty::contexts::Message::Edit { .. }
+                        | potty::contexts::Message::Forget { .. }
+                        | potty::contexts::Message::Refresh),
+                    ) = potty::contexts::Message::parse(&json)
+                    {
+                        context_request(session, client_id, message);
+                        continue;
+                    }
                     if let Some(record) = potty::agent::Message::parse(&json) {
                         handle_overview(session, record);
                         continue;
@@ -805,6 +956,19 @@ mod imp {
         }
     }
 
+    /// The remote host owns this policy; a client cannot change it for other clients.
+    fn context_repository() -> Option<Result<potty::contexts::Repository, String>> {
+        match potty::settings::saved_contexts_enabled(&potty::settings::config_path()) {
+            Ok(false) => None,
+            Ok(true) => {
+                Some(potty::contexts::Repository::open_default().map_err(|e| e.to_string()))
+            }
+            Err(err) => Some(Err(format!(
+                "Cannot read saved-context configuration: {err}"
+            ))),
+        }
+    }
+
     /// Daemon role: own the PTYs, keep accepting attaches, and persist across detaches.
     fn run_daemon(sock: PathBuf) {
         let _ = std::fs::remove_file(&sock);
@@ -828,6 +992,7 @@ mod imp {
             layout: Mutex::new(None),
             pending_notes: Mutex::new(HashMap::new()),
             overview: Mutex::new(potty::agent::Store::default()),
+            contexts: Mutex::new(context_repository()),
             overview_origin: format!("daemon-{}-{}", std::process::id(), potty::agent::now()),
             notify_sock,
         });
@@ -875,6 +1040,7 @@ mod imp {
             layout: Mutex::new(None),
             pending_notes: Mutex::new(HashMap::new()),
             overview: Mutex::new(potty::agent::Store::default()),
+            contexts: Mutex::new(None),
             overview_origin: format!("daemon-{}-{}", std::process::id(), potty::agent::now()),
             notify_sock: inline_notify_socket_path(),
         });

@@ -93,6 +93,193 @@ fn send_note(sock: &Path, session: &str, kind: Kind) {
 }
 
 #[test]
+fn disabled_saved_contexts_preserve_live_overview_and_do_not_touch_history() {
+    use potty::{
+        agent,
+        contexts::{Annotation, Message, Repository},
+    };
+    for existing in [false, true] {
+        let sock = std::env::temp_dir().join(format!("potty-no-history-{}.sock", tag()));
+        let config = sock.with_extension("config").join("potty/potty.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, "saved_contexts = false\n").unwrap();
+        let path = sock.with_extension("data").join("potty/contexts.json");
+        let record = agent::hook(Tool::Claude, &serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"live-only", "prompt":"Private task"}),
+            "socket".into(), "host".into(), Some(1)).unwrap();
+        let original = if existing {
+            let mut repo = Repository::open(path.clone()).unwrap();
+            repo.observe(&record).unwrap();
+            Some(std::fs::read(&path).unwrap())
+        } else {
+            None
+        };
+        let daemon = start_daemon(&sock);
+        let mut client = Client::connect(&sock);
+        client.send(Frame::Control(Control::Hello { version: 2 }));
+        client.send(Frame::Control(Control::Notify {
+            json: agent::Message::json(record),
+        }));
+        assert!(client.wait(|_, ctrl| ctrl.iter().any(|c| matches!(c, Control::Notify { json } if agent::Message::parse(json).is_some_and(|r| r.session == "live-only")))));
+        client.send(Frame::Control(Control::Notify {
+            json: Message::Refresh.json(),
+        }));
+        client.send(Frame::Control(Control::Notify {
+            json: Message::Edit {
+                owner: "host".into(),
+                id: "work".into(),
+                expected: 0,
+                annotation: Annotation {
+                    kept: true,
+                    ..Default::default()
+                },
+            }
+            .json(),
+        }));
+        assert!(client.wait(|_, ctrl| ctrl.iter().any(|c| matches!(c, Control::Notify { json } if matches!(Message::parse(json), Some(Message::Error { .. }))))));
+        assert!(!client.collected.lock().unwrap().1.iter().any(|c| matches!(c, Control::Notify { json } if matches!(Message::parse(json), Some(Message::Snapshot { .. })))));
+        if let Some(original) = original {
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        } else {
+            assert!(!sock.with_extension("data").exists());
+        }
+        client.disconnect();
+        cleanup(daemon, &sock);
+    }
+}
+
+#[test]
+fn saved_contexts_survive_daemon_restart_and_open_a_shell_without_running_an_agent() {
+    use potty::{
+        agent,
+        contexts::{Annotation, Message, Snapshot},
+    };
+    fn snapshot(ctrl: &[Control]) -> Option<Snapshot> {
+        ctrl.iter().rev().find_map(|c| match c {
+            Control::Notify { json } => match Message::parse(json) {
+                Some(Message::Snapshot { snapshot }) => Some(snapshot),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+    let sock = std::env::temp_dir().join(format!("potty-contexts-{}.sock", tag()));
+    let cwd = sock.with_extension("directory with spaces");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut daemon = start_daemon(&sock);
+    let mut c1 = Client::connect(&sock);
+    c1.send(Frame::Control(Control::Hello { version: 2 }));
+    let mut record = agent::hook(Tool::Claude, &serde_json::json!({
+        "hook_event_name":"UserPromptSubmit", "session_id":"persistent-agent", "prompt":"Dashboard", "cwd":cwd
+    }), "old-socket".into(), "host".into(), Some(1)).unwrap();
+    record.briefing = Some(agent::Briefing {
+        title: "Dashboard".into(),
+        summary: "Ready for review".into(),
+        ..Default::default()
+    });
+    record.briefing_at = agent::now();
+    c1.send(Frame::Control(Control::Notify {
+        json: agent::Message::json(record),
+    }));
+    assert!(c1.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| s.contexts.len() == 1)));
+    let saved = snapshot(&c1.collected.lock().unwrap().1).unwrap();
+    let owner = saved.owner;
+    let id = saved.contexts.keys().next().unwrap().clone();
+    let mut c2 = Client::connect(&sock);
+    c2.send(Frame::Control(Control::Hello { version: 2 }));
+    c1.send(Frame::Control(Control::Notify {
+        json: Message::Edit {
+            owner: owner.clone(),
+            id: id.clone(),
+            expected: 0,
+            annotation: Annotation {
+                name: "PTT dashboard".into(),
+                notes: "Review the API contract".into(),
+                links: vec!["https://example.com/issue/1".into()],
+                kept: false,
+            },
+        }
+        .json(),
+    }));
+    assert!(c2.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| s.contexts[&id].annotation.kept)));
+    // Stale edits are rejected; no other client's annotation is overwritten.
+    c2.send(Frame::Control(Control::Notify {
+        json: Message::Edit {
+            owner: owner.clone(),
+            id: id.clone(),
+            expected: 0,
+            annotation: Annotation::default(),
+        }
+        .json(),
+    }));
+    assert!(c2.wait(|_, ctrl| ctrl.iter().any(|c| matches!(c, Control::Notify { json } if matches!(Message::parse(json), Some(Message::Error { .. }))))));
+    c1.disconnect();
+    c2.disconnect();
+    assert!(wait_until(Duration::from_secs(5), || daemon
+        .try_wait()
+        .unwrap()
+        .is_some()));
+    let daemon = start_daemon(&sock);
+    let mut c = Client::connect(&sock);
+    c.send(Frame::Control(Control::Hello { version: 2 }));
+    assert!(c.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| s.contexts.contains_key(&id))));
+    let restored = snapshot(&c.collected.lock().unwrap().1).unwrap();
+    assert_eq!(restored.owner, owner);
+    assert_eq!(
+        restored.contexts[&id].annotation.notes,
+        "Review the API contract"
+    );
+    assert!(
+        restored.contexts[&id]
+            .sessions
+            .iter()
+            .all(|r| r.pane.is_none())
+    );
+    c.send(Frame::Control(Control::Notify {
+        json: Message::Open {
+            owner: owner.clone(),
+            id: id.clone(),
+            pane: 5,
+            cols: 100,
+            rows: 24,
+        }
+        .json(),
+    }));
+    assert!(c.wait(|_, ctrl| ctrl.contains(&Control::Opened { pane: 5 })));
+    c.send(Frame::Data {
+        pane: 5,
+        bytes: b"printf '__CTX_CWD__%s\\n' \"$PWD\"\r".to_vec(),
+    });
+    let marker = format!("__CTX_CWD__{}", cwd.display());
+    assert!(c.wait(|out, _| out.get(&5).is_some_and(|o| contains(o, marker.as_bytes()))));
+    let next = agent::hook(
+        Tool::Codex,
+        &serde_json::json!({"hook_event_name":"SessionStart", "session_id":"new-agent", "cwd":cwd}),
+        "new-socket".into(),
+        "host".into(),
+        Some(5),
+    )
+    .unwrap();
+    c.send(Frame::Control(Control::Notify {
+        json: agent::Message::json(next),
+    }));
+    assert!(c.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| {
+        s.contexts[&id].sessions.len() == 1 && s.contexts[&id].sessions[0].session == "new-agent"
+    })));
+    c.send(Frame::Control(Control::Notify {
+        json: Message::Forget {
+            owner,
+            id: id.clone(),
+            expected: restored.contexts[&id].edited,
+        }
+        .json(),
+    }));
+    assert!(c.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| !s.contexts.contains_key(&id))));
+    c.disconnect();
+    cleanup(daemon, &sock);
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
+#[test]
 fn overview_survives_detach_and_dismissal_is_replayed_to_all_clients() {
     use potty::agent::{self, Briefing, Message};
     let sock = std::env::temp_dir().join(format!("potty-overview-{}.sock", tag()));
@@ -180,6 +367,8 @@ fn overview_survives_detach_and_dismissal_is_replayed_to_all_clients() {
 fn start_daemon(sock: &Path) -> Child {
     let _ = std::fs::remove_file(sock);
     let child = Command::new(env!("CARGO_BIN_EXE_potty-session"))
+        .env("XDG_DATA_HOME", sock.with_extension("data"))
+        .env("XDG_CONFIG_HOME", sock.with_extension("config"))
         .arg("--daemon")
         .arg(sock)
         .stdin(Stdio::null())
@@ -269,6 +458,8 @@ struct RelayClient {
 impl RelayClient {
     fn connect(sock: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_potty-session"))
+            .env("XDG_DATA_HOME", sock.with_extension("data"))
+            .env("XDG_CONFIG_HOME", sock.with_extension("config"))
             .env("POTTY_SESSION_SOCK", sock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1133,6 +1324,8 @@ fn pane_close_clears_pending_note_for_that_pane() {
 fn cleanup(mut daemon: Child, sock: &Path) {
     let _ = daemon.kill();
     let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(sock.with_extension("data"));
+    let _ = std::fs::remove_dir_all(sock.with_extension("config"));
     let _ = std::fs::remove_file(sock);
     let _ = std::fs::remove_file(notify_socket(sock));
 }

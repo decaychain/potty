@@ -177,7 +177,9 @@ fn session_cmd() -> String {
 
 fn persistent_session_cmd(sock: &Path) -> String {
     format!(
-        "POTTY_SESSION_SOCK={} {}",
+        "XDG_DATA_HOME={} XDG_CONFIG_HOME={} POTTY_SESSION_SOCK={} {}",
+        sock.with_extension("data").display(),
+        sock.with_extension("config").display(),
         sock.display(),
         env!("CARGO_BIN_EXE_potty-session")
     )

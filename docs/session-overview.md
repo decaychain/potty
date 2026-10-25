@@ -29,8 +29,8 @@ installer does not change sandbox, network, or hook-trust permissions.
 Start or resume the agent **inside a pane in the new Potty instance**. Restart an already-running
 agent after installing hooks; Codex may require approving the hooks in `/hooks`. Open the panel
 with the tab-bar Sessions button or menu item. Updates do not open the panel or steal focus.
-The tab-bar button hides when no undismissed, non-ended sessions remain, unless the panel is
-already open. Sessions stays available in the menu, including the pane's right-click menu,
+The tab-bar button hides when no undismissed, non-ended sessions or kept contexts remain, unless
+the panel is already open. Sessions stays available in the menu, including the pane's right-click menu,
 so an empty panel or session history can still be opened. Waiting agents count as current sessions.
 The default **Current** view excludes ended sessions. Enable **Show ended sessions** in the
 panel menu to inspect or dismiss history. A new agent session can use the same pane without
@@ -189,19 +189,95 @@ updates and dismissals to all attached clients. Dismissal hides the current revi
 new hook or briefing update may surface it again. A locally dismissed disconnected entry is
 reconciled with the daemon on reconnect. Pane navigation uses current remote-to-local routes.
 
-Records and dismissal watermarks are bounded to the 128 most recently updated sessions per
+Live records and dismissal watermarks are bounded to the 128 most recently updated sessions per
 store and live only in memory. Remote persistence lasts for the daemon's lifetime; local
 records last for the GUI's lifetime. Retention guarantees end on eviction. A missing pane or
 disconnected session remains dismissible and is marked unavailable, with its last known status.
 Acknowledging an attention notification does not delete a briefing, and opening a briefing's
 pane does not acknowledge notifications.
 
+### Saved contexts: first experiment
+
+Saved contexts are enabled by default. To disable them, set this **top-level** option in
+`$XDG_CONFIG_HOME/potty/potty.toml` (normally `~/.config/potty/potty.toml`), before any tables:
+
+```toml
+saved_contexts = false
+```
+
+The GUI hot-reloads this setting. Disabling it hides the history tabs and annotation controls,
+closes the annotation editor, clears cached history, and stops local history reads and writes.
+The live overview, agent hooks, and notifications continue working. Existing history files are
+not deleted; setting it back to `true` makes them available again. Missing options default to
+`true`; unreadable or malformed configuration does not silently enable persistence.
+
+Each remote host controls its own persistence using the same option in its own configuration
+file. `potty-session` reads it when the daemon starts; a local client's setting cannot disable
+storage for other clients of that host. Apply the remote option before starting the daemon.
+Do not stop a daemon with active work just to change the setting. When disabled remotely, live
+overview updates still work, but no saved-context store is opened, replayed, or modified.
+
+The overview has three views: **Current**, **Saved**, and **Recent**. Current keeps the live
+session list; Saved contains deliberately kept work; Recent lists contexts in activity order,
+including kept contexts,
+including sessions whose panes have closed. Saved and Recent can be searched by name, notes,
+links, host, directory, agent session ID, and briefing summary. Search only covers the local
+store and remote stores received during this Potty instance's lifetime.
+
+Expand an item to **Keep** it or **Edit notes**. The editor replaces the annotation display
+inline, with a name, notes, and one HTTP(S) link per line. Saving annotations keeps the context.
+User text is separate from agent briefings and cannot be overwritten by hook updates. A saved
+name also labels its associated live overview rows. Long notes scroll within the expanded item;
+collapsed rows remain compact. **Forget...** asks for confirmation before removing the durable
+record and its annotations. It does not delete the provider's conversation or stop a process;
+a new update from a still-running agent can create a fresh Recent record.
+
+Each pane context retains only its latest agent session, replacing the previous association and
+briefing without changing the context's name, notes, or links. Existing multi-session contexts
+are reduced to their last session when loaded. Provider session IDs
+identify resumed sessions within this host's store; socket paths and pane numbers are only
+temporary navigation bindings. Historical records never claim that a process is still running
+and never navigate using a pane number recovered from disk.
+
+When a context has a live pane, clicking it focuses that pane. Otherwise **Open shell** explicitly
+creates a new tab in its last recorded directory, locally or on an already-connected remote.
+Missing directories produce an error rather than silently choosing a different directory.
+This does not resume the agent, restore environment variables, or replay commands.
+The latest agent session and its working directory appear directly above the expanded item's
+action buttons; **Copy ID** and **Copy path** copy their full values, even when truncated on screen.
+Automatic agent resumption and automatic SSH connection are deliberately deferred.
+A reopened shell is tracked in the current client;
+once an agent publishes from it, it becomes the context's latest session.
+
+Each host owns one per-user store, `$XDG_DATA_HOME/potty/contexts.json`, falling back to
+`~/.local/share/potty/contexts.json`. Local Potty instances share the local file; remote
+`potty-session` daemons use the remote user's file and replay it on reconnect, even after a
+daemon restart. Remote history is not copied to local disk. Disconnected remote contexts remain
+readable in memory, but cannot be edited or reopened until that host reconnects. Update the remote
+**potty-session** for this feature; existing overview hooks and `potty-notify` need no changes.
+Older daemons keep the live overview but do not offer context editing.
+Replacing the binary does not upgrade an already-running daemon. Use a newly started daemon to
+try remote contexts; do not stop a daemon that still owns work you need to preserve.
+
+Storage uses a cross-process file lock and atomic replacement, with 0700 directories and 0600
+files on Unix. An edit carries an annotation revision; conflicting edits are rejected with the
+draft retained. Remote edits only show as saved after the daemon returns its updated record.
+Reopening the overview or selecting a view refreshes shared storage; live mirroring of annotations
+between separate local windows/remote daemons is not yet implemented. Clients attached to the
+same daemon receive changes immediately.
+
+Retention is bounded to 128 unkept contexts and 512 kept contexts, with one session snapshot
+per context and a 4 MiB file limit. Kept contexts are never automatically evicted.
+Limit, corruption, and write errors are shown in the panel.
+Routine tool-state changes do not rewrite the file; new prompts, responses, and briefings do.
+
 ### Privacy and experiment boundaries
 
 Installing the hooks opts into collecting up to 1600 characters from submitted prompts and
 final responses, along with session IDs, host, working directory, and agent-written reports.
-These can contain sensitive project information. Overview records stay in local process memory or the
-remote daemon and travel through the existing private socket/SSH path. The optional relay also
+These can contain sensitive project information. Live overview records travel through the existing
+private socket/SSH path. Context history now stores these excerpts and reports on the owning host's
+disk, together with user annotations, until forgotten or evicted as described above. The optional relay also
 temporarily stores queued briefing data on disk as described below. Potty does not call a
 separate model service, scrape terminals, read transcripts, dump environments, or send external telemetry.
 Hooks never request an additional continuation in the existing agent session.
@@ -220,8 +296,8 @@ are discarded on the next flush; there is no background expiry or global disk qu
 relay directories only after their sessions have stopped. A system temporary-file cleanup may
 also remove them; a later prompt hook recreates a missing outbox.
 
-This is not yet the entire proposal: cross-window mirroring of local overview rows, user-edited
-names, disk persistence, explicit task-completion/review tracking, and old-daemon capability
+This is not yet the entire proposal: cross-window mirroring of local overview rows,
+explicit task-completion/review tracking, and old-daemon capability
 indicators are deferred. Old daemons/clients ignore the new payload and remain usable, but do
 not provide live overview support. Subagent lifecycle events with an `agent_id` are ignored;
 provider events lacking subagent identity cannot be reliably separated from parent activity.

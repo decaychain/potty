@@ -2834,6 +2834,9 @@ struct App {
 
     overview: overview::Overview,
     overview_remote: HashMap<String, ConnId>,
+    contexts: Option<potty::contexts::Repository>,
+    context_remote: HashMap<String, ConnId>,
+    context_panes: HashMap<(String, String), PaneId>,
 
     /// Panes whose cached render is stale and must be re-prepared next frame (damage tracking).
     dirty: std::collections::HashSet<PaneId>,
@@ -3018,6 +3021,9 @@ impl App {
             shortcut_capture: None,
             overview: overview::Overview::live(),
             overview_remote: HashMap::new(),
+            contexts: None,
+            context_remote: HashMap::new(),
+            context_panes: HashMap::new(),
             dirty: std::collections::HashSet::new(),
             visible: std::collections::HashSet::new(),
             last_rect: HashMap::new(),
@@ -4119,6 +4125,20 @@ impl App {
                     c.restore_layout = Some(layout);
                 }
             }
+            // Uncover a requested saved-context shell only after the daemon confirms it opened.
+            Frame::Control(Control::Opened { pane }) => {
+                if let Some(local) = self
+                    .connections
+                    .get(&conn)
+                    .and_then(|c| c.routes.get(&pane))
+                    && self.context_panes.values().any(|p| p == local)
+                    && *local == self.focus()
+                    && self.overview.covers_terminal
+                {
+                    self.overview.open = false;
+                    self.request_redraw();
+                }
+            }
             // Our daemon-assigned client id.
             Frame::Control(Control::Welcome { client, .. }) => {
                 if let Some(c) = self.connections.get_mut(&conn) {
@@ -4186,6 +4206,23 @@ impl App {
                 }
             }
             Frame::Control(Control::Notify { json }) => {
+                if let Some(message) = potty::contexts::Message::parse(&json) {
+                    if !self.config.saved_contexts {
+                        return;
+                    }
+                    match message {
+                        potty::contexts::Message::Snapshot { snapshot } => {
+                            self.context_remote.insert(snapshot.owner.clone(), conn);
+                            self.overview.receive_snapshot(snapshot);
+                        }
+                        potty::contexts::Message::Error { message } => {
+                            self.overview.context_failed(message)
+                        }
+                        _ => {}
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 if let Some(record) = potty::agent::Message::parse(&json) {
                     if let Some(local) = self.overview.store.records.get(&record.key())
                         && local.dismissed > record.dismissed
@@ -4603,7 +4640,9 @@ impl App {
     /// Whether an egui text field (connect dialog or a text auth prompt) is capturing keyboard —
     /// if so, keys go to egui rather than the focused pane.
     fn text_input_active(&self) -> bool {
-        self.show_connect || matches!(self.auth_prompts.first(), Some(AuthPrompt::Text { .. }))
+        self.show_connect
+            || self.overview.text_input_active()
+            || matches!(self.auth_prompts.first(), Some(AuthPrompt::Text { .. }))
     }
 
     fn shortcut_action(&self, ev: &KeyEvent) -> Option<MenuAction> {
@@ -4847,9 +4886,13 @@ impl App {
     /// Apply a (possibly new) config: repaint the palette always; rebuild the font only when
     /// family/size changed (and then force a refit of every terminal, since the cell box moved).
     fn apply_config(&mut self, new: Config) {
+        let contexts_changed = new.saved_contexts != self.config.saved_contexts;
         let font_changed =
             new.font_family != self.config.font_family || new.font_size != self.config.font_size;
         self.config = new;
+        if contexts_changed {
+            self.configure_contexts();
+        }
         // Hot-reload the OSC 52 clipboard policy on every live terminal.
         for t in self.terms.values() {
             t.term
@@ -4891,6 +4934,29 @@ impl App {
             }
             state.window.request_redraw();
         }
+    }
+
+    fn configure_contexts(&mut self) {
+        self.overview
+            .set_contexts_enabled(self.config.saved_contexts);
+        if !self.config.saved_contexts {
+            self.contexts = None;
+            self.context_remote.clear();
+            self.context_panes.clear();
+            return;
+        }
+        if self.contexts.is_none() {
+            match potty::contexts::Repository::open_default() {
+                Ok(repo) => {
+                    self.overview.receive_snapshot(repo.snapshot.clone());
+                    self.contexts = Some(repo);
+                }
+                Err(err) => self.overview.context_failed(err.to_string()),
+            }
+        }
+        self.overview
+            .actions
+            .push(overview::OverviewAction::RefreshContexts);
     }
 
     fn set_font_family(&mut self, family: Option<String>) {
@@ -5561,7 +5627,44 @@ impl App {
         self.overview_remote
             .retain(|key, _| self.overview.store.records.contains_key(key));
         self.overview.locations.clear();
+        self.context_panes
+            .retain(|_, pane| self.workspace.tab_of(*pane).is_some());
+        for ((owner, id), pane) in &self.context_panes {
+            self.overview
+                .locations
+                .insert(format!("context:{owner}:{id}"), *pane);
+        }
+        self.overview.context_refs.clear();
+        self.overview.writable_owners.clear();
+        if let Some(repo) = &self.contexts {
+            self.overview
+                .writable_owners
+                .insert(repo.snapshot.owner.clone());
+        }
+        for (owner, conn) in &self.context_remote {
+            if self.connections.contains_key(conn) {
+                self.overview.writable_owners.insert(owner.clone());
+            }
+        }
         for (key, record) in &self.overview.store.records {
+            let owner = if let Some(conn) = self.overview_remote.get(key) {
+                self.context_remote
+                    .iter()
+                    .find_map(|(owner, id)| (id == conn).then_some(owner))
+            } else {
+                self.contexts.as_ref().map(|r| &r.snapshot.owner)
+            };
+            if let Some(owner) = owner
+                && let Some(context) = self
+                    .overview
+                    .snapshots
+                    .get(owner)
+                    .and_then(|s| s.for_record(record))
+            {
+                self.overview
+                    .context_refs
+                    .insert(key.clone(), (owner.clone(), context.id.clone()));
+            }
             if record.state == potty::agent::State::Ended {
                 continue;
             }
@@ -5697,7 +5800,130 @@ impl App {
             }
         }
         for action in std::mem::take(&mut self.overview.actions) {
+            if !self.config.saved_contexts
+                && matches!(
+                    action,
+                    overview::OverviewAction::RefreshContexts
+                        | overview::OverviewAction::EditContext(_)
+                        | overview::OverviewAction::OpenContext { .. }
+                )
+            {
+                continue;
+            }
             match action {
+                overview::OverviewAction::OpenContext { owner, id } => {
+                    self.overview.context_error = None;
+                    let mut opened_local = false;
+                    let context = self
+                        .overview
+                        .snapshots
+                        .get(&owner)
+                        .and_then(|s| s.contexts.get(&id));
+                    let cwd = context
+                        .and_then(|c| c.sessions.last())
+                        .map(|r| PathBuf::from(&r.cwd));
+                    if let Some(repo) = &mut self.contexts
+                        && repo.snapshot.owner == owner
+                    {
+                        if let Some(cwd) = cwd.filter(|p| valid_cwd(p)) {
+                            self.workspace.new_tab();
+                            let pane = self.workspace.active_tab().focus;
+                            self.pending_cwds.insert(pane, cwd);
+                            repo.bind(&id, self.notify_sock.to_string_lossy().into_owned(), pane);
+                            self.context_panes.insert((owner, id), pane);
+                            opened_local = true;
+                        } else {
+                            self.overview
+                                .context_failed("The recorded directory no longer exists".into());
+                        }
+                    } else if let Some(&conn) = self
+                        .context_remote
+                        .get(&owner)
+                        .filter(|conn| self.connections.contains_key(conn))
+                    {
+                        let remote = self.connections[&conn].next_remote_id;
+                        let message = potty::contexts::Message::Open {
+                            owner: owner.clone(),
+                            id: id.clone(),
+                            pane: remote,
+                            cols: self.last_dims.cols as u16,
+                            rows: self.last_dims.rows as u16,
+                        };
+                        if self.connections[&conn]
+                            .outbound
+                            .try_send(Frame::Control(Control::Notify {
+                                json: message.json(),
+                            }))
+                            .is_ok()
+                        {
+                            self.workspace.new_tab();
+                            let pane = self.workspace.active_tab().focus;
+                            self.wire_remote_pane(conn, remote, pane, false, None);
+                            self.context_panes.insert((owner, id), pane);
+                        } else {
+                            self.overview
+                                .context_failed("Could not request a remote shell".into());
+                        }
+                    } else {
+                        self.overview
+                            .context_failed("Reconnect to this host before opening a shell".into());
+                    }
+                    if opened_local && self.overview.covers_terminal {
+                        self.overview.open = false;
+                    }
+                }
+                overview::OverviewAction::RefreshContexts => {
+                    if let Some(repo) = &mut self.contexts {
+                        match repo.refresh() {
+                            Ok(()) => self.overview.receive_snapshot(repo.snapshot.clone()),
+                            Err(err) => self.overview.context_failed(err.to_string()),
+                        }
+                    }
+                    for conn in self.connections.values().filter(|c| !c.ephemeral) {
+                        let _ = conn.outbound.try_send(Frame::Control(Control::Notify {
+                            json: potty::contexts::Message::Refresh.json(),
+                        }));
+                    }
+                }
+                overview::OverviewAction::EditContext(message) => {
+                    if let potty::contexts::Message::Edit { owner, .. }
+                    | potty::contexts::Message::Forget { owner, .. } = &message
+                    {
+                        if let Some(repo) = &mut self.contexts
+                            && &repo.snapshot.owner == owner
+                        {
+                            match repo.apply(&message) {
+                                Ok(()) => self.overview.receive_snapshot(repo.snapshot.clone()),
+                                Err(err) => {
+                                    self.overview.context_failed(err.to_string());
+                                    if repo.refresh().is_ok() {
+                                        self.overview.receive_snapshot(repo.snapshot.clone());
+                                    }
+                                }
+                            }
+                        } else if let Some(conn) = self
+                            .context_remote
+                            .get(owner)
+                            .and_then(|id| self.connections.get(id))
+                        {
+                            if conn
+                                .outbound
+                                .try_send(Frame::Control(Control::Notify {
+                                    json: message.json(),
+                                }))
+                                .is_err()
+                            {
+                                self.overview.context_failed(
+                                    "Could not send the saved context update".into(),
+                                );
+                            }
+                        } else {
+                            self.overview.context_failed(
+                                "Reconnect to this host before editing its contexts".into(),
+                            );
+                        }
+                    }
+                }
                 overview::OverviewAction::Open(key) => {
                     if let Some(&pane) = self.overview.locations.get(&key)
                         && let Some(tab) = self.workspace.tab_of(pane)
@@ -5911,6 +6137,7 @@ impl ApplicationHandler<UserEvent> for App {
             Config::default().save(&self.config_path);
         }
         self.config = Config::load(&self.config_path);
+        self.configure_contexts();
 
         // The handle (not the instance) is what's kept: a rebuild after device loss needs a
         // brand-new instance, and by then the `ActiveEventLoop` is no longer in hand.
@@ -6136,7 +6363,17 @@ impl ApplicationHandler<UserEvent> for App {
             // An agentic CLI (via `potty-notify`) raised/cleared an attention note.
             UserEvent::Notify(note) => self.on_local_note(note),
             UserEvent::OverviewRecord(record) => {
+                let key = record.key();
                 self.overview.store.merge(record);
+                if let Some(repo) = &mut self.contexts
+                    && let Some(record) = self.overview.store.records.get(&key)
+                {
+                    match repo.observe(record) {
+                        Ok(true) => self.overview.receive_snapshot(repo.snapshot.clone()),
+                        Ok(false) => {}
+                        Err(err) => self.overview.context_failed(err.to_string()),
+                    }
+                }
                 self.request_redraw();
             }
             UserEvent::PeerNotify(note) => self.on_peer_note(note),

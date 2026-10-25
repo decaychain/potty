@@ -9,6 +9,24 @@ const MIN_TERMINAL_WIDTH: f32 = 440.0;
 const MIN_PANEL_WIDTH: f32 = 340.0;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum View {
+    #[default]
+    Current,
+    Saved,
+    Recent,
+}
+
+struct Editor {
+    owner: String,
+    id: String,
+    expected: u64,
+    annotation: potty::contexts::Annotation,
+    links: String,
+    pending: bool,
+    pending_since: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum DisplayMode {
     #[default]
     Docked,
@@ -38,6 +56,7 @@ enum WorkState {
     Unknown,
     ResponseReady,
     Ended,
+    Saved,
 }
 
 impl WorkState {
@@ -49,6 +68,7 @@ impl WorkState {
             Self::Unknown => "Unknown",
             Self::ResponseReady => "Response ready",
             Self::Ended => "Ended",
+            Self::Saved => "Saved context",
         }
     }
 
@@ -57,7 +77,7 @@ impl WorkState {
             Self::Working => chrome_accent(),
             Self::NeedsYou => chrome_warn(),
             Self::Finished | Self::ResponseReady => egui::Color32::from_rgb(126, 216, 161),
-            Self::Unknown | Self::Ended => chrome_muted(),
+            Self::Unknown | Self::Ended | Self::Saved => chrome_muted(),
         }
     }
 }
@@ -209,11 +229,25 @@ pub struct Overview {
     pub store: potty::agent::Store,
     pub locations: std::collections::HashMap<String, u64>,
     pub actions: Vec<OverviewAction>,
+    view: View,
+    search: String,
+    search_focused: bool,
+    editor: Option<Editor>,
+    editor_visible: bool,
+    forget: Option<(String, String)>,
+    pub context_error: Option<String>,
+    pub snapshots: std::collections::BTreeMap<String, potty::contexts::Snapshot>,
+    pub context_refs: std::collections::HashMap<String, (String, String)>,
+    pub writable_owners: std::collections::HashSet<String>,
+    contexts_enabled: bool,
 }
 
 pub enum OverviewAction {
     Open(String),
     Dismiss(potty::agent::Record),
+    EditContext(potty::contexts::Message),
+    OpenContext { owner: String, id: String },
+    RefreshContexts,
 }
 
 impl Overview {
@@ -229,12 +263,70 @@ impl Overview {
     pub fn live() -> Self {
         Self {
             enabled: true,
+            contexts_enabled: true,
             ..Self::default()
         }
     }
 
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        if self.open && self.contexts_enabled {
+            self.actions.push(OverviewAction::RefreshContexts);
+        }
+    }
+
+    pub fn set_contexts_enabled(&mut self, enabled: bool) {
+        self.contexts_enabled = enabled;
+        if !enabled {
+            self.view = View::Current;
+            self.search.clear();
+            self.search_focused = false;
+            self.editor = None;
+            self.editor_visible = false;
+            self.forget = None;
+            self.context_error = None;
+            self.snapshots.clear();
+            self.context_refs.clear();
+            self.writable_owners.clear();
+            self.actions
+                .retain(|a| matches!(a, OverviewAction::Open(_) | OverviewAction::Dismiss(_)));
+        }
+    }
+
+    pub fn text_input_active(&self) -> bool {
+        self.open && (self.editor_visible || self.search_focused)
+    }
+
+    pub fn receive_snapshot(&mut self, snapshot: potty::contexts::Snapshot) {
+        if !self.contexts_enabled {
+            return;
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.owner == snapshot.owner && !snapshot.contexts.contains_key(&e.id))
+        {
+            self.editor = None;
+        }
+        if let Some(editor) = &self.editor
+            && editor.pending
+            && editor.owner == snapshot.owner
+            && snapshot
+                .contexts
+                .get(&editor.id)
+                .is_some_and(|c| c.edited > editor.expected && c.annotation == editor.annotation)
+        {
+            self.editor = None;
+        }
+        self.snapshots.insert(snapshot.owner.clone(), snapshot);
+    }
+
+    pub fn context_failed(&mut self, error: String) {
+        self.context_error = Some(error);
+        if let Some(editor) = &mut self.editor {
+            editor.pending = false;
+            editor.pending_since = None;
+        }
     }
 
     pub fn sync_focus(&mut self, pane: u64) {
@@ -252,9 +344,12 @@ impl Overview {
                         session.state != WorkState::Ended && !self.dismissed.contains(session.id)
                     })
                 } else {
-                    self.store.records.values().any(|record| {
-                        record.visible() && record.state != potty::agent::State::Ended
-                    })
+                    self.snapshots
+                        .values()
+                        .any(|s| s.contexts.values().any(|c| c.annotation.kept))
+                        || self.store.records.values().any(|record| {
+                            record.visible() && record.state != potty::agent::State::Ended
+                        })
                 })
     }
 
@@ -271,6 +366,7 @@ impl Overview {
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
         self.covers_terminal = false;
         self.pointer_over = false;
+        self.editor_visible = false;
         self.panel_rect = None;
         if self.open && !self.was_open {
             self.reveal_focus = true;
@@ -352,6 +448,22 @@ impl Overview {
     }
 
     fn contents(&mut self, ui: &mut egui::Ui) {
+        if self.editor.as_ref().is_some_and(|e| !e.pending)
+            && ui.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.editor = None;
+        }
+        if let Some(started) = self.editor.as_ref().and_then(|e| e.pending_since) {
+            let timeout = std::time::Duration::from_secs(15);
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                self.context_failed(
+                    "Save confirmation not received. Refresh before retrying.".into(),
+                );
+            } else {
+                ui.ctx().request_repaint_after(timeout - elapsed);
+            }
+        }
         ui.style_mut().interaction.selectable_labels = false;
         let small_size = (egui::TextStyle::Body.resolve(ui.style()).size - 1.0).max(11.0);
         ui.style_mut().text_styles.insert(
@@ -360,18 +472,45 @@ impl Overview {
         );
         ui.spacing_mut().item_spacing.y = 4.0;
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Sessions")
-                    .strong()
-                    .color(chrome_text()),
+            let title_width = (ui.available_width() - 60.0).max(80.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(title_width, 24.0),
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().button_padding.x = 4.0;
+                    ui.label(
+                        egui::RichText::new("Sessions")
+                            .strong()
+                            .color(chrome_text()),
+                    );
+                    if self.demo {
+                        ui.label(
+                            egui::RichText::new("Sample data")
+                                .small()
+                                .color(chrome_magenta()),
+                        );
+                    } else if self.contexts_enabled {
+                        ui.add_space(12.0);
+                        for (view, label) in [
+                            (View::Current, "Current"),
+                            (View::Saved, "Saved"),
+                            (View::Recent, "Recent"),
+                        ] {
+                            if ui
+                                .selectable_value(
+                                    &mut self.view,
+                                    view,
+                                    egui::RichText::new(label).small(),
+                                )
+                                .clicked()
+                            {
+                                self.actions.push(OverviewAction::RefreshContexts);
+                            }
+                        }
+                    }
+                },
             );
-            if self.demo {
-                ui.label(
-                    egui::RichText::new("Sample data")
-                        .small()
-                        .color(chrome_magenta()),
-                );
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, "x", "Close session overview").clicked() {
                     self.open = false;
@@ -401,34 +540,57 @@ impl Overview {
             });
         });
         ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-            for (filter, label) in [
-                (
-                    Filter::All,
-                    if self.demo || self.show_ended {
-                        "All"
-                    } else {
-                        "Current"
-                    },
-                ),
-                (Filter::NeedsYou, "Needs you"),
-                (
-                    Filter::Finished,
-                    if self.demo { "Finished" } else { "Ready" },
-                ),
-            ] {
-                let count = if self.demo {
-                    SAMPLES.iter().filter(|s| self.matches(s, filter)).count()
-                } else {
-                    self.store
-                        .records
-                        .values()
-                        .filter(|r| self.matches_live(r, filter))
-                        .count()
-                };
-                ui.selectable_value(&mut self.filter, filter, format!("{label} {count}"));
+        if !self.demo {
+            if self.view != View::Current {
+                self.search_focused = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Search contexts")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .has_focus();
+            } else {
+                self.search_focused = false;
             }
-        });
+        }
+        if let Some(error) = self.context_error.clone() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(error).small().color(chrome_error()));
+                if icon_button(ui, "x", "Dismiss storage error").clicked() {
+                    self.context_error = None;
+                }
+            });
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.pending && !self.writable_owners.contains(&e.owner))
+        {
+            self.context_failed("Connection lost before the save was confirmed".into());
+        }
+        if self.view == View::Current {
+            ui.horizontal_wrapped(|ui| {
+                for (filter, label) in [
+                    (Filter::All, "All"),
+                    (Filter::NeedsYou, "Needs you"),
+                    (
+                        Filter::Finished,
+                        if self.demo { "Finished" } else { "Ready" },
+                    ),
+                ] {
+                    let count = if self.demo {
+                        SAMPLES.iter().filter(|s| self.matches(s, filter)).count()
+                    } else {
+                        self.store
+                            .records
+                            .values()
+                            .filter(|r| self.matches_live(r, filter))
+                            .count()
+                    };
+                    ui.selectable_value(&mut self.filter, filter, format!("{label} {count}"));
+                }
+            });
+        }
         ui.add_space(6.0);
         ui.separator();
         egui::ScrollArea::vertical()
@@ -436,7 +598,11 @@ impl Overview {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !self.demo {
-                    self.live_rows(ui);
+                    if self.view == View::Current {
+                        self.live_rows(ui);
+                    } else {
+                        self.saved_rows(ui);
+                    }
                     return;
                 }
                 if !SAMPLES.iter().any(|s| self.matches(s, self.filter)) {
@@ -463,6 +629,367 @@ impl Overview {
                     WorkState::Finished | WorkState::ResponseReady
                 ),
             }
+    }
+
+    fn saved_rows(&mut self, ui: &mut egui::Ui) {
+        let query = self.search.to_lowercase();
+        let mut contexts: Vec<_> = self
+            .snapshots
+            .iter()
+            .flat_map(|(owner, s)| s.contexts.values().map(move |c| (owner.clone(), c.clone())))
+            .filter(|(_, c)| self.view != View::Saved || c.annotation.kept)
+            .filter(|(_, c)| {
+                query.is_empty()
+                    || format!(
+                        "{} {} {} {}",
+                        c.title(),
+                        c.annotation.notes,
+                        c.annotation.links.join(" "),
+                        c.sessions
+                            .iter()
+                            .map(|r| format!(
+                                "{} {} {} {}",
+                                r.host,
+                                r.cwd,
+                                r.session,
+                                r.briefing.as_ref().map_or("", |b| b.summary.as_str())
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .collect();
+        contexts.sort_by_key(|(_, c)| std::cmp::Reverse(c.updated));
+        if contexts.is_empty() {
+            ui.add_space(20.0);
+            ui.label(
+                egui::RichText::new(if self.search.is_empty() {
+                    if self.view == View::Saved {
+                        "No saved contexts"
+                    } else {
+                        "No recent contexts"
+                    }
+                } else {
+                    "No matching contexts"
+                })
+                .color(chrome_muted()),
+            );
+        }
+        for (owner, context) in contexts {
+            let key = format!("context:{owner}:{}", context.id);
+            let live = self.context_refs.iter().find_map(|(key, (o, id))| {
+                (o == &owner && id == &context.id)
+                    .then(|| self.locations.get(key).copied())
+                    .flatten()
+            });
+            if let Some(pane) = live {
+                self.locations.insert(key.clone(), pane);
+            }
+            self.context_refs
+                .insert(key.clone(), (owner.clone(), context.id.clone()));
+            let r = context.sessions.last().unwrap();
+            let briefing = r.briefing.as_ref();
+            let age = format!(
+                "{}m ago",
+                potty::agent::now().saturating_sub(context.updated) / 60_000_000_000
+            );
+            let milestones: Vec<_> = briefing
+                .map(|b| b.milestones.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            let row = SampleSession {
+                id: &key,
+                title: context.title(),
+                tool: match r.tool {
+                    potty::notify::Tool::Claude => "Claude",
+                    potty::notify::Tool::Codex => "Codex",
+                    _ => "Agent",
+                },
+                host: &r.host,
+                cwd: &r.cwd,
+                state: WorkState::Saved,
+                availability: None,
+                summary: briefing.map_or(r.prompt.as_str(), |b| b.summary.as_str()),
+                newer_prompt: None,
+                next: briefing.map_or("", |b| b.next.as_str()),
+                age: &age,
+                milestones: &milestones,
+            };
+            let response = ui.push_id(&key, |ui| {
+                self.row(ui, &row, "Last recorded briefing", briefing.is_none(), None)
+            });
+            if self.reveal_focus
+                && self.focused_pane.is_some()
+                && self.locations.get(&key).copied() == self.focused_pane
+            {
+                response.inner.scroll_to_me(None);
+                self.reveal_focus = false;
+            }
+        }
+        self.reveal_focus = false;
+    }
+
+    fn context_details(&mut self, ui: &mut egui::Ui, key: &str) {
+        if !self.contexts_enabled {
+            return;
+        }
+        let Some((owner, id)) = self.context_refs.get(key).cloned() else {
+            return;
+        };
+        let Some(context) = self
+            .snapshots
+            .get(&owner)
+            .and_then(|s| s.contexts.get(&id))
+            .cloned()
+        else {
+            return;
+        };
+        let writable = self.writable_owners.contains(&owner);
+        ui.separator();
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.owner == owner && e.id == id)
+        {
+            self.context_editor(ui, key, owner, id);
+            return;
+        }
+        if !context.annotation.notes.is_empty() {
+            ui.label(
+                egui::RichText::new("Notes")
+                    .small()
+                    .strong()
+                    .color(chrome_muted()),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt(("notes", key))
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(&context.annotation.notes).wrap());
+                });
+        }
+        for link in &context.annotation.links {
+            // Only HTTP(S) links accepted by the store. No shell commands or file URLs.
+            let mut label = egui::text::LayoutJob::simple(
+                link.clone(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                chrome_accent(),
+                ui.available_width(),
+            );
+            label.wrap.max_rows = 1;
+            label.wrap.break_anywhere = true;
+            ui.add(egui::Hyperlink::from_label_and_url(label, link))
+                .on_hover_text(link);
+        }
+        if let Some(record) = context.sessions.last() {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Agent session")
+                    .small()
+                    .color(chrome_muted()),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button("Copy ID")
+                    .on_hover_text("Copy agent session ID")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(record.session.clone());
+                }
+                ui.add(
+                    egui::Label::new(format!("{:?}: {}", record.tool, record.session)).truncate(),
+                )
+                .on_hover_text(&record.session);
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !record.cwd.is_empty(),
+                        egui::Button::new("Copy path").small(),
+                    )
+                    .on_hover_text("Copy recorded working directory")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(record.cwd.clone());
+                }
+                ui.add(egui::Label::new(&record.cwd).truncate())
+                    .on_hover_text(&record.cwd);
+            });
+            ui.add_space(6.0);
+        }
+        ui.horizontal_wrapped(|ui| {
+            if self.view != View::Current
+                && !self.locations.contains_key(key)
+                && ui
+                    .add_enabled(writable, egui::Button::new("Open shell"))
+                    .on_hover_text("Open a new shell in the recorded directory")
+                    .clicked()
+            {
+                self.actions.push(OverviewAction::OpenContext {
+                    owner: owner.clone(),
+                    id: id.clone(),
+                });
+            }
+            if !context.annotation.kept
+                && ui
+                    .add_enabled(writable, egui::Button::new("Keep"))
+                    .clicked()
+            {
+                let mut annotation = context.annotation.clone();
+                annotation.kept = true;
+                self.actions.push(OverviewAction::EditContext(
+                    potty::contexts::Message::Edit {
+                        owner: owner.clone(),
+                        id: id.clone(),
+                        expected: context.edited,
+                        annotation,
+                    },
+                ));
+            }
+            if ui
+                .add_enabled(writable, egui::Button::new("Edit notes"))
+                .clicked()
+            {
+                self.editor = Some(Editor {
+                    owner: owner.clone(),
+                    id: id.clone(),
+                    expected: context.edited,
+                    annotation: context.annotation.clone(),
+                    links: context.annotation.links.join("\n"),
+                    pending: false,
+                    pending_since: None,
+                });
+                self.editor_visible = true;
+                self.context_error = None;
+            }
+            if context.annotation.kept {
+                ui.label(egui::RichText::new("Kept").small().color(chrome_muted()));
+            }
+            if !writable {
+                ui.label(
+                    egui::RichText::new("Disconnected")
+                        .small()
+                        .color(chrome_muted()),
+                );
+            }
+            if self.view != View::Current
+                && ui
+                    .add_enabled(writable, egui::Button::new("Forget..."))
+                    .clicked()
+            {
+                self.forget = Some((owner.clone(), id.clone()));
+            }
+        });
+        if self.forget.as_ref() == Some(&(owner.clone(), id.clone())) {
+            ui.label(
+                egui::RichText::new("Forget this context and its notes?")
+                    .small()
+                    .color(chrome_warn()),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Forget").clicked() {
+                    self.actions.push(OverviewAction::EditContext(
+                        potty::contexts::Message::Forget {
+                            owner: owner.clone(),
+                            id: id.clone(),
+                            expected: context.edited,
+                        },
+                    ));
+                    self.forget = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.forget = None;
+                }
+            });
+        }
+    }
+
+    fn context_editor(&mut self, ui: &mut egui::Ui, key: &str, owner: String, id: String) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        if editor.owner != owner || editor.id != id {
+            return;
+        }
+        self.editor_visible = true;
+        ui.add_space(6.0);
+        let mut cancel = false;
+        ui.add_enabled_ui(!editor.pending, |ui| {
+            ui.label(egui::RichText::new("Name").small().color(chrome_muted()));
+            ui.add(
+                egui::TextEdit::singleline(&mut editor.annotation.name)
+                    .desired_width(f32::INFINITY)
+                    .char_limit(120),
+            );
+            ui.label(egui::RichText::new("Notes").small().color(chrome_muted()));
+            egui::ScrollArea::vertical()
+                .id_salt(("edit-notes", key))
+                .max_height(110.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut editor.annotation.notes)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .char_limit(8192),
+                    );
+                });
+            ui.label(egui::RichText::new("Links").small().color(chrome_muted()));
+            egui::ScrollArea::vertical()
+                .id_salt(("edit-links", key))
+                .max_height(65.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut editor.links)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .char_limit(32768),
+                    );
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    editor.annotation.links = editor
+                        .links
+                        .lines()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    editor.annotation.normalize();
+                    editor.annotation.kept = true;
+                    if editor.annotation.valid() {
+                        editor.pending = true;
+                        editor.pending_since = Some(std::time::Instant::now());
+                        self.actions.push(OverviewAction::EditContext(
+                            potty::contexts::Message::Edit {
+                                owner,
+                                id,
+                                expected: editor.expected,
+                                annotation: editor.annotation.clone(),
+                            },
+                        ));
+                    } else {
+                        self.context_error = Some(
+                            "Use a short name, notes up to 8 KB, and up to 16 HTTP(S) links."
+                                .into(),
+                        );
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if editor.pending {
+            ui.label(
+                egui::RichText::new("Saving...")
+                    .small()
+                    .color(chrome_muted()),
+            );
+        }
+        if cancel {
+            self.editor = None;
+        }
     }
 
     fn sorted_records(&self) -> Vec<potty::agent::Record> {
@@ -507,6 +1034,12 @@ impl Overview {
         }
         for r in records {
             let key = r.key();
+            let custom_title = self
+                .context_refs
+                .get(&key)
+                .and_then(|(owner, id)| self.snapshots.get(owner)?.contexts.get(id))
+                .map(|c| c.annotation.name.clone())
+                .filter(|s| !s.is_empty());
             let has_briefing = r.briefing.is_some();
             let prompt_only =
                 !has_briefing && (r.response_at <= r.prompt_at || r.response.is_empty());
@@ -575,11 +1108,12 @@ impl Overview {
                 .unwrap_or_default();
             let row = SampleSession {
                 id: &key,
-                title: r
-                    .briefing
-                    .as_ref()
-                    .map(|b| b.title.as_str())
-                    .unwrap_or(&fallback_title),
+                title: custom_title.as_deref().unwrap_or_else(|| {
+                    r.briefing
+                        .as_ref()
+                        .map(|b| b.title.as_str())
+                        .unwrap_or(&fallback_title)
+                }),
                 tool: match r.tool {
                     potty::notify::Tool::Codex => "Codex",
                     potty::notify::Tool::Claude => "Claude",
@@ -777,12 +1311,12 @@ impl Overview {
                         }
                         ui.add(egui::Label::new(session.next).wrap());
                         ui.add_space(6.0);
-                        ui.label(
+                        if !session.milestones.is_empty() { ui.label(
                             egui::RichText::new("Milestones")
                                 .small()
                                 .strong()
                                 .color(chrome_muted()),
-                        );
+                        ); }
                         for milestone in session.milestones {
                             ui.add(egui::Label::new(format!("- {milestone}")).wrap());
                         }
@@ -796,8 +1330,9 @@ impl Overview {
                             prompt_excerpt(ui, prompt);
                         }
                         ui.add_space(6.0);
+                        if !self.demo { self.context_details(ui, session.id); }
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Dismiss").clicked() {
+                            if (self.demo || self.view == View::Current) && ui.button("Dismiss").clicked() {
                                 if self.demo {
                                     self.dismissed.insert(session.id.to_owned());
                                 } else if let Some(record) = self.store.records.get_mut(session.id) {
@@ -825,7 +1360,10 @@ impl Overview {
                 self.actions
                     .push(OverviewAction::Open(session.id.to_owned()));
             }
-            self.expanded = if expanded && (focused || linked.is_none()) {
+            let editing = self.editor.as_ref().is_some_and(|e| {
+                self.context_refs.get(session.id) == Some(&(e.owner.clone(), e.id.clone()))
+            });
+            self.expanded = if expanded && (focused || linked.is_none()) && !editing {
                 None
             } else {
                 Some(session.id.to_owned())
@@ -874,6 +1412,326 @@ fn live_matches(state: potty::agent::State, filter: Filter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(deprecated)]
+    fn disabling_contexts_hides_history_without_disabling_live_overview() {
+        use potty::contexts::{Annotation, Context, Snapshot};
+        let mut overview = Overview::live();
+        overview.open = true;
+        let record = live_session("active", 1);
+        let key = record.key();
+        overview.store.merge(record.clone());
+        overview.locations.insert(key.clone(), 1);
+        overview.expanded = Some(key.clone());
+        let mut snapshot = Snapshot::default();
+        snapshot.contexts.insert(
+            "work".into(),
+            Context {
+                id: "work".into(),
+                annotation: Annotation {
+                    kept: true,
+                    ..Default::default()
+                },
+                edited: 1,
+                updated: record.revision(),
+                sessions: vec![record],
+            },
+        );
+        overview.receive_snapshot(snapshot.clone());
+        overview.view = View::Saved;
+        overview.editor = Some(Editor {
+            owner: snapshot.owner.clone(),
+            id: "work".into(),
+            expected: 1,
+            annotation: Annotation::default(),
+            links: String::new(),
+            pending: false,
+            pending_since: None,
+        });
+        overview.editor_visible = true;
+        overview.search_focused = true;
+        overview.actions.push(OverviewAction::RefreshContexts);
+        overview.actions.push(OverviewAction::Open(key));
+        overview.set_contexts_enabled(false);
+        assert!(overview.view == View::Current);
+        assert!(!overview.text_input_active());
+        assert!(overview.editor.is_none());
+        assert!(overview.snapshots.is_empty());
+        assert!(matches!(
+            overview.actions.as_slice(),
+            [OverviewAction::Open(_)]
+        ));
+        overview.receive_snapshot(snapshot.clone());
+        assert!(
+            overview.snapshots.is_empty(),
+            "late remote snapshots must stay ignored"
+        );
+        assert!(overview.button_visible());
+        let ctx = egui::Context::default();
+        crate::apply_chrome_style(&ctx, 13.0);
+        let frame = |overview: &mut Overview| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(420.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    overview.show(ctx);
+                },
+            )
+        };
+        frame(&mut overview);
+        let output = frame(&mut overview);
+        let has = |label: &str| {
+            output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == label))
+        };
+        assert!(has("Task active"));
+        assert!(has("Dismiss"));
+        for label in [
+            "Current",
+            "Saved",
+            "Recent",
+            "Keep",
+            "Edit notes",
+            "Copy ID",
+            "Copy path",
+        ] {
+            assert!(!has(label), "history control {label} remained visible");
+        }
+        overview.set_contexts_enabled(true);
+        overview.receive_snapshot(snapshot);
+        let output = frame(&mut overview);
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "Saved"))
+        );
+        assert_eq!(overview.store.records.len(), 1);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn saved_context_editor_search_and_actions_fit_narrow_panels() {
+        use potty::contexts::{Annotation, Context, Message, Snapshot};
+        fn frame(
+            ctx: &egui::Context,
+            overview: &mut Overview,
+            width: f32,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    overview.show(ctx);
+                },
+            )
+        }
+        fn click(
+            ctx: &egui::Context,
+            overview: &mut Overview,
+            width: f32,
+            label: &str,
+        ) -> egui::FullOutput {
+            let output = frame(ctx, overview, width, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == label => {
+                        Some(t.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Missing {label}"));
+            let mut output = frame(ctx, overview, width, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                output = frame(
+                    ctx,
+                    overview,
+                    width,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    }],
+                );
+            }
+            output
+        }
+        for width in [320.0, 420.0, 900.0, 1280.0] {
+            let ctx = egui::Context::default();
+            crate::apply_chrome_style(&ctx, 13.0);
+            let mut overview = Overview::live();
+            overview.open = true;
+            overview.view = View::Recent;
+            let mut snapshot = Snapshot::default();
+            let owner = snapshot.owner.clone();
+            let mut record = live_session("saved", 1);
+            record.cwd = format!("/projects/{}", "long-path-".repeat(30));
+            snapshot.contexts.insert(
+                "work".into(),
+                Context {
+                    id: "work".into(),
+                    annotation: Annotation::default(),
+                    edited: 0,
+                    updated: record.revision(),
+                    sessions: vec![record],
+                },
+            );
+            let key = format!("context:{owner}:work");
+            overview.receive_snapshot(snapshot.clone());
+            overview.writable_owners.insert(owner.clone());
+            overview.expanded = Some(key.clone());
+            for _ in 0..3 {
+                frame(&ctx, &mut overview, width, vec![]);
+            }
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            let heading = |label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.job.text == label => {
+                            Some(t.visual_bounding_rect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let caption = heading("Sessions");
+            for label in ["Current", "Saved", "Recent"] {
+                let tab = heading(label);
+                assert!(
+                    (tab.center().y - caption.center().y).abs() < 4.0,
+                    "{label} not beside caption at {width}"
+                );
+                assert!(tab.left() >= caption.right());
+            }
+            assert!(heading("Current").left() - caption.right() >= 16.0);
+            assert!(heading("Agent session").bottom() < heading("Copy ID").top());
+            assert!(heading("Copy path").bottom() < heading("Keep").top());
+            assert!(heading("Copy path").bottom() < heading("Edit notes").top());
+            let output = click(&ctx, &mut overview, width, "Copy ID");
+            assert!(
+                output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, egui::OutputCommand::CopyText(s) if s == "saved"))
+            );
+            let output = click(&ctx, &mut overview, width, "Copy path");
+            let cwd = &snapshot.contexts["work"].sessions[0].cwd;
+            assert!(
+                output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, egui::OutputCommand::CopyText(s) if s == cwd))
+            );
+            assert_eq!(overview.expanded.as_deref(), Some(key.as_str()));
+            assert!(
+                overview.actions.is_empty(),
+                "copying must not navigate or mutate the context"
+            );
+            click(&ctx, &mut overview, width, "Keep");
+            assert!(overview.actions.iter().any(|a| matches!(a, OverviewAction::EditContext(Message::Edit { annotation, .. }) if annotation.kept)));
+            overview.actions.clear();
+            snapshot.contexts.get_mut("work").unwrap().annotation.kept = true;
+            snapshot.contexts.get_mut("work").unwrap().edited = 1;
+            overview.receive_snapshot(snapshot.clone());
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "Task saved")), "keeping a context must not remove it from Recent");
+            overview.view = View::Saved;
+            click(&ctx, &mut overview, width, "Edit notes");
+            assert!(overview.text_input_active());
+            let editor = overview.editor.as_mut().unwrap();
+            editor.annotation.name = "Saved dashboard".into();
+            editor.annotation.notes = "Review API first\n".repeat(80);
+            editor.links = format!("https://example.com/{}", "long-path-".repeat(30));
+            for _ in 0..3 {
+                frame(&ctx, &mut overview, width, vec![]);
+            }
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            let bounds = overview.panel_rect.unwrap();
+            for s in &output.shapes {
+                if let egui::Shape::Text(t) = &s.shape {
+                    let rect = t.visual_bounding_rect();
+                    if s.clip_rect.intersects(rect) && bounds.intersects(rect) {
+                        assert!(
+                            rect.right() <= bounds.right() + 2.0,
+                            "text overflow at {width}: {}",
+                            t.galley.job.text
+                        );
+                    }
+                }
+            }
+            click(&ctx, &mut overview, width, "Save");
+            assert!(overview.editor.as_ref().unwrap().pending);
+            let annotation = overview
+                .actions
+                .iter()
+                .find_map(|a| match a {
+                    OverviewAction::EditContext(Message::Edit { annotation, .. }) => {
+                        Some(annotation.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            overview.context_failed("Save rejected".into());
+            assert!(!overview.editor.as_ref().unwrap().pending);
+            assert_eq!(
+                overview.editor.as_ref().unwrap().annotation.notes,
+                annotation.notes
+            );
+            overview.context_error = None;
+            click(&ctx, &mut overview, width, "Save");
+            let c = snapshot.contexts.get_mut("work").unwrap();
+            c.annotation = annotation;
+            c.edited = 2;
+            overview.receive_snapshot(snapshot.clone());
+            assert!(overview.editor.is_none());
+            frame(&ctx, &mut overview, width, vec![]);
+            assert!(!overview.text_input_active());
+            overview.search = "not-present-anywhere".into();
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "No matching contexts")));
+            overview.search.clear();
+            click(&ctx, &mut overview, width, "Forget...");
+            assert!(
+                !overview
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, OverviewAction::EditContext(Message::Forget { .. })))
+            );
+            click(&ctx, &mut overview, width, "Forget");
+            assert!(
+                overview
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, OverviewAction::EditContext(Message::Forget { .. })))
+            );
+            assert!(!overview.actions.iter().any(|a| matches!(
+                a,
+                OverviewAction::Open(_) | OverviewAction::OpenContext { .. }
+            )));
+        }
+    }
 
     fn live_session(session: &str, pane: u64) -> potty::agent::Record {
         potty::agent::hook(
@@ -1369,6 +2227,7 @@ mod tests {
         briefing.briefing = Some(potty::agent::Briefing {
             title: "Old task".into(),
             summary: "Earlier work".into(),
+            milestones: vec!["Reviewed the transport".into()],
             ..Default::default()
         });
         briefing.briefing_at = record.prompt_at - 1;
