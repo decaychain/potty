@@ -831,6 +831,7 @@ mod imp {
                     }
                     if let Some(
                         message @ (potty::contexts::Message::Edit { .. }
+                        | potty::contexts::Message::Dock { .. }
                         | potty::contexts::Message::Forget { .. }
                         | potty::contexts::Message::Refresh),
                     ) = potty::contexts::Message::parse(&json)

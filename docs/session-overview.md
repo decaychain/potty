@@ -245,6 +245,8 @@ Missing directories produce an error rather than silently choosing a different d
 This does not resume the agent, restore environment variables, or replay commands.
 The latest agent session and its working directory appear directly above the expanded item's
 action buttons; **Copy ID** and **Copy path** copy their full values, even when truncated on screen.
+Expanded current items have one action row: Keep and Edit notes on the left, a dock control,
+and Dismiss on the right. Editing notes temporarily replaces these actions with Save/Cancel.
 Automatic agent resumption and automatic SSH connection are deliberately deferred.
 A reopened shell is tracked in the current client;
 once an agent publishes from it, it becomes the context's latest session.
@@ -266,8 +268,30 @@ Reopening the overview or selecting a view refreshes shared storage; live mirror
 between separate local windows/remote daemons is not yet implemented. Clients attached to the
 same daemon receive changes immediately.
 
-Retention is bounded to 128 unkept contexts and 512 kept contexts, with one session snapshot
-per context and a 4 MiB file limit. Kept contexts are never automatically evicted.
+### Session dock
+
+The down control moves an item into a compact **Dock** at the bottom of the overview. Each
+entry shows only its title, status, and restore control. Clicking the entry focuses its live
+pane without undocking it. The up control restores and expands the full item. The dock stays
+visible across Current/Saved/Recent and state filters; it scrolls independently and takes at
+most 35% of the space below the panel controls.
+
+Docking is independent of Keep, dismissal, agent state, and pane focus. With saved contexts
+enabled, it is stored on the context's owning host, survives reconnects and restarts, and is
+broadcast to clients of the same remote daemon. A context with no live agent remains in the
+dock as **Saved**, without claiming its old pane still exists. Restoring it opens its details
+in Recent; opening a shell remains a separate explicit action.
+
+Persistent docking requires an updated running `potty-session` on remote hosts. Snapshots
+advertise support; older daemons and sessions without saved contexts get a window-local dock,
+identified by the dock control's tooltip. No unsupported persistence requests are sent.
+Remote moves wait for confirmation; errors or a lost connection keep the last confirmed view.
+Refreshing reconciles requests whose replies were lost. Disconnected persistent contexts must
+reconnect before changing their dock state.
+There is no new hook installation requirement.
+
+Retention is bounded to 128 unkept, undocked contexts and 512 kept or docked contexts, with one
+session snapshot per context and a 4 MiB file limit. Kept and docked contexts are never automatically evicted.
 Limit, corruption, and write errors are shown in the panel.
 Routine tool-state changes do not rewrite the file; new prompts, responses, and briefings do.
 

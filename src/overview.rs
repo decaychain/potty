@@ -26,6 +26,18 @@ struct Editor {
     pending_since: Option<std::time::Instant>,
 }
 
+struct PendingDock {
+    expected: u64,
+    docked: bool,
+    started: std::time::Instant,
+}
+
+struct DockEntry {
+    key: String,
+    title: String,
+    state: WorkState,
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum DisplayMode {
     #[default]
@@ -60,6 +72,16 @@ enum WorkState {
 }
 
 impl WorkState {
+    fn from_live(state: potty::agent::State) -> Self {
+        match state {
+            potty::agent::State::Working => Self::Working,
+            potty::agent::State::NeedsYou => Self::NeedsYou,
+            potty::agent::State::ResponseReady => Self::ResponseReady,
+            potty::agent::State::Ended => Self::Ended,
+            potty::agent::State::Unknown => Self::Unknown,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Working => "Working",
@@ -240,6 +262,9 @@ pub struct Overview {
     pub context_refs: std::collections::HashMap<String, (String, String)>,
     pub writable_owners: std::collections::HashSet<String>,
     contexts_enabled: bool,
+    temporary_dock: std::collections::HashSet<String>,
+    pending_docks: std::collections::HashMap<(String, String), PendingDock>,
+    reveal_item: Option<String>,
 }
 
 pub enum OverviewAction {
@@ -288,6 +313,8 @@ impl Overview {
             self.snapshots.clear();
             self.context_refs.clear();
             self.writable_owners.clear();
+            self.pending_docks.clear();
+            self.reveal_item = None;
             self.actions
                 .retain(|a| matches!(a, OverviewAction::Open(_) | OverviewAction::Dismiss(_)));
         }
@@ -301,6 +328,13 @@ impl Overview {
         if !self.contexts_enabled {
             return;
         }
+        self.pending_docks.retain(|(owner, id), pending| {
+            owner != &snapshot.owner
+                || snapshot
+                    .contexts
+                    .get(id)
+                    .is_some_and(|c| c.edited <= pending.expected || c.docked != pending.docked)
+        });
         if self
             .editor
             .as_ref()
@@ -323,6 +357,7 @@ impl Overview {
 
     pub fn context_failed(&mut self, error: String) {
         self.context_error = Some(error);
+        self.pending_docks.clear();
         if let Some(editor) = &mut self.editor {
             editor.pending = false;
             editor.pending_since = None;
@@ -346,9 +381,11 @@ impl Overview {
                 } else {
                     self.snapshots
                         .values()
-                        .any(|s| s.contexts.values().any(|c| c.annotation.kept))
+                        .any(|s| s.contexts.values().any(|c| c.annotation.kept || c.docked))
                         || self.store.records.values().any(|record| {
-                            record.visible() && record.state != potty::agent::State::Ended
+                            record.visible()
+                                && (record.state != potty::agent::State::Ended
+                                    || self.temporary_dock.contains(&record.key()))
                         })
                 })
     }
@@ -448,6 +485,22 @@ impl Overview {
     }
 
     fn contents(&mut self, ui: &mut egui::Ui) {
+        let timeout = std::time::Duration::from_secs(15);
+        if self.pending_docks.iter().any(|((owner, _), p)| {
+            p.started.elapsed() >= timeout || !self.writable_owners.contains(owner)
+        }) {
+            self.context_failed(
+                "Dock update not confirmed. Reconnect or refresh before retrying.".into(),
+            );
+        }
+        for pending in self.pending_docks.values() {
+            ui.ctx()
+                .request_repaint_after(timeout.saturating_sub(pending.started.elapsed()));
+        }
+        if !self.demo {
+            self.temporary_dock
+                .retain(|key| self.store.records.contains_key(key));
+        }
         if self.editor.as_ref().is_some_and(|e| !e.pending)
             && ui.input(|i| i.key_pressed(egui::Key::Escape))
         {
@@ -532,6 +585,7 @@ impl Overview {
                     }
                     if self.demo && ui.button("Reset sample sessions").clicked() {
                         self.dismissed.clear();
+                        self.temporary_dock.clear();
                         self.expanded = None;
                         self.filter = Filter::All;
                         ui.close();
@@ -579,12 +633,15 @@ impl Overview {
                     ),
                 ] {
                     let count = if self.demo {
-                        SAMPLES.iter().filter(|s| self.matches(s, filter)).count()
+                        SAMPLES
+                            .iter()
+                            .filter(|s| self.matches(s, filter) && !self.is_docked(s.id))
+                            .count()
                     } else {
                         self.store
                             .records
                             .values()
-                            .filter(|r| self.matches_live(r, filter))
+                            .filter(|r| self.matches_live(r, filter) && !self.is_docked(&r.key()))
                             .count()
                     };
                     ui.selectable_value(&mut self.filter, filter, format!("{label} {count}"));
@@ -593,8 +650,24 @@ impl Overview {
         }
         ui.add_space(6.0);
         ui.separator();
+        let dock = self.dock_entries();
+        let reveal_dock = self.reveal_focus
+            && self.focused_pane.is_some()
+            && dock
+                .iter()
+                .any(|e| self.locations.get(&e.key).copied() == self.focused_pane);
+        let dock_height = if dock.is_empty() {
+            0.0
+        } else {
+            let line = ui.text_style_height(&egui::TextStyle::Body).max(24.0) + 4.0;
+            (28.0 + dock.len() as f32 * line).min(ui.available_height() * 0.35)
+        };
+        let list_height =
+            (ui.available_height() - dock_height - if dock.is_empty() { 0.0 } else { 8.0 })
+                .max(0.0);
         egui::ScrollArea::vertical()
             .id_salt("session-overview-list")
+            .max_height(list_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !self.demo {
@@ -605,18 +678,267 @@ impl Overview {
                     }
                     return;
                 }
-                if !SAMPLES.iter().any(|s| self.matches(s, self.filter)) {
+                if !SAMPLES
+                    .iter()
+                    .any(|s| self.matches(s, self.filter) && !self.is_docked(s.id))
+                {
                     ui.add_space(20.0);
                     ui.label(egui::RichText::new("No sessions").color(chrome_muted()));
                 }
                 for session in SAMPLES {
-                    if self.matches(session, self.filter) {
+                    if self.matches(session, self.filter) && !self.is_docked(session.id) {
                         ui.push_id(session.id, |ui| {
                             self.row(ui, session, "Agent briefing", false, None)
                         });
                     }
                 }
             });
+        if !dock.is_empty() {
+            self.reveal_focus = reveal_dock;
+            ui.separator();
+            ui.label(egui::RichText::new("Dock").small().color(chrome_muted()));
+            egui::ScrollArea::vertical()
+                .id_salt("session-overview-dock")
+                .max_height((dock_height - 28.0).max(0.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for entry in dock {
+                        ui.push_id(("dock", &entry.key), |ui| self.dock_row(ui, &entry));
+                    }
+                });
+            self.reveal_focus = false;
+        }
+    }
+
+    fn is_docked(&self, key: &str) -> bool {
+        self.temporary_dock.contains(key)
+            || self.context_refs.get(key).is_some_and(|(owner, id)| {
+                self.snapshots
+                    .get(owner)
+                    .and_then(|s| s.contexts.get(id))
+                    .is_some_and(|c| c.docked)
+            })
+    }
+
+    fn dock_entries(&mut self) -> Vec<DockEntry> {
+        if self.demo {
+            return SAMPLES
+                .iter()
+                .filter(|s| self.is_docked(s.id) && !self.dismissed.contains(s.id))
+                .map(|s| DockEntry {
+                    key: s.id.into(),
+                    title: s.title.into(),
+                    state: s.state,
+                })
+                .collect();
+        }
+        let mut entries = Vec::new();
+        let mut represented = std::collections::HashSet::new();
+        for (key, record) in &self.store.records {
+            if !record.visible() || !self.is_docked(key) {
+                continue;
+            }
+            let context = self.context_refs.get(key).and_then(|(owner, id)| {
+                represented.insert((owner.clone(), id.clone()));
+                self.snapshots.get(owner)?.contexts.get(id)
+            });
+            let title = context.map(|c| c.title().to_owned()).unwrap_or_else(|| {
+                record
+                    .briefing
+                    .as_ref()
+                    .map(|b| b.title.clone())
+                    .unwrap_or_else(|| {
+                        let prompt = record.prompt.lines().next().unwrap_or("");
+                        if prompt.is_empty() {
+                            "Agent session".into()
+                        } else {
+                            potty::agent::excerpt(prompt, 120)
+                        }
+                    })
+            });
+            entries.push(DockEntry {
+                key: key.clone(),
+                title,
+                state: WorkState::from_live(record.state),
+            });
+        }
+        // A docked context remains reachable even after its pane or daemon has gone away.
+        for (owner, snapshot) in &self.snapshots {
+            for (id, context) in &snapshot.contexts {
+                if !context.docked || represented.contains(&(owner.clone(), id.clone())) {
+                    continue;
+                }
+                let key = format!("context:{owner}:{id}");
+                self.context_refs
+                    .insert(key.clone(), (owner.clone(), id.clone()));
+                entries.push(DockEntry {
+                    key,
+                    title: context.title().into(),
+                    state: WorkState::Saved,
+                });
+            }
+        }
+        entries.sort_by(|a, b| a.title.cmp(&b.title).then(a.key.cmp(&b.key)));
+        entries
+    }
+
+    fn dock_button(&mut self, ui: &mut egui::Ui, key: &str, docked: bool) {
+        let persistent = self
+            .context_refs
+            .get(key)
+            .filter(|_| !self.temporary_dock.contains(key))
+            .and_then(|(owner, id)| {
+                let snapshot = self.snapshots.get(owner)?;
+                snapshot.supports_docking.then(|| {
+                    (
+                        owner.clone(),
+                        id.clone(),
+                        snapshot.contexts.get(id).cloned(),
+                    )
+                })
+            })
+            .and_then(|(owner, id, context)| context.map(|c| (owner, id, c)));
+        let enabled = persistent.as_ref().is_none_or(|(owner, id, _)| {
+            self.writable_owners.contains(owner)
+                && !self
+                    .pending_docks
+                    .contains_key(&(owner.clone(), id.clone()))
+        });
+        let tooltip = if !enabled {
+            "Waiting for the owning host; reconnect or refresh to update the dock"
+        } else if !docked {
+            "Restore session from dock"
+        } else if persistent.is_some() {
+            "Dock session (saved on its host)"
+        } else {
+            "Dock session for this window only; persistence requires saved contexts and an updated remote daemon"
+        };
+        if ui
+            .add_enabled_ui(enabled, |ui| {
+                dock_icon_button(ui, docked).on_hover_text(tooltip)
+            })
+            .inner
+            .on_disabled_hover_text(tooltip)
+            .clicked()
+        {
+            if let Some((owner, id, context)) = persistent {
+                self.pending_docks.insert(
+                    (owner.clone(), id.clone()),
+                    PendingDock {
+                        expected: context.edited,
+                        docked,
+                        started: std::time::Instant::now(),
+                    },
+                );
+                self.actions.push(OverviewAction::EditContext(
+                    potty::contexts::Message::Dock {
+                        owner,
+                        id,
+                        expected: context.edited,
+                        docked,
+                    },
+                ));
+            } else if docked {
+                self.temporary_dock.insert(key.into());
+            } else {
+                self.temporary_dock.remove(key);
+            }
+            if docked {
+                self.expanded = None;
+            } else {
+                self.view = if key.starts_with("context:") {
+                    View::Recent
+                } else {
+                    View::Current
+                };
+                self.search.clear();
+                self.filter = Filter::All;
+                if self
+                    .store
+                    .records
+                    .get(key)
+                    .is_some_and(|r| r.state == potty::agent::State::Ended)
+                {
+                    self.show_ended = true;
+                }
+                self.expanded = Some(key.into());
+                self.reveal_item = Some(key.into());
+            }
+        }
+    }
+
+    fn dock_row(&mut self, ui: &mut egui::Ui, entry: &DockEntry) {
+        let linked = self.locations.get(&entry.key).copied();
+        let focused = linked.is_some() && linked == self.focused_pane;
+        let background = ui.painter().add(egui::Shape::Noop);
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.set_min_height(24.0);
+                    self.dock_button(ui, &entry.key, false);
+                    let status = if entry.state == WorkState::Saved {
+                        "Saved".to_owned()
+                    } else if linked.is_none() && !self.demo {
+                        format!("Last: {}", entry.state.label().to_lowercase())
+                    } else {
+                        entry.state.label().to_owned()
+                    };
+                    let status_width = ui.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(
+                                status.clone(),
+                                egui::TextStyle::Small.resolve(ui.style()),
+                                entry.state.color(),
+                            )
+                            .size()
+                            .x
+                    });
+                    let width =
+                        (ui.available_width() - status_width - ui.spacing().item_spacing.x - 8.0)
+                            .max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 24.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(width);
+                            ui.add(egui::Label::new(&entry.title).truncate())
+                                .on_hover_text(&entry.title);
+                        },
+                    );
+                    ui.label(
+                        egui::RichText::new(status)
+                            .small()
+                            .color(entry.state.color()),
+                    );
+                });
+            })
+            .response;
+        if response.hovered() || focused {
+            ui.painter().set(
+                background,
+                egui::Shape::rect_filled(response.rect, 0, chrome_hover()),
+            );
+        }
+        if focused {
+            ui.painter().rect_stroke(
+                response.rect,
+                0,
+                active_item_stroke(),
+                egui::StrokeKind::Inside,
+            );
+            if self.reveal_focus {
+                response.scroll_to_me(None);
+            }
+        }
+        if response.clicked() && linked.is_some() {
+            self.actions.push(OverviewAction::Open(entry.key.clone()));
+        }
+        response.on_hover_text(if linked.is_some() {
+            "Switch to pane"
+        } else {
+            "Pane unavailable; restore the item to view its details"
+        });
     }
 
     fn matches(&self, session: &SampleSession, filter: Filter) -> bool {
@@ -637,6 +959,7 @@ impl Overview {
             .snapshots
             .iter()
             .flat_map(|(owner, s)| s.contexts.values().map(move |c| (owner.clone(), c.clone())))
+            .filter(|(_, c)| !c.docked)
             .filter(|(_, c)| self.view != View::Saved || c.annotation.kept)
             .filter(|(_, c)| {
                 query.is_empty()
@@ -719,12 +1042,14 @@ impl Overview {
             let response = ui.push_id(&key, |ui| {
                 self.row(ui, &row, "Last recorded briefing", briefing.is_none(), None)
             });
-            if self.reveal_focus
-                && self.focused_pane.is_some()
-                && self.locations.get(&key).copied() == self.focused_pane
+            if self.reveal_item.as_deref() == Some(&key)
+                || (self.reveal_focus
+                    && self.focused_pane.is_some()
+                    && self.locations.get(&key).copied() == self.focused_pane)
             {
                 response.inner.scroll_to_me(None);
                 self.reveal_focus = false;
+                self.reveal_item = None;
             }
         }
         self.reveal_focus = false;
@@ -745,7 +1070,6 @@ impl Overview {
         else {
             return;
         };
-        let writable = self.writable_owners.contains(&owner);
         ui.separator();
         if self
             .editor
@@ -818,69 +1142,103 @@ impl Overview {
             });
             ui.add_space(6.0);
         }
-        ui.horizontal_wrapped(|ui| {
-            if self.view != View::Current
-                && !self.locations.contains_key(key)
-                && ui
-                    .add_enabled(writable, egui::Button::new("Open shell"))
-                    .on_hover_text("Open a new shell in the recorded directory")
+    }
+
+    fn item_actions(&mut self, ui: &mut egui::Ui, key: &str) {
+        let context = self.context_refs.get(key).and_then(|(owner, id)| {
+            Some((
+                owner.clone(),
+                id.clone(),
+                self.snapshots.get(owner)?.contexts.get(id)?.clone(),
+            ))
+        });
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| self.context_refs.get(key) == Some(&(e.owner.clone(), e.id.clone())))
+        {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().button_padding.x = 4.0;
+            if let Some((owner, id, context)) = &context {
+                let writable = self.writable_owners.contains(owner)
+                    && !self
+                        .pending_docks
+                        .contains_key(&(owner.clone(), id.clone()));
+                if self.view != View::Current
+                    && !self.locations.contains_key(key)
+                    && ui
+                        .add_enabled(writable, egui::Button::new("Open shell").small())
+                        .on_hover_text("Open a new shell in the recorded directory")
+                        .clicked()
+                {
+                    self.actions.push(OverviewAction::OpenContext {
+                        owner: owner.clone(),
+                        id: id.clone(),
+                    });
+                }
+                if !context.annotation.kept
+                    && ui
+                        .add_enabled(writable, egui::Button::new("Keep").small())
+                        .clicked()
+                {
+                    let mut annotation = context.annotation.clone();
+                    annotation.kept = true;
+                    self.actions.push(OverviewAction::EditContext(
+                        potty::contexts::Message::Edit {
+                            owner: owner.clone(),
+                            id: id.clone(),
+                            expected: context.edited,
+                            annotation,
+                        },
+                    ));
+                }
+                if ui
+                    .add_enabled(writable, egui::Button::new("Edit notes").small())
                     .clicked()
-            {
-                self.actions.push(OverviewAction::OpenContext {
-                    owner: owner.clone(),
-                    id: id.clone(),
-                });
-            }
-            if !context.annotation.kept
-                && ui
-                    .add_enabled(writable, egui::Button::new("Keep"))
-                    .clicked()
-            {
-                let mut annotation = context.annotation.clone();
-                annotation.kept = true;
-                self.actions.push(OverviewAction::EditContext(
-                    potty::contexts::Message::Edit {
+                {
+                    self.editor = Some(Editor {
                         owner: owner.clone(),
                         id: id.clone(),
                         expected: context.edited,
-                        annotation,
-                    },
-                ));
+                        annotation: context.annotation.clone(),
+                        links: context.annotation.links.join("\n"),
+                        pending: false,
+                        pending_since: None,
+                    });
+                    self.editor_visible = true;
+                    self.context_error = None;
+                }
+                if self.view != View::Current
+                    && ui
+                        .add_enabled(writable, egui::Button::new("Forget...").small())
+                        .clicked()
+                {
+                    self.forget = Some((owner.clone(), id.clone()));
+                }
             }
-            if ui
-                .add_enabled(writable, egui::Button::new("Edit notes"))
-                .clicked()
-            {
-                self.editor = Some(Editor {
-                    owner: owner.clone(),
-                    id: id.clone(),
-                    expected: context.edited,
-                    annotation: context.annotation.clone(),
-                    links: context.annotation.links.join("\n"),
-                    pending: false,
-                    pending_since: None,
+            if self.view == View::Current {
+                self.dock_button(ui, key, true);
+            }
+            if self.demo || self.view == View::Current {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Dismiss").clicked() {
+                        if self.demo {
+                            self.dismissed.insert(key.to_owned());
+                        } else if let Some(record) = self.store.records.get_mut(key) {
+                            record.dismissed = record.revision();
+                            self.actions.push(OverviewAction::Dismiss(record.clone()));
+                        }
+                        self.expanded = None;
+                    }
                 });
-                self.editor_visible = true;
-                self.context_error = None;
-            }
-            if context.annotation.kept {
-                ui.label(egui::RichText::new("Kept").small().color(chrome_muted()));
-            }
-            if !writable {
-                ui.label(
-                    egui::RichText::new("Disconnected")
-                        .small()
-                        .color(chrome_muted()),
-                );
-            }
-            if self.view != View::Current
-                && ui
-                    .add_enabled(writable, egui::Button::new("Forget..."))
-                    .clicked()
-            {
-                self.forget = Some((owner.clone(), id.clone()));
             }
         });
+        let Some((owner, id, context)) = context else {
+            return;
+        };
         if self.forget.as_ref() == Some(&(owner.clone(), id.clone())) {
             ui.label(
                 egui::RichText::new("Forget this context and its notes?")
@@ -998,6 +1356,7 @@ impl Overview {
             .records
             .values()
             .filter(|r| self.matches_live(r, self.filter))
+            .filter(|r| !self.is_docked(&r.key()))
             .cloned()
             .collect();
         // Resolved panes group local and remote sessions alike. Detached sessions use their
@@ -1121,13 +1480,7 @@ impl Overview {
                 },
                 host: &r.host,
                 cwd: &r.cwd,
-                state: match r.state {
-                    State::Working => WorkState::Working,
-                    State::NeedsYou => WorkState::NeedsYou,
-                    State::ResponseReady => WorkState::ResponseReady,
-                    State::Ended => WorkState::Ended,
-                    State::Unknown => WorkState::Unknown,
-                },
+                state: WorkState::from_live(r.state),
                 availability: (r.state != State::Ended && !self.locations.contains_key(&key))
                     .then_some("Pane unavailable"),
                 summary,
@@ -1144,9 +1497,10 @@ impl Overview {
             let response = ui.push_id(&key, |ui| {
                 self.row(ui, &row, source, prompt_only, background)
             });
-            if reveal.as_deref() == Some(&key) {
+            if reveal.as_deref() == Some(&key) || self.reveal_item.as_deref() == Some(&key) {
                 response.inner.scroll_to_me(None);
                 self.reveal_focus = false;
+                self.reveal_item = None;
             }
         }
         // Do not keep pulling the scroll position toward a filtered-out or missing session.
@@ -1331,17 +1685,7 @@ impl Overview {
                         }
                         ui.add_space(6.0);
                         if !self.demo { self.context_details(ui, session.id); }
-                        ui.horizontal_wrapped(|ui| {
-                            if (self.demo || self.view == View::Current) && ui.button("Dismiss").clicked() {
-                                if self.demo {
-                                    self.dismissed.insert(session.id.to_owned());
-                                } else if let Some(record) = self.store.records.get_mut(session.id) {
-                                    record.dismissed = record.revision();
-                                    self.actions.push(OverviewAction::Dismiss(record.clone()));
-                                }
-                                self.expanded = None;
-                            }
-                        });
+                        self.item_actions(ui, session.id);
                     });
             }
         });
@@ -1385,6 +1729,47 @@ impl Overview {
     }
 }
 
+fn dock_icon_button(ui: &mut egui::Ui, dock: bool) -> egui::Response {
+    let (_, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            if dock {
+                "Dock session"
+            } else {
+                "Restore session"
+            },
+        )
+    });
+    if ui.is_rect_visible(response.rect) {
+        let visuals = ui.style().interact(&response);
+        if response.hovered() || response.has_focus() || response.is_pointer_button_down_on() {
+            ui.painter().rect_filled(response.rect, 4, visuals.bg_fill);
+        }
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                response.rect,
+                4,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        let center = response.rect.center();
+        let stroke = egui::Stroke::new(1.5, visuals.fg_stroke.color);
+        let direction = if dock { 1.0 } else { -1.0 };
+        ui.painter().add(egui::Shape::line(
+            vec![
+                center + egui::vec2(-5.0, -2.5 * direction),
+                center + egui::vec2(0.0, 2.5 * direction),
+                center + egui::vec2(5.0, -2.5 * direction),
+            ],
+            stroke,
+        ));
+    }
+    response
+}
+
 fn active_item_stroke() -> egui::Stroke {
     egui::Stroke::new(1.0, chrome_hover().lerp_to_gamma(chrome_muted(), 0.10))
 }
@@ -1415,6 +1800,303 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
+    fn dock_actions_layout_focus_and_confirmation() {
+        use potty::contexts::{Annotation, Context, Message, Snapshot};
+        fn frame(
+            ctx: &egui::Context,
+            overview: &mut Overview,
+            width: f32,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    overview.show(ctx);
+                },
+            )
+        }
+        fn rect(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+            output.shapes.iter().rev().find_map(|s| match &s.shape {
+                egui::Shape::Path(p)
+                    if matches!(label, "Dock session" | "Restore session")
+                        && p.points.len() == 3
+                        && p.points[2] - p.points[0] == egui::vec2(10.0, 0.0)
+                        && p.points[1] - p.points[0]
+                            == egui::vec2(
+                                5.0,
+                                if label == "Dock session" { 5.0 } else { -5.0 },
+                            ) =>
+                {
+                    let center = egui::Rect::from_points(&p.points).center();
+                    Some(egui::Rect::from_center_size(center, egui::vec2(24.0, 24.0)))
+                }
+                egui::Shape::Text(t)
+                    if t.galley.job.text == label
+                        && s.clip_rect.intersects(t.visual_bounding_rect()) =>
+                {
+                    Some(t.visual_bounding_rect())
+                }
+                _ => None,
+            })
+        }
+        fn click(ctx: &egui::Context, overview: &mut Overview, width: f32, label: &str) {
+            let output = frame(ctx, overview, width, vec![]);
+            let pos = rect(&output, label)
+                .unwrap_or_else(|| panic!("Missing {label}"))
+                .center();
+            click_at(ctx, overview, width, pos);
+        }
+        fn click_at(ctx: &egui::Context, overview: &mut Overview, width: f32, pos: egui::Pos2) {
+            frame(ctx, overview, width, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    ctx,
+                    overview,
+                    width,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    }],
+                );
+            }
+        }
+        for (width, font) in [
+            (320.0, 13.0),
+            (420.0, 13.0),
+            (900.0, 13.0),
+            (1280.0, 13.0),
+            (320.0, 18.0),
+        ] {
+            let ctx = egui::Context::default();
+            crate::apply_chrome_style(&ctx, font);
+            let mut overview = Overview::live();
+            overview.open = true;
+            let record = live_session("docked", 1);
+            let key = record.key();
+            overview.store.merge(record.clone());
+            overview.locations.insert(key.clone(), 1);
+            overview.expanded = Some(key.clone());
+            let mut snapshot = Snapshot::default();
+            let owner = snapshot.owner.clone();
+            snapshot.contexts.insert(
+                "work".into(),
+                Context {
+                    id: "work".into(),
+                    annotation: Annotation::default(),
+                    docked: false,
+                    edited: 0,
+                    updated: record.revision(),
+                    sessions: vec![record],
+                },
+            );
+            overview
+                .context_refs
+                .insert(key.clone(), (owner.clone(), "work".into()));
+            overview.writable_owners.insert(owner.clone());
+            overview.receive_snapshot(snapshot.clone());
+            for _ in 0..3 {
+                frame(&ctx, &mut overview, width, vec![]);
+            }
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            let dismiss = rect(&output, "Dismiss").unwrap();
+            for label in ["Keep", "Edit notes", "Dock session"] {
+                let action = rect(&output, label).unwrap();
+                assert!(
+                    (action.center().y - dismiss.center().y).abs() < 4.0,
+                    "{label} not beside Dismiss at {width}/{font}"
+                );
+                assert!(action.right() < dismiss.left(), "Dismiss must be rightmost");
+            }
+            assert!(dismiss.right() <= overview.panel_rect.unwrap().right());
+            click(&ctx, &mut overview, width, "Dock session");
+            assert!(matches!(
+                overview.actions.as_slice(),
+                [OverviewAction::EditContext(Message::Dock {
+                    docked: true,
+                    expected: 0,
+                    ..
+                })]
+            ));
+            assert!(!overview.is_docked(&key), "wait for host confirmation");
+            overview.actions.clear();
+            snapshot.contexts.get_mut("work").unwrap().docked = true;
+            snapshot.contexts.get_mut("work").unwrap().edited = 1;
+            overview.receive_snapshot(snapshot.clone());
+            assert!(overview.pending_docks.is_empty());
+            assert!(overview.sorted_records().is_empty());
+            overview.sync_focus(1);
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            let heading = rect(&output, "Dock").unwrap();
+            let title = rect(&output, "Task docked").unwrap();
+            assert!(heading.top() > 700.0, "dock must stay at the bottom");
+            assert!(title.top() > heading.bottom());
+            let outline = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.stroke == active_item_stroke() => Some(r.rect),
+                    _ => None,
+                })
+                .expect("active dock outline");
+            let status = rect(&output, "Working").unwrap();
+            let bounds = overview.panel_rect.unwrap();
+            // Side-panel hit bounds include an extra 5px resize margin on either side.
+            let margin = if overview.covers_terminal { 12.0 } else { 17.0 };
+            assert!((outline.left() - bounds.left() - margin).abs() < 2.0);
+            assert!(
+                (bounds.right() - outline.right() - margin).abs() < 2.0,
+                "dock highlight must span the panel content at {width}/{font}"
+            );
+            assert!(
+                (outline.right() - status.right() - 8.0).abs() < 3.0,
+                "status must have an 8px right inset at {width}/{font}"
+            );
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Rect(r) if r.fill == chrome_hover() && r.rect == outline)));
+            assert!(rect(&output, "Edit notes").is_none());
+            assert!(!overview.reveal_focus, "focus scrolling must settle");
+            let empty_space = egui::pos2((title.right() + status.left()) * 0.5, outline.center().y);
+            click_at(&ctx, &mut overview, width, empty_space);
+            assert!(
+                matches!(overview.actions.as_slice(), [OverviewAction::Open(k)] if k == &key),
+                "the empty part of the dock row must focus the pane too"
+            );
+            assert!(overview.is_docked(&key));
+            overview.actions.clear();
+            click(&ctx, &mut overview, width, "Task docked");
+            assert!(matches!(overview.actions.as_slice(), [OverviewAction::Open(k)] if k == &key));
+            assert!(overview.is_docked(&key), "navigation must not undock");
+            overview.actions.clear();
+            overview.filter = Filter::NeedsYou;
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            assert!(
+                rect(&output, "Task docked").is_some(),
+                "dock stays visible across filters"
+            );
+            click(&ctx, &mut overview, width, "Restore session");
+            assert!(matches!(
+                overview.actions.as_slice(),
+                [OverviewAction::EditContext(Message::Dock {
+                    docked: false,
+                    expected: 1,
+                    ..
+                })]
+            ));
+            snapshot.contexts.get_mut("work").unwrap().docked = false;
+            snapshot.contexts.get_mut("work").unwrap().edited = 2;
+            overview.receive_snapshot(snapshot.clone());
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            assert!(rect(&output, "Dock").is_none());
+            assert!(rect(&output, "Edit notes").is_some());
+            assert_eq!(overview.expanded.as_deref(), Some(key.as_str()));
+            assert!(overview.reveal_item.is_none());
+            overview.actions.clear();
+            click(&ctx, &mut overview, width, "Dock session");
+            overview.context_failed("Disk full".into());
+            assert!(overview.pending_docks.is_empty());
+            assert!(!overview.is_docked(&key));
+
+            // Old daemons still get a temporary dock, without sending an unsupported request.
+            snapshot.supports_docking = false;
+            overview.receive_snapshot(snapshot);
+            overview.expanded = Some(key.clone());
+            overview.actions.clear();
+            click(&ctx, &mut overview, width, "Dock session");
+            assert!(overview.is_docked(&key));
+            assert!(overview.actions.is_empty());
+            click(&ctx, &mut overview, width, "Restore session");
+            assert!(!overview.is_docked(&key));
+            assert!(overview.actions.is_empty());
+
+            overview.expanded = None;
+            overview.context_error = None;
+            for pane in 2..=21 {
+                let record = live_session(&format!("overflow-{pane:02}"), pane);
+                overview.temporary_dock.insert(record.key());
+                overview.locations.insert(record.key(), pane);
+                overview.store.merge(record);
+            }
+            overview.sync_focus(21);
+            for _ in 0..30 {
+                frame(&ctx, &mut overview, width, vec![]);
+            }
+            let output = frame(&ctx, &mut overview, width, vec![]);
+            assert!(
+                rect(&output, "Task overflow-21").is_some(),
+                "focused dock entry must scroll into view"
+            );
+            assert!(
+                rect(&output, "Task overflow-02").is_none(),
+                "dock must scroll independently"
+            );
+            assert!(
+                rect(&output, "Task docked").is_some(),
+                "main list must remain visible"
+            );
+            assert!(
+                rect(&output, "Dock").unwrap().top() > 550.0,
+                "large dock must leave space for main list"
+            );
+            let bounds = overview.panel_rect.unwrap();
+            for shape in &output.shapes {
+                if let egui::Shape::Text(t) = &shape.shape {
+                    let rect = t.visual_bounding_rect();
+                    if shape.clip_rect.intersects(rect) && bounds.intersects(rect) {
+                        assert!(
+                            rect.right() <= bounds.right() + 2.0,
+                            "dock text overflow at {width}/{font}: {}",
+                            t.galley.job.text
+                        );
+                    }
+                }
+            }
+            overview.sync_focus(21);
+            assert!(!overview.reveal_focus);
+        }
+    }
+
+    #[test]
+    fn docked_contexts_remain_accessible_without_live_records() {
+        use potty::contexts::{Annotation, Context, Snapshot};
+        let mut overview = Overview::live();
+        let mut snapshot = Snapshot::default();
+        let owner = snapshot.owner.clone();
+        snapshot.contexts.insert(
+            "work".into(),
+            Context {
+                id: "work".into(),
+                annotation: Annotation::default(),
+                docked: true,
+                edited: 1,
+                updated: 1,
+                sessions: vec![live_session("archived", 1)],
+            },
+        );
+        overview.receive_snapshot(snapshot);
+        assert!(overview.button_visible());
+        let entries = overview.dock_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, format!("context:{owner}:work"));
+        assert!(entries[0].state == WorkState::Saved);
+        assert!(
+            !overview.locations.contains_key(&entries[0].key),
+            "stored pane IDs must never become navigation targets"
+        );
+        overview.set_contexts_enabled(false);
+        assert!(overview.dock_entries().is_empty());
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn disabling_contexts_hides_history_without_disabling_live_overview() {
         use potty::contexts::{Annotation, Context, Snapshot};
         let mut overview = Overview::live();
@@ -1429,6 +2111,7 @@ mod tests {
             "work".into(),
             Context {
                 id: "work".into(),
+                docked: false,
                 annotation: Annotation {
                     kept: true,
                     ..Default::default()
@@ -1588,6 +2271,7 @@ mod tests {
                 "work".into(),
                 Context {
                     id: "work".into(),
+                    docked: false,
                     annotation: Annotation::default(),
                     edited: 0,
                     updated: record.revision(),

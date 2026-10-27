@@ -5887,6 +5887,7 @@ impl App {
                 }
                 overview::OverviewAction::EditContext(message) => {
                     if let potty::contexts::Message::Edit { owner, .. }
+                    | potty::contexts::Message::Dock { owner, .. }
                     | potty::contexts::Message::Forget { owner, .. } = &message
                     {
                         if let Some(repo) = &mut self.contexts

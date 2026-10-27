@@ -201,6 +201,18 @@ fn saved_contexts_survive_daemon_restart_and_open_a_shell_without_running_an_age
         .json(),
     }));
     assert!(c2.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| s.contexts[&id].annotation.kept)));
+    let edited = snapshot(&c2.collected.lock().unwrap().1).unwrap();
+    assert!(edited.supports_docking);
+    c2.send(Frame::Control(Control::Notify {
+        json: Message::Dock {
+            owner: owner.clone(),
+            id: id.clone(),
+            expected: edited.contexts[&id].edited,
+            docked: true,
+        }
+        .json(),
+    }));
+    assert!(c1.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| s.contexts[&id].docked)));
     // Stale edits are rejected; no other client's annotation is overwritten.
     c2.send(Frame::Control(Control::Notify {
         json: Message::Edit {
@@ -224,6 +236,18 @@ fn saved_contexts_survive_daemon_restart_and_open_a_shell_without_running_an_age
     assert!(c.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| s.contexts.contains_key(&id))));
     let restored = snapshot(&c.collected.lock().unwrap().1).unwrap();
     assert_eq!(restored.owner, owner);
+    assert!(restored.supports_docking);
+    assert!(restored.contexts[&id].docked);
+    c.send(Frame::Control(Control::Notify {
+        json: Message::Dock {
+            owner: owner.clone(),
+            id: id.clone(),
+            expected: restored.contexts[&id].edited,
+            docked: false,
+        }
+        .json(),
+    }));
+    assert!(c.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| !s.contexts[&id].docked)));
     assert_eq!(
         restored.contexts[&id].annotation.notes,
         "Review the API contract"
@@ -265,11 +289,12 @@ fn saved_contexts_survive_daemon_restart_and_open_a_shell_without_running_an_age
     assert!(c.wait(|_, ctrl| snapshot(ctrl).is_some_and(|s| {
         s.contexts[&id].sessions.len() == 1 && s.contexts[&id].sessions[0].session == "new-agent"
     })));
+    let current = snapshot(&c.collected.lock().unwrap().1).unwrap();
     c.send(Frame::Control(Control::Notify {
         json: Message::Forget {
             owner,
             id: id.clone(),
-            expected: restored.contexts[&id].edited,
+            expected: current.contexts[&id].edited,
         }
         .json(),
     }));

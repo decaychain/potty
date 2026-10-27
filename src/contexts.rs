@@ -48,6 +48,8 @@ pub fn link_valid(s: &str) -> bool {
 pub struct Context {
     pub id: String,
     pub annotation: Annotation,
+    #[serde(default)]
+    pub docked: bool,
     pub edited: u64,
     pub updated: u64,
     pub sessions: Vec<Record>,
@@ -86,6 +88,8 @@ impl Context {
 pub struct Snapshot {
     pub version: u32,
     pub owner: String,
+    #[serde(default)]
+    pub supports_docking: bool,
     pub contexts: BTreeMap<String, Context>,
 }
 
@@ -94,6 +98,7 @@ impl Default for Snapshot {
         Self {
             version: 1,
             owner: unique_id(),
+            supports_docking: true,
             contexts: BTreeMap::new(),
         }
     }
@@ -159,6 +164,13 @@ pub enum Message {
         expected: u64,
         annotation: Annotation,
     },
+    #[serde(rename = "potty_context_dock_v1")]
+    Dock {
+        owner: String,
+        id: String,
+        expected: u64,
+        docked: bool,
+    },
     #[serde(rename = "potty_context_forget_v1")]
     Forget {
         owner: String,
@@ -192,7 +204,9 @@ impl Message {
                 ..
             } => owner.len() <= 128 && id.len() <= 128 && annotation.valid(),
             Self::Error { message } => message.len() <= 1024,
-            Self::Forget { owner, id, .. } => owner.len() <= 128 && id.len() <= 128,
+            Self::Forget { owner, id, .. } | Self::Dock { owner, id, .. } => {
+                owner.len() <= 128 && id.len() <= 128
+            }
         };
         if let Self::Snapshot { snapshot } = &mut message {
             snapshot.retain_latest();
@@ -231,6 +245,12 @@ impl Repository {
                 expected,
                 annotation,
             } => self.edit(owner, id, *expected, annotation.clone()),
+            Message::Dock {
+                owner,
+                id,
+                expected,
+                docked,
+            } => self.dock(owner, id, *expected, *docked),
             Message::Forget {
                 owner,
                 id,
@@ -283,6 +303,8 @@ impl Repository {
             return Err(io::Error::other("Invalid saved context file"));
         }
         snapshot.retain_latest();
+        // Capabilities describe the running implementation, not the file's writer.
+        snapshot.supports_docking = true;
         Ok(Some(snapshot))
     }
 
@@ -371,6 +393,7 @@ impl Repository {
                 .or_insert_with(|| Context {
                     id: id.clone(),
                     annotation: Annotation::default(),
+                    docked: false,
                     edited: 0,
                     updated: 0,
                     sessions: Vec::new(),
@@ -403,7 +426,7 @@ impl Repository {
             let mut recent: Vec<_> = snapshot
                 .contexts
                 .values()
-                .filter(|c| !c.annotation.kept)
+                .filter(|c| !c.annotation.kept && !c.docked)
                 .map(|c| (c.updated, c.id.clone()))
                 .collect();
             recent.sort();
@@ -438,10 +461,13 @@ impl Repository {
                 && snapshot
                     .contexts
                     .values()
-                    .filter(|c| c.annotation.kept)
+                    .filter(|c| c.annotation.kept || c.docked)
                     .count()
                     >= SAVED_LIMIT
-                && !snapshot.contexts.get(id).is_some_and(|c| c.annotation.kept)
+                && !snapshot
+                    .contexts
+                    .get(id)
+                    .is_some_and(|c| c.annotation.kept || c.docked)
             {
                 return Err(io::Error::other("Saved context limit reached"));
             }
@@ -456,6 +482,34 @@ impl Repository {
             }
             c.annotation = annotation;
             c.edited = agent::now().max(c.edited + 1);
+            Ok(())
+        })
+    }
+
+    pub fn dock(&mut self, owner: &str, id: &str, expected: u64, docked: bool) -> io::Result<()> {
+        self.transaction(|snapshot| {
+            if snapshot.owner != owner {
+                return Err(io::Error::other("Context belongs to a different host"));
+            }
+            let protected = snapshot
+                .contexts
+                .values()
+                .filter(|c| c.annotation.kept || c.docked)
+                .count();
+            let context = snapshot
+                .contexts
+                .get_mut(id)
+                .ok_or_else(|| io::Error::other("Context no longer exists"))?;
+            if context.edited != expected {
+                return Err(io::Error::other(
+                    "Context changed in another window. Refresh before retrying.",
+                ));
+            }
+            if docked && !context.docked && !context.annotation.kept && protected >= SAVED_LIMIT {
+                return Err(io::Error::other("Saved context limit reached"));
+            }
+            context.docked = docked;
+            context.edited = agent::now().max(context.edited + 1);
             Ok(())
         })
     }
@@ -518,6 +572,87 @@ mod tests {
             "hook_event_name":"UserPromptSubmit", "session_id":session, "prompt":"Implement a dashboard", "cwd":"/tmp"
         }), "process-1".into(), "host".into(), Some(pane)).unwrap()
     }
+    #[test]
+    fn docking_survives_restart_updates_and_annotation_edits() {
+        let temp = Temp::new();
+        let mut repo = temp.repo();
+        let first = record("docked", 1);
+        repo.observe(&first).unwrap();
+        let id = repo.snapshot.for_record(&first).unwrap().id.clone();
+        let owner = repo.snapshot.owner.clone();
+        let message = Message::Dock {
+            owner: owner.clone(),
+            id: id.clone(),
+            expected: 0,
+            docked: true,
+        };
+        repo.apply(&Message::parse(&message.json()).unwrap())
+            .unwrap();
+        assert!(repo.snapshot.contexts[&id].docked);
+        assert!(
+            !repo.snapshot.contexts[&id].annotation.kept,
+            "docking is independent of Keep"
+        );
+        assert!(
+            repo.dock(&owner, &id, 0, false).is_err(),
+            "stale updates must not win"
+        );
+        let revision = repo.snapshot.contexts[&id].edited;
+        repo.edit(&owner, &id, revision, Annotation::default())
+            .unwrap();
+        assert!(
+            repo.snapshot.contexts[&id].docked,
+            "older clients' annotation edits preserve docking"
+        );
+        for i in 0..RECENT_LIMIT + 2 {
+            repo.observe(&record(&format!("other-{i}"), i as u64 + 2))
+                .unwrap();
+        }
+        drop(repo);
+        let mut repo = temp.repo();
+        assert!(repo.snapshot.supports_docking);
+        assert!(
+            repo.snapshot.contexts[&id].docked,
+            "docked work must not be evicted as recent history"
+        );
+        let mut resumed = first;
+        resumed.origin = "reconnected".into();
+        resumed.pane = Some(999);
+        resumed.prompt_at = agent::now();
+        repo.observe(&resumed).unwrap();
+        assert!(repo.snapshot.for_record(&resumed).unwrap().docked);
+        let revision = repo.snapshot.contexts[&id].edited;
+        repo.dock(&owner, &id, revision, false).unwrap();
+        assert!(!temp.repo().snapshot.contexts[&id].docked);
+    }
+
+    #[test]
+    fn old_snapshots_default_to_undocked_and_advertise_no_support() {
+        let temp = Temp::new();
+        let mut repo = temp.repo();
+        repo.observe(&record("legacy", 1)).unwrap();
+        let mut json = serde_json::to_value(Message::Snapshot {
+            snapshot: repo.snapshot.clone(),
+        })
+        .unwrap();
+        let snapshot = json["snapshot"].as_object_mut().unwrap();
+        snapshot.remove("supports_docking");
+        for context in snapshot["contexts"].as_object_mut().unwrap().values_mut() {
+            context.as_object_mut().unwrap().remove("docked");
+        }
+        let Message::Snapshot { snapshot } = Message::parse(&json.to_string()).unwrap() else {
+            panic!()
+        };
+        assert!(!snapshot.supports_docking);
+        assert!(snapshot.contexts.values().all(|c| !c.docked));
+        std::fs::write(&repo.path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        repo.refresh().unwrap();
+        assert!(
+            repo.snapshot.supports_docking,
+            "local capabilities must not depend on the old file"
+        );
+    }
+
     #[test]
     fn survives_restart_without_live_bindings_and_groups_resumed_sessions() {
         let temp = Temp::new();
