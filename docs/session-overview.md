@@ -268,6 +268,19 @@ Reopening the overview or selecting a view refreshes shared storage; live mirror
 between separate local windows/remote daemons is not yet implemented. Clients attached to the
 same daemon receive changes immediately.
 
+### Adaptive tab headers
+
+While Sessions is open, tabs whose panes all have live, undismissed overview entries
+use compact numbered headers. Docked entries count; saved history and ended sessions
+do not. Search and filters do not change tab widths. Mixed agent/shell tabs retain
+their captions, and closing Sessions restores normal headers.
+
+Tab captions shrink proportionally when space is tight, with full titles available
+on hover. Fixed toolbar controls remain visible. When minimum header widths no
+longer fit, the tab strip scrolls horizontally (including with the mouse wheel) and
+reveals the active tab on selection or resize. Compact tabs can be closed from
+their context menu.
+
 ### Session dock
 
 The down control moves an item into a compact **Dock** at the bottom of the overview. Each

@@ -18,6 +18,7 @@ mod clip;
 mod config;
 mod gridr;
 mod overview;
+mod tabbar;
 mod workspace;
 
 use std::collections::HashMap;
@@ -1896,83 +1897,79 @@ fn build_ui(
         egui::TopBottomPanel::top("tabbar")
             .frame(tabbar_frame())
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    for (i, _tab) in ws.tabs.iter().enumerate() {
-                        // Label + close grouped tightly so they read as one tab.
-                        ui.scope(|ui| {
-                            ui.spacing_mut().item_spacing.x = 3.0;
-                            let title = elide(&tab_titles[i], 24);
-                            if ui
-                                .add(
-                                    egui::Button::selectable(i == ws.active, title)
-                                        .corner_radius(egui::CornerRadius::same(6)),
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y.max(24.0)),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // Allocate fixed controls first so the tab strip cannot push them offscreen.
+                        // Automatic IDs would shift with the number of tabs before these controls.
+                        let controls = egui::UiBuilder::new()
+                            .id_salt("tabbar-controls")
+                            .global_scope(true)
+                            .layout(egui::Layout::right_to_left(egui::Align::Center));
+                        ui.scope_builder(controls, |ui| {
+                            let focus_detachable =
+                                detachable_panes.contains(&ws.active_tab().focus);
+                            ui.menu_button("☰", |ui| {
+                                full_menu(
+                                    ui,
+                                    actions,
+                                    cfg,
+                                    None,
+                                    focus_detachable,
+                                    overview.enabled,
                                 )
-                                .clicked()
-                            {
-                                actions.push(Action::SelectTab(i));
-                            }
-                            let close =
-                                egui::Button::new(egui::RichText::new("×").weak()).frame(false);
-                            if ui.add(close).on_hover_text("Close tab").clicked() {
-                                actions.push(Action::CloseTab(i));
-                            }
-                        });
-                    }
-                    if icon_button(ui, "+", "New tab").clicked() {
-                        actions.push(Action::NewLocalTab);
-                    }
-                    // Automatic IDs would shift with the number of tabs before these controls.
-                    let controls = egui::UiBuilder::new()
-                        .id_salt("tabbar-controls")
-                        .global_scope(true)
-                        .layout(egui::Layout::right_to_left(egui::Align::Center));
-                    ui.scope_builder(controls, |ui| {
-                        let focus_detachable = detachable_panes.contains(&ws.active_tab().focus);
-                        ui.menu_button("☰", |ui| {
-                            full_menu(ui, actions, cfg, None, focus_detachable, overview.enabled)
-                        });
-                        if show_overview_button && overview_button(ui, overview.open).clicked() {
-                            actions.push(Action::ToggleOverview);
-                        }
-                        // Attention-feed bell — present once the feed has latched the bar on. Shows
-                        // the waiting count; toggles the overlay.
-                        if chrome_latched {
-                            // The overview button can disappear independently of the bell.
-                            let bell = egui::UiBuilder::new()
-                                .id_salt("tabbar-bell")
-                                .global_scope(true);
-                            ui.scope_builder(bell, |ui| {
-                                let empty = pending.is_empty();
-                                let label = if empty {
-                                    "\u{1F514}".to_string() // 🔔
-                                } else {
-                                    format!("\u{1F514} {}", pending.len())
-                                };
-                                let hover = if empty {
-                                    "Nothing waiting — click to dismiss"
-                                } else {
-                                    "Sessions waiting for you"
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::selectable(feed_open, label)
-                                            .corner_radius(egui::CornerRadius::same(6)),
-                                    )
-                                    .on_hover_text(hover)
-                                    .clicked()
-                                {
-                                    // With nothing waiting, the bell is a dismiss: un-latch the bar.
-                                    // Otherwise it toggles the overlay.
-                                    actions.push(if empty {
-                                        Action::DismissFeed
-                                    } else {
-                                        Action::ShowFeed(!feed_open)
-                                    });
-                                }
                             });
-                        }
-                    });
-                });
+                            if show_overview_button && overview_button(ui, overview.open).clicked()
+                            {
+                                actions.push(Action::ToggleOverview);
+                            }
+                            // Attention-feed bell — present once the feed has latched the bar on. Shows
+                            // the waiting count; toggles the overlay.
+                            if chrome_latched {
+                                // The overview button can disappear independently of the bell.
+                                let bell = egui::UiBuilder::new()
+                                    .id_salt("tabbar-bell")
+                                    .global_scope(true);
+                                ui.scope_builder(bell, |ui| {
+                                    let empty = pending.is_empty();
+                                    let label = if empty {
+                                        "\u{1F514}".to_string() // 🔔
+                                    } else {
+                                        format!("\u{1F514} {}", pending.len())
+                                    };
+                                    let hover = if empty {
+                                        "Nothing waiting — click to dismiss"
+                                    } else {
+                                        "Sessions waiting for you"
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::selectable(feed_open, label)
+                                                .corner_radius(egui::CornerRadius::same(6)),
+                                        )
+                                        .on_hover_text(hover)
+                                        .clicked()
+                                    {
+                                        // With nothing waiting, the bell is a dismiss: un-latch the bar.
+                                        // Otherwise it toggles the overlay.
+                                        actions.push(if empty {
+                                            Action::DismissFeed
+                                        } else {
+                                            Action::ShowFeed(!feed_open)
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                        ui.push_id("tabbar-new", |ui| {
+                            if icon_button(ui, "+", "New tab").clicked() {
+                                actions.push(Action::NewLocalTab);
+                            }
+                        });
+                        tabbar::show(ui, ws, tab_titles, &overview.represented_panes(), actions);
+                    },
+                );
             });
     }
 
@@ -6833,14 +6830,16 @@ mod tests {
         ws.new_tab();
         let mut overview = crate::overview::Overview::demo();
         overview.open = false;
-        let frame = |ws: &crate::workspace::Workspace, overview: &mut crate::overview::Overview| {
+        let frame = |ws: &crate::workspace::Workspace,
+                     overview: &mut crate::overview::Overview,
+                     width: f32| {
             let mut actions = Vec::new();
             let titles = vec!["shell".to_owned(); ws.tabs.len()];
             ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(1000.0, 700.0),
+                        egui::vec2(width, 700.0),
                     )),
                     ..Default::default()
                 },
@@ -6884,7 +6883,7 @@ mod tests {
         };
         for step in 0..5 {
             for _ in 0..3 {
-                let output = frame(&ws, &mut overview);
+                let output = frame(&ws, &mut overview, 1000.0);
                 assert!(!output.shapes.iter().any(|s| matches!(&s.shape,
                     egui::Shape::Rect(r) if r.stroke.color == egui::Color32::RED && r.rect.right() > 850.0)),
                     "toolbar widget IDs changed at step {step}");
@@ -6897,6 +6896,39 @@ mod tests {
                     overview.open = false;
                 }
                 _ => {}
+            }
+        }
+        for _ in 0..40 {
+            ws.new_tab();
+        }
+        for width in [240.0, 320.0, 600.0, 1280.0] {
+            for _ in 0..3 {
+                let output = frame(&ws, &mut overview, width);
+                let text_rect = |label: &str| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|s| match &s.shape {
+                            egui::Shape::Text(t) if t.galley.job.text == label => {
+                                Some(t.visual_bounding_rect())
+                            }
+                            _ => None,
+                        })
+                        .unwrap()
+                };
+                let menu = text_rect("\u{2630}");
+                let bell = text_rect("\u{1f514}");
+                let new_tab = text_rect("+");
+                assert!(menu.right() < width && menu.bottom() < 50.0);
+                assert!(bell.right() < menu.left());
+                assert!(new_tab.right() < bell.left());
+                for shape in &output.shapes {
+                    if let egui::Shape::Text(t) = &shape.shape
+                        && t.galley.job.text == "shell"
+                    {
+                        assert!(shape.clip_rect.right() < new_tab.left());
+                    }
+                }
             }
         }
     }

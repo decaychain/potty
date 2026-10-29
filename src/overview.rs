@@ -371,6 +371,20 @@ impl Overview {
         }
     }
 
+    /// Live navigation targets, independent of search, filters, and docking. Stored contexts
+    /// and original remote pane numbers are not evidence that a pane is represented here.
+    pub fn represented_panes(&self) -> std::collections::HashSet<u64> {
+        if !self.enabled || !self.open || self.demo {
+            return std::collections::HashSet::new();
+        }
+        self.store
+            .records
+            .values()
+            .filter(|r| r.visible() && r.state != potty::agent::State::Ended)
+            .filter_map(|r| self.locations.get(&r.key()).copied())
+            .collect()
+    }
+
     pub fn button_visible(&self) -> bool {
         self.enabled
             && (self.open
@@ -2427,6 +2441,36 @@ mod tests {
             Some(pane),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn tab_compaction_uses_only_live_resolved_panes_and_ignores_filters() {
+        let mut overview = Overview::live();
+        overview.open = true;
+        let record = live_session("remote-agent", 90);
+        let key = record.key();
+        overview.store.records.insert(key.clone(), record);
+        // The transport's pane number is not the local navigation target.
+        overview.locations.insert(key.clone(), 4);
+        overview.locations.insert("context:host:saved".into(), 7);
+        assert_eq!(overview.represented_panes(), [4].into());
+        overview.search = "does not match".into();
+        overview.view = View::Saved;
+        overview.temporary_dock.insert(key.clone());
+        assert_eq!(overview.represented_panes(), [4].into());
+        overview.open = false;
+        assert!(overview.represented_panes().is_empty());
+        overview.open = true;
+        overview.store.records.get_mut(&key).unwrap().state = potty::agent::State::Ended;
+        overview.show_ended = true;
+        assert!(overview.represented_panes().is_empty());
+        let r = overview.store.records.get_mut(&key).unwrap();
+        r.state = potty::agent::State::Working;
+        r.dismissed = r.revision();
+        assert!(overview.represented_panes().is_empty());
+        overview.store.records.get_mut(&key).unwrap().dismissed = 0;
+        overview.locations.clear();
+        assert!(overview.represented_panes().is_empty());
     }
 
     #[test]
