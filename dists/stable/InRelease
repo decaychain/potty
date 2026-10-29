@@ -5,26 +5,26 @@ Origin: Potty
 Label: Potty
 Suite: stable
 Codename: stable
-Date: Tue, 27 Oct 2026 22:34:40 UTC
+Date: Thu, 29 Oct 2026 22:23:39 UTC
 Architectures: amd64
 Components: main
 Description: Potty terminal emulator APT repository
 MD5Sum:
- d31279ad55bacf4d27e5f3927624da0c 1578 main/binary-amd64/Packages
- ce5cdbbd1637dabe37bb138fa3ab193a 824 main/binary-amd64/Packages.gz
+ ce699bea9d4fc66016ef4d30f5b5954b 1578 main/binary-amd64/Packages
+ aa6128a354785ed2c08b42c76c6c3c7d 821 main/binary-amd64/Packages.gz
  ca629b36f0cfc9812a257f10df88dd84 131 main/binary-amd64/Release
 SHA1:
- b03e776deff529c400aa294b530f17c67b4d9593 1578 main/binary-amd64/Packages
- 670ec62686e29d8fbf0d79e894b04b1bdaa6a4bd 824 main/binary-amd64/Packages.gz
+ bc5c5cd3055d88eb70edfa1f4c3ecc16ed5b77f6 1578 main/binary-amd64/Packages
+ 163a1fc062bb8e4c1e7a7bad1da05f4952cb5491 821 main/binary-amd64/Packages.gz
  7eaab59f65f118d6f362a1ec4e6ceab046bf44c7 131 main/binary-amd64/Release
 SHA256:
- a1a34398b8588a503ad24da7e8a7c6e94ff6fcf1a3e3cebf7149824d384c9d15 1578 main/binary-amd64/Packages
- 6e26cbe0f56a03bdc77f853aca14a679299c7df664bea1c83e44c67ab1ecc6e2 824 main/binary-amd64/Packages.gz
+ 8cba785a1e053d7ab5b52828b0bc18cdaa06c303faffccc07baa8bcdbd31edb5 1578 main/binary-amd64/Packages
+ 685d777be71a3450cafb2d6ac9b09a587da68aae0ad1bdf8e7be25c53388950f 821 main/binary-amd64/Packages.gz
  935c8785bcb9d9c449ea581f90585f0a205110907f211a2427352820d78e2eb2 131 main/binary-amd64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQSplwom4iCHh01u0FZtw96lJ24TmAUCauEnAAAKCRBtw96lJ24T
-mNNJAP9tQ0RdcJDv1JVV5tpvBCzoO5gFE7aXOkop9GLpWoAgjAEAmrODp3iSYM/U
-O/rbQTo+mT0udJ4Dshf4mN+W/xj1UQo=
-=Z6UW
+iHUEARYKAB0WIQSplwom4iCHh01u0FZtw96lJ24TmAUCauPHawAKCRBtw96lJ24T
+mEeNAQCH35v/V8nglGzeskeRKDQ8v1iOLKZpx0iy4Pm7L5wlXAEA8/hLeYo6z3Xq
+v0ZORhK+Tu1KW9+Mky6L8GDxbUCZrwU=
+=gn1D
 -----END PGP SIGNATURE-----

@@ -1,35 +1,35 @@
 Package: potty
-Version: 0.4.15
+Version: 0.4.16
 Architecture: amd64
 Maintainer: Decay Chain <noreply@github.com>
 Homepage: https://github.com/decaychain/potty
 Depends: libc6 (>= 2.39), libgcc-s1 (>= 4.2), libwayland-client0, libwayland-cursor0, libwayland-egl1, libxkbcommon0, libvulkan1, fonts-dejavu-core
-Recommends: potty-tools (= 0.4.15)
+Recommends: potty-tools (= 0.4.16)
 Priority: optional
 Section: x11
-Filename: pool/main/p/potty/potty_0.4.15_amd64.deb
-Size: 7745710
-SHA256: fb2400c4af56d43de4701d5909fb90c01e95fb72363ed7e47c20b1c4e62fc69e
-SHA1: 2eb110a12342c7f60995802f4b02137917d6d3ac
-MD5sum: 4a62321184b29194c92fa7f7e13a4194
+Filename: pool/main/p/potty/potty_0.4.16_amd64.deb
+Size: 7761416
+SHA256: 329c66b34c2760c44e3e03f85a27db7ff6abbb467f49be9ff72be7ee56cbf255
+SHA1: 574adb778b75f7f5a53f60b8cd5b3692041d03eb
+MD5sum: fd2b476848e338a11c3211d3c421ba77
 Description: GPU-accelerated terminal emulator with visual tabs and panes
  potty is a GPU-accelerated terminal emulator in Rust with a deliberately
  visual, pointer-driven take on tabs and panes. It is Wayland-native, with a
  custom per-cell GPU renderer and real multiplexing.
 
 Package: potty-tools
-Version: 0.4.15
+Version: 0.4.16
 Architecture: amd64
 Maintainer: Decay Chain <noreply@github.com>
 Homepage: https://github.com/decaychain/potty
 Depends: libc6 (>= 2.39), libgcc-s1 (>= 4.2)
 Priority: optional
 Section: utils
-Filename: pool/main/p/potty-tools/potty-tools_0.4.15_amd64.deb
-Size: 913328
-SHA256: 6e0109fd02a314d669590f824ada19d86b96350b2c645b944e1ac727e8377e5b
-SHA1: 33d70fdff041a86984f9530fa08b20981315d9b5
-MD5sum: c86ee49a1dce74dda051054a1087d5ca
+Filename: pool/main/p/potty-tools/potty-tools_0.4.16_amd64.deb
+Size: 913350
+SHA256: fab3c6e8e45c1957319fbc5ce142bd7f84d27e812aab2cacece853355428b1d8
+SHA1: 057a57de1812524fd743e29c45b1b4d397d1db2e
+MD5sum: fb3dcb08531a4537ce4a4b9878d700ef
 Description: Remote-session and notification helpers for potty
  Helper programs for potty that carry none of the GUI dependencies:
  potty-session is the SSH persistence daemon, and potty-notify is the
