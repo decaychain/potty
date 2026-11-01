@@ -305,6 +305,8 @@ pub enum Event {
     Input { pane: u64, bytes: Vec<u8> },
     /// The agent looked at the pane.
     Read { pane: u64 },
+    /// The agent tried to type, but the share is read-only. The terminal doesn't show this.
+    Refused { pane: u64 },
 }
 
 struct Entry<T> {
@@ -472,6 +474,9 @@ fn serve_one<T: EventListener>(conn: Stream, registry: &Registry<T>, on_event: &
     }
 }
 
+const READ_ONLY: &str =
+    "this share is read-only; ask the user to switch the share badge on the pane to 'can type'";
+
 const ENDED: &str = "this share has ended (the user stopped sharing or closed the pane); ask the user to share the pane again";
 
 /// Answer one request. Public so tests can drive it without a socket.
@@ -516,9 +521,8 @@ pub fn handle<T: EventListener>(
         }
         Op::Send { text, keys, enter } => {
             if mode != Mode::CanType {
-                return Response::err(
-                    "this share is read-only; ask the user to switch the share badge on the pane to 'can type'",
-                );
+                on_event(Event::Refused { pane });
+                return Response::err(READ_ONLY);
             }
             let (bytes, cursor) = {
                 let t = term.lock().unwrap();
@@ -575,9 +579,8 @@ pub fn handle<T: EventListener>(
             max_chars,
         } => {
             if mode != Mode::CanType {
-                return Response::err(
-                    "this share is read-only; ask the user to switch the share badge on the pane to 'can type'",
-                );
+                on_event(Event::Refused { pane });
+                return Response::err(READ_ONLY);
             }
             if let Err(e) = check_command(command) {
                 return Response::err(e);
@@ -1507,6 +1510,10 @@ mod tests {
         };
         let r = handle(&send, &registry, &on_event);
         assert!(!r.ok && r.error.unwrap().contains("read-only"));
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            [Event::Refused { pane: 7 }]
+        );
         registry.set_mode(7, Mode::CanType);
         assert!(handle(&send, &registry, &on_event).ok);
         assert!(sent.lock().unwrap().contains(&Event::Input {

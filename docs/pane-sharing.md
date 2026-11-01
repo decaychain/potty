@@ -26,7 +26,10 @@ the output back, while the user watches and can take the pane back at any moment
    The same actions are in the pane's right-click menu.
 3. In the agent's pane: "help me with X in Potty pane `psh-…`" (paste the ID).
 4. The agent uses the Potty MCP tools with that ID. The badge shows "Agent reading" or
-   "Agent typing" while it works.
+   "Agent typing" while it works. When a read-only share blocks an attempt to type, the badge
+   shows "Agent tried to type (read-only)" in red for a few seconds, since the terminal itself
+   shows nothing. (A per-share input log was tried and dropped: the terminal already shows what
+   the agent typed, and the larger badge jumped around.)
 5. **×**, *Stop sharing* in the menu, or closing the pane ends the share immediately. The ID is
    then worthless; sharing again issues a new one.
 
@@ -159,8 +162,8 @@ tool timeout long enough for `pane_wait`; Codex's own approval policy is left un
 
 1. **Foundation** *(implemented)*: cross-platform endpoint, ID, badge with mode / copy / stop,
    MCP server with snapshot / read / send / wait, installer.
-2. **Comfort**: `pane_run` with markers and OSC 133 *(implemented)*; *(later)* input log in the
-   badge, confirm mode. Dropped: "Share with → [agent session]" from the overview. The request
+2. **Comfort**: `pane_run` with markers and OSC 133, refusal notice in the badge *(implemented)*;
+   *(later)* confirm mode. Dropped: an input log in the badge (see *User flow*). Dropped: "Share with → [agent session]" from the overview. The request
    has to be typed into the agent anyway, and switching panes costs nothing.
 3. **Unification** *(later)*: move the notify listener onto the same cross-platform transport, so
    the session overview also works on Windows.

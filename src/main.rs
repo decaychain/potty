@@ -553,6 +553,16 @@ enum Action {
 
 /// How long a badge shows agent activity or "copied".
 const SHARE_FLASH: Duration = Duration::from_millis(1500);
+/// A refused attempt stays up longer: it's the one thing the terminal itself doesn't show.
+const SHARE_REFUSED: &str = "Agent tried to type (read-only)";
+
+fn share_flash(what: &str) -> Duration {
+    if what == SHARE_REFUSED {
+        Duration::from_secs(4)
+    } else {
+        SHARE_FLASH
+    }
+}
 
 /// One shared pane, as the chrome draws it.
 struct ShareBadge {
@@ -1700,7 +1710,12 @@ fn share_badge(
                             Some(a) => format!("● {a}"),
                             None => format!("● Agent · {}", badge.mode.label()),
                         };
-                        ui.label(egui::RichText::new(status).color(chrome_warn()).strong());
+                        let color = if badge.activity == Some(SHARE_REFUSED) {
+                            chrome_error()
+                        } else {
+                            chrome_warn()
+                        };
+                        ui.label(egui::RichText::new(status).color(color).strong());
                         if !expanded {
                             return;
                         }
@@ -5169,14 +5184,14 @@ impl App {
         self.shares.retain(|p| self.terms.contains_key(&p));
         let list = self.shares.list();
         self.share_activity
-            .retain(|p, (at, _)| list.contains_key(p) && at.elapsed() < SHARE_FLASH);
+            .retain(|p, (at, what)| list.contains_key(p) && at.elapsed() < share_flash(what));
         let mut ui = ShareUi::default();
         for (pane, (_, mode)) in list {
             if let Some(t) = self.terms.get(&pane) {
                 self.shares.set_title(pane, &t.title);
             }
             let activity = self.share_activity.get(&pane).map(|(at, what)| {
-                let left = SHARE_FLASH.saturating_sub(at.elapsed());
+                let left = share_flash(what).saturating_sub(at.elapsed());
                 ui.repaint_in = Some(ui.repaint_in.map_or(left, |d| d.min(left)));
                 *what
             });
@@ -6549,11 +6564,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                 }
             }
+            UserEvent::Share(share::Event::Refused { pane }) => {
+                self.share_activity
+                    .insert(pane, (Instant::now(), SHARE_REFUSED));
+                self.request_redraw();
+            }
             UserEvent::Share(share::Event::Read { pane }) => {
-                let typing = self.share_activity.get(&pane).is_some_and(|(at, what)| {
-                    *what == "Agent typing" && at.elapsed() < SHARE_FLASH
+                // A read is the least telling activity: don't cover typing or a refusal.
+                let busy = self.share_activity.get(&pane).is_some_and(|(at, what)| {
+                    *what != "Agent reading" && at.elapsed() < share_flash(what)
                 });
-                if !typing {
+                if !busy {
                     self.share_activity
                         .insert(pane, (Instant::now(), "Agent reading"));
                 }

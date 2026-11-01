@@ -261,7 +261,9 @@ fn format_response(tool: &str, r: &Response) -> String {
         }
         match r.via.as_deref() {
             Some("osc133") => head.push("end detected by: shell integration (OSC 133)".into()),
-            Some("marker") => head.push("end detected by: end marker appended to the command".into()),
+            Some("marker") => {
+                head.push("end detected by: end marker appended to the command".into())
+            }
             _ => {}
         }
     } else if let Some(reason) = &r.reason {
