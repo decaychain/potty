@@ -25,6 +25,21 @@ enum State {
     OscEsc,
 }
 
+/// One semantic-prompt mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// `A`: a prompt starts.
+    PromptStart,
+    /// `B`: the prompt ends; what follows is the typed command.
+    CommandStart,
+    /// `C`: the command runs; what follows is its output.
+    OutputStart,
+    /// `D`: a command that ran (after a `C`) finished with this exit code.
+    CommandEnd(i32),
+    /// `D` with no command run since the last prompt (shell start, an empty line).
+    IdleEnd,
+}
+
 #[derive(Default)]
 pub struct Scanner {
     state: State,
@@ -39,8 +54,21 @@ impl Scanner {
     /// Watch a chunk of PTY output (sequences may span chunks). Returns the exit codes of
     /// any commands that finished in this chunk, oldest first.
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<i32> {
+        self.scan_marks(bytes)
+            .into_iter()
+            .filter_map(|(_, m)| match m {
+                Mark::CommandEnd(code) => Some(code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Watch a chunk of PTY output and return every mark in it, with the offset just past the
+    /// mark's terminator — so a caller can parse the bytes up to a mark, then note where the
+    /// cursor is at that mark.
+    pub fn scan_marks(&mut self, bytes: &[u8]) -> Vec<(usize, Mark)> {
         let mut done = Vec::new();
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             match self.state {
                 State::Ground => {
                     if b == 0x1b {
@@ -60,7 +88,9 @@ impl Scanner {
                 }
                 State::Osc => match b {
                     0x07 => {
-                        self.finish(&mut done);
+                        if let Some(m) = self.finish() {
+                            done.push((i + 1, m));
+                        }
                         self.state = State::Ground;
                     }
                     0x1b => self.state = State::OscEsc,
@@ -74,7 +104,9 @@ impl Scanner {
                 },
                 State::OscEsc => {
                     if b == b'\\' {
-                        self.finish(&mut done);
+                        if let Some(m) = self.finish() {
+                            done.push((i + 1, m));
+                        }
                         self.state = State::Ground;
                     } else {
                         // Not an ST — the OSC was aborted mid-sequence. The ESC we swallowed
@@ -96,19 +128,27 @@ impl Scanner {
     }
 
     /// A complete OSC payload is in `buf` — react if it's a 133 mark.
-    fn finish(&mut self, done: &mut Vec<i32>) {
+    fn finish(&mut self) -> Option<Mark> {
         if self.overflow {
-            return;
+            return None;
         }
         match self.buf.strip_prefix(b"133;") {
-            Some([b'C', ..]) => self.executing = true,
+            Some([b'C', ..]) => {
+                self.executing = true;
+                Some(Mark::OutputStart)
+            }
             // A new prompt implies the previous command is over — self-heals a lost `D`.
-            Some([b'A', ..]) => self.executing = false,
+            Some([b'A', ..]) => {
+                self.executing = false;
+                Some(Mark::PromptStart)
+            }
+            Some([b'B', ..]) => Some(Mark::CommandStart),
             Some([b'D', rest @ ..]) if self.executing => {
                 self.executing = false;
-                done.push(parse_code(rest));
+                Some(Mark::CommandEnd(parse_code(rest)))
             }
-            _ => {}
+            Some([b'D', ..]) => Some(Mark::IdleEnd),
+            _ => None,
         }
     }
 }
@@ -140,6 +180,25 @@ mod tests {
             s.scan(b"\x1b]133;C\x07make: error\r\n\x1b]133;D;2\x07"),
             [2]
         );
+    }
+
+    #[test]
+    fn marks_carry_offsets_past_their_terminator() {
+        let mut s = Scanner::default();
+        let stream = b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x1b\\out\x1b]133;D;0\x07";
+        let marks = s.scan_marks(stream);
+        let kinds: Vec<Mark> = marks.iter().map(|(_, m)| *m).collect();
+        assert_eq!(
+            kinds,
+            [
+                Mark::PromptStart,
+                Mark::CommandStart,
+                Mark::OutputStart,
+                Mark::CommandEnd(0)
+            ]
+        );
+        assert_eq!(&stream[marks[2].0..marks[3].0 - 10], b"out");
+        assert_eq!(marks[3].0, stream.len());
     }
 
     #[test]

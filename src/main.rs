@@ -497,6 +497,8 @@ struct Terminal {
     /// Coalesces wake-ups: the reader sets it and only sends a `Wake` when it was unset, so a
     /// flood of PTY reads can't spam the main loop with one event each. Cleared when handled.
     wake_pending: Arc<AtomicBool>,
+    /// Where the shell's OSC 133 marks landed in the grid (for agents running commands).
+    marks: Arc<Mutex<share::Marks>>,
 }
 
 enum Action {
@@ -3719,6 +3721,8 @@ impl App {
         let proxy = self.proxy.clone();
         let wake_pending = Arc::new(AtomicBool::new(false));
         let reader_wake = wake_pending.clone();
+        let marks = Arc::new(Mutex::new(share::Marks::default()));
+        let reader_marks = marks.clone();
         thread::spawn(move || {
             let mut parser = Processor::<StdSyncHandler>::new();
             let mut osc = potty::osc133::Scanner::default();
@@ -3727,11 +3731,14 @@ impl App {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        {
-                            let mut t = reader_term.lock().unwrap();
-                            parser.advance(&mut *t, &buf[..n]);
-                        }
-                        for code in osc.scan(&buf[..n]) {
+                        let codes = share::feed(
+                            &mut parser,
+                            &reader_term,
+                            &mut osc,
+                            &reader_marks,
+                            &buf[..n],
+                        );
+                        for code in codes {
                             let _ = proxy.send_event(UserEvent::CommandExit(id, code));
                         }
                         // Only wake the main loop if it hasn't an unhandled wake already —
@@ -3767,6 +3774,7 @@ impl App {
                 title: default_title.clone(),
                 default_title,
                 wake_pending,
+                marks,
             },
         );
         self.dirty.insert(id); // never rendered yet → prepare on first sight
@@ -4142,6 +4150,7 @@ impl App {
                 title: "shell".into(),
                 default_title: "shell".into(),
                 wake_pending: Arc::new(AtomicBool::new(false)),
+                marks: Arc::new(Mutex::new(share::Marks::default())),
             },
         );
         self.remote_panes.insert(local);
@@ -4239,10 +4248,7 @@ impl App {
                     if let Some(t) = self.terms.get_mut(&local)
                         && let Backend::Remote { parser, osc, .. } = &mut t.backend
                     {
-                        let mut term = t.term.lock().unwrap();
-                        parser.advance(&mut *term, &bytes);
-                        drop(term);
-                        codes = osc.scan(&bytes);
+                        codes = share::feed(parser, &t.term, osc, &t.marks, &bytes);
                     }
                     for code in codes {
                         self.on_command_exit(local, code);
@@ -5134,9 +5140,12 @@ impl App {
 
     /// Lend `pane` to an agent, or change the mode of its share. A new share copies its ID.
     fn share_pane(&mut self, pane: PaneId, mode: share::Mode) {
-        let Some(term) = self.arc(pane) else { return };
+        let Some(t) = self.terms.get(&pane) else {
+            return;
+        };
+        let (term, marks) = (t.term.clone(), t.marks.clone());
         let fresh = !self.shares.list().contains_key(&pane);
-        match self.shares.share(pane, mode, term) {
+        match self.shares.share(pane, mode, term, marks) {
             Ok(_) if fresh => self.copy_share_id(pane),
             Ok(_) => {}
             Err(e) => self.error_msg = Some(format!("Could not share the pane: {e}")),

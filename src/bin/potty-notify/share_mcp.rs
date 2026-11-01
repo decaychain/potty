@@ -26,8 +26,8 @@ pane_read fetches output since a cursor.
 
 Avoid pagers and programs that wait for input: use `| cat`, `--no-pager`, `SYSTEMD_PAGER=cat`. \
 If pane_run times out, the command may be waiting for input: pane_snapshot and answer it, or \
-send C-c. pane_run appends a short end marker to the command line, which shows up in the pane \
-and in shell history.
+send C-c. When the pane's shell has OSC 133 integration, pane_run types the command as is; \
+otherwise it appends a short end marker, which shows up in the pane and in shell history.
 
 The pane belongs to the user and may be a production system: run only what the task needs, \
 prefer read-only commands, and ask before anything destructive. Never type passwords or second \
@@ -259,6 +259,11 @@ fn format_response(tool: &str, r: &Response) -> String {
             Some("ended") => head.push("the share ended while waiting".into()),
             _ => {}
         }
+        match r.via.as_deref() {
+            Some("osc133") => head.push("end detected by: shell integration (OSC 133)".into()),
+            Some("marker") => head.push("end detected by: end marker appended to the command".into()),
+            _ => {}
+        }
     } else if let Some(reason) = &r.reason {
         head.push(format!("returned because: {reason}"));
     }
@@ -275,6 +280,9 @@ fn format_response(tool: &str, r: &Response) -> String {
                 ""
             }
         ));
+        if s.shell_integration {
+            head.push("shell integration: at an OSC 133 prompt".into());
+        }
     }
     if let Some(c) = &r.cursor {
         head.push(format!("cursor: {c}"));

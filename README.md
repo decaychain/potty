@@ -129,6 +129,9 @@ The marks are the same ones kitty/ghostty/VS Code use, so an already-integrated 
 extra setup. potty only reacts to commands that actually ran (a bare Enter or the shell starting
 up doesn't pulse).
 
+The same marks let an agent in a [shared pane](docs/pane-sharing.md) run commands without an
+appended end marker. That also works on a remote host, when the remote shell has the snippet.
+
 ## Attention feed
 
 When you run several agentic CLIs at once they spend a lot of time *blocked on you* — a permission

@@ -118,7 +118,9 @@ fn agent_reads_types_and_waits_through_the_mcp_server() {
         }),
     )
     .unwrap();
-    let id = registry.share(3, Mode::ReadOnly, term.clone()).unwrap();
+    let id = registry
+        .share(3, Mode::ReadOnly, term.clone(), Default::default())
+        .unwrap();
 
     let mut mcp = Mcp::start();
     let init = mcp.rpc("initialize", json!({"protocolVersion": "2025-06-18"}));
@@ -195,21 +197,73 @@ fn agent_reads_types_and_waits_through_the_mcp_server() {
 }
 
 /// pane_run against interactive shells in a real PTY: real echo, prompt, and line editing, in a
-/// narrow pane so the marked line wraps.
+/// narrow pane so the typed line wraps. Each shell runs once plain (end marker) and once with
+/// OSC 133 integration (no marker typed), including a non-integrated subshell inside it.
 #[cfg(unix)]
 #[test]
 fn pane_run_works_in_interactive_shells() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    use potty::share::{Op, PROTOCOL, Request, handle};
+    use potty::osc133::Scanner;
+    use potty::share::{Marks, Op, PROTOCOL, Request, Response, feed, handle};
     use std::io::Read;
 
-    for (shell, args) in [
-        ("bash", &["--norc", "--noprofile", "-i"][..]),
-        ("zsh", &["-f", "-i"][..]),
-    ] {
-        if Command::new(shell).arg("-c").arg("true").status().is_err() {
+    let dir = std::env::temp_dir().join(format!("potty-share-shells-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bashrc = dir.join("bashrc");
+    std::fs::write(
+        &bashrc,
+        "PS1='\\[\\e]133;A\\a\\]test$ \\[\\e]133;B\\a\\]'\nPS0='\\e]133;C\\a'\nPROMPT_COMMAND='printf \"\\e]133;D;%s\\a\" \"$?\"'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".zshrc"),
+        "PROMPT=$'%{\\e]133;A\\a%}test$ %{\\e]133;B\\a%}'\npreexec() { print -n '\\e]133;C\\a' }\nprecmd() { local s=$?; print -n \"\\e]133;D;$s\\a\" }\n",
+    )
+    .unwrap();
+    let bashrc = bashrc.to_str().unwrap().to_string();
+
+    struct Case {
+        shell: &'static str,
+        args: Vec<String>,
+        integrated: bool,
+    }
+    let cases = [
+        Case {
+            shell: "bash",
+            args: vec!["--norc".into(), "--noprofile".into(), "-i".into()],
+            integrated: false,
+        },
+        Case {
+            shell: "bash",
+            args: vec![
+                "--noprofile".into(),
+                "--rcfile".into(),
+                bashrc.clone(),
+                "-i".into(),
+            ],
+            integrated: true,
+        },
+        Case {
+            shell: "zsh",
+            args: vec!["-f".into(), "-i".into()],
+            integrated: false,
+        },
+        Case {
+            shell: "zsh",
+            args: vec!["-i".into()],
+            integrated: true,
+        },
+    ];
+    for case in cases {
+        if Command::new(case.shell)
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_err()
+        {
             continue;
         }
+        let label = format!("{} integrated={}", case.shell, case.integrated);
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 12,
@@ -218,11 +272,12 @@ fn pane_run_works_in_interactive_shells() {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut cmd = CommandBuilder::new(shell);
-        cmd.args(args);
+        let mut cmd = CommandBuilder::new(case.shell);
+        cmd.args(&case.args);
         cmd.env("PS1", "test$ ");
         cmd.env("PROMPT", "test$ ");
         cmd.env("TERM", "xterm-256color");
+        cmd.env("ZDOTDIR", &dir);
         let mut child = pty.slave.spawn_command(cmd).unwrap();
         drop(pty.slave);
         let term: SharedTerm = Arc::new(Mutex::new(Term::new(
@@ -230,23 +285,29 @@ fn pane_run_works_in_interactive_shells() {
             &TermSize::new(40, 12),
             VoidListener,
         )));
+        let marks = Arc::new(Mutex::new(Marks::default()));
         let mut reader = pty.master.try_clone_reader().unwrap();
-        let reader_term = term.clone();
+        let (reader_term, reader_marks) = (term.clone(), marks.clone());
         std::thread::spawn(move || {
             let mut p: Processor<StdSyncHandler> = Processor::new();
+            let mut osc = Scanner::default();
             let mut buf = [0u8; 4096];
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
-                p.advance(&mut *reader_term.lock().unwrap(), &buf[..n]);
+                feed(&mut p, &reader_term, &mut osc, &reader_marks, &buf[..n]);
             }
         });
         let writer = Mutex::new(pty.master.take_writer().unwrap());
+        let typed = Mutex::new(Vec::<u8>::new());
         let registry = Registry::new("9-9");
-        let id = registry.share(1, Mode::CanType, term.clone()).unwrap();
+        let id = registry
+            .share(1, Mode::CanType, term.clone(), marks)
+            .unwrap();
         let on_event = |e: Event| {
             if let Event::Input { bytes, .. } = e {
+                typed.lock().unwrap().extend(&bytes);
                 let mut w = writer.lock().unwrap();
                 w.write_all(&bytes).unwrap();
                 w.flush().unwrap();
@@ -263,7 +324,6 @@ fn pane_run_works_in_interactive_shells() {
                 &on_event,
             )
         };
-        // Let the shell print its first prompt.
         let ready = ask(Op::Wait {
             since: None,
             pattern: Some("test$".into()),
@@ -275,9 +335,9 @@ fn pane_run_works_in_interactive_shells() {
         assert_eq!(
             ready.reason.as_deref(),
             Some("pattern"),
-            "{shell}: no prompt"
+            "{label}: no prompt"
         );
-        let run = |command: &str| {
+        let run = |command: &str| -> Response {
             ask(Op::Run {
                 command: command.into(),
                 shell: None,
@@ -285,13 +345,49 @@ fn pane_run_works_in_interactive_shells() {
                 max_chars: None,
             })
         };
-        let r = run("echo one; echo two");
-        assert_eq!(r.reason.as_deref(), Some("done"), "{shell}: {r:?}");
-        assert_eq!(r.exit_code, Some(0));
-        assert_eq!(r.text, "one\ntwo", "{shell}");
+        let first = run("echo one; echo two");
+        assert_eq!(first.reason.as_deref(), Some("done"), "{label}: {first:?}");
+        assert_eq!(first.exit_code, Some(0), "{label}");
+        assert_eq!(first.text, "one\ntwo", "{label}");
+        // The first run can't trust integration yet (no `C` seen before it): later ones do.
         let r = run("ls /definitely/not/here 2>/dev/null");
-        assert_eq!(r.exit_code, Some(2), "{shell}: {r:?}");
-        assert_eq!(r.text, "", "{shell}");
+        assert_eq!(r.exit_code, Some(2), "{label}: {r:?}");
+        assert_eq!(r.text, "", "{label}");
+        let expect = if case.integrated { "osc133" } else { "marker" };
+        assert_eq!(r.via.as_deref(), Some(expect), "{label}");
+        let r = run("printf 'x%.0s' $(seq 1 60); echo");
+        assert_eq!(r.text, "x".repeat(60), "{label}: wrapped output");
+        if case.integrated {
+            let before = typed.lock().unwrap().len();
+            let r = run("echo clean");
+            assert_eq!(r.text, "clean", "{label}");
+            let typed_now = String::from_utf8_lossy(&typed.lock().unwrap()[before..]).to_string();
+            assert!(
+                !typed_now.contains("__PTY_"),
+                "{label}: marker typed: {typed_now:?}"
+            );
+            // A shell without integration inside (like ssh or sudo -i): the marker takes over.
+            ask(Op::Send {
+                text: Some("sh".into()),
+                keys: vec![],
+                enter: true,
+            });
+            ask(Op::Wait {
+                since: None,
+                pattern: None,
+                regex: false,
+                quiet_ms: Some(300),
+                timeout_ms: Some(5_000),
+                max_chars: None,
+            });
+            let r = run("echo inside; false");
+            assert_eq!(r.via.as_deref(), Some("marker"), "{label}");
+            assert_eq!(
+                (r.text.as_str(), r.exit_code),
+                ("inside", Some(1)),
+                "{label}: {r:?}"
+            );
+        }
         let _ = child.kill();
     }
 }

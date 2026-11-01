@@ -8,10 +8,12 @@
 //! Transport: one JSON request line and one JSON response line per connection, over a local
 //! socket (a Unix socket in a private directory, or a named pipe on Windows).
 
+use crate::osc133::{Mark, Scanner};
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::{Term, TermMode, cell::Flags};
+use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use interprocess::local_socket::{ListenerOptions, Stream, prelude::*};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -219,6 +221,9 @@ pub struct Screen {
     pub cursor_col: usize,
     /// A full-screen program (vim, less, htop) is using the alternate screen.
     pub alt_screen: bool,
+    /// The pane sits at a prompt of a shell that emits OSC 133 marks, so `run` needs no marker.
+    #[serde(default)]
+    pub shell_integration: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -248,6 +253,9 @@ pub struct Response {
     /// Exit status of a finished `run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// How a `run` detected the end: `osc133` (shell integration) or `marker`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<Screen>,
 }
@@ -303,6 +311,7 @@ struct Entry<T> {
     secret: String,
     mode: Mode,
     term: Arc<Mutex<Term<T>>>,
+    marks: Arc<Mutex<Marks>>,
     title: String,
 }
 
@@ -322,7 +331,13 @@ impl<T> Registry<T> {
     }
 
     /// Share `pane` (or change the mode of an existing share). Returns the share ID.
-    pub fn share(&self, pane: u64, mode: Mode, term: Arc<Mutex<Term<T>>>) -> io::Result<String> {
+    pub fn share(
+        &self,
+        pane: u64,
+        mode: Mode,
+        term: Arc<Mutex<Term<T>>>,
+        marks: Arc<Mutex<Marks>>,
+    ) -> io::Result<String> {
         let mut shares = self.shares.lock().unwrap();
         if let Some(e) = shares.get_mut(&pane) {
             e.mode = mode;
@@ -335,6 +350,7 @@ impl<T> Registry<T> {
                 secret: id.secret.clone(),
                 mode,
                 term,
+                marks,
                 title: String::new(),
             },
         );
@@ -388,12 +404,20 @@ impl<T> Registry<T> {
         shares
             .iter()
             .find(|(_, e)| constant_time_eq(e.secret.as_bytes(), secret.as_bytes()))
-            .map(|(pane, e)| (*pane, e.mode, e.term.clone(), e.title.clone()))
+            .map(|(pane, e)| {
+                (
+                    *pane,
+                    e.mode,
+                    e.term.clone(),
+                    e.marks.clone(),
+                    e.title.clone(),
+                )
+            })
     }
 }
 
-/// A live share, as one request sees it: (pane, mode, grid, pane title).
-type Found<T> = (u64, Mode, Arc<Mutex<Term<T>>>, String);
+/// A live share, as one request sees it: (pane, mode, grid, shell marks, pane title).
+type Found<T> = (u64, Mode, Arc<Mutex<Term<T>>>, Arc<Mutex<Marks>>, String);
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -468,10 +492,10 @@ pub fn handle<T: EventListener>(
     if id.instance != registry.instance {
         return Response::err(ENDED);
     }
-    let Some((pane, mode, term, title)) = registry.find(&id.secret) else {
+    let Some((pane, mode, term, marks, title)) = registry.find(&id.secret) else {
         return Response::err(ENDED);
     };
-    let mut resp = match &req.op {
+    let resp = match &req.op {
         Op::Snapshot => {
             on_event(Event::Read { pane });
             let t = term.lock().unwrap();
@@ -555,6 +579,55 @@ pub fn handle<T: EventListener>(
                     "this share is read-only; ask the user to switch the share badge on the pane to 'can type'",
                 );
             }
+            if let Err(e) = check_command(command) {
+                return Response::err(e);
+            }
+            let timeout =
+                Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS));
+            let integrated = {
+                let m = marks.lock().unwrap();
+                m.ready().then_some(m.finished)
+            };
+            if let Some(before) = integrated {
+                // The shell reports where output starts and ends: type the command as is.
+                let start = Cursor::at_cursor(&term.lock().unwrap());
+                on_event(Event::Input {
+                    pane,
+                    bytes: format!("{}\r", command.trim()).into_bytes(),
+                });
+                let mut resp = wait(
+                    registry,
+                    &id.secret,
+                    &term,
+                    Some(&start.encode()),
+                    Some(&Matcher::CommandEnd(marks.clone(), before)),
+                    None,
+                    timeout,
+                    usize::MAX,
+                );
+                let output = (resp.reason.as_deref() == Some("pattern")).then(|| {
+                    let t = term.lock().unwrap();
+                    let m = marks.lock().unwrap();
+                    (m.output_text(&t), m.exit)
+                });
+                match output {
+                    Some((Some(mut text), exit)) => {
+                        resp.truncated |= truncate_head(&mut text, limit(*max_chars));
+                        resp.text = text;
+                        resp.exit_code = exit;
+                        resp.reason = Some("done".into());
+                    }
+                    // Finished, but the output's position is gone (cleared or scrolled away).
+                    Some((None, exit)) => {
+                        finish_run(&mut resp, None, limit(*max_chars));
+                        resp.exit_code = exit;
+                        resp.reason = Some("done".into());
+                    }
+                    None => finish_run(&mut resp, None, limit(*max_chars)),
+                }
+                resp.via = Some("osc133".into());
+                return finish(resp, mode, title, &marks);
+            }
             let shell = match Shell::parse(shell.as_deref()) {
                 Ok(s) => s,
                 Err(e) => return Response::err(e),
@@ -576,8 +649,6 @@ pub fn handle<T: EventListener>(
                 bytes: format!("{line}\r").into_bytes(),
             });
             let marker = regex::Regex::new(&format!("{MARKER}{nonce}_(-?\\d+)__")).unwrap();
-            let timeout =
-                Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS));
             let mut resp = wait(
                 registry,
                 &id.secret,
@@ -588,13 +659,22 @@ pub fn handle<T: EventListener>(
                 timeout,
                 usize::MAX,
             );
-            finish_run(&mut resp, &marker, limit(*max_chars));
+            finish_run(&mut resp, Some(&marker), limit(*max_chars));
+            resp.via = Some("marker".into());
             resp
         }
     };
+    finish(resp, mode, title, &marks)
+}
+
+/// Stamp what every successful response carries.
+fn finish(mut resp: Response, mode: Mode, title: String, marks: &Mutex<Marks>) -> Response {
     resp.mode = Some(mode);
     if !title.is_empty() {
         resp.title = Some(title);
+    }
+    if let Some(screen) = resp.screen.as_mut() {
+        screen.shell_integration = marks.lock().unwrap().ready();
     }
     resp
 }
@@ -606,6 +686,8 @@ fn limit(max: Option<usize>) -> usize {
 enum Matcher {
     Plain(String),
     Regex(regex::Regex),
+    /// More commands than this have finished (OSC 133 `D`).
+    CommandEnd(Arc<Mutex<Marks>>, u64),
 }
 
 impl Matcher {
@@ -613,6 +695,7 @@ impl Matcher {
         match self {
             Matcher::Plain(p) => text.contains(p.as_str()),
             Matcher::Regex(r) => r.is_match(text),
+            Matcher::CommandEnd(marks, before) => marks.lock().unwrap().finished > *before,
         }
     }
 }
@@ -682,12 +765,17 @@ fn wait<T: EventListener>(
 
 /// One buffer row as text, and whether it soft-wraps into the next row.
 fn row_text<T>(term: &Term<T>, abs: usize) -> (String, bool) {
+    row_text_cols(term, abs, 0, usize::MAX)
+}
+
+/// Columns `from..to` of a buffer row as text, and whether the row soft-wraps.
+fn row_text_cols<T>(term: &Term<T>, abs: usize, from: usize, to: usize) -> (String, bool) {
     let grid = term.grid();
     let line = Line(abs as i32 - grid.history_size() as i32);
     let row = &grid[line];
     let cols = grid.columns();
     let mut s = String::with_capacity(cols);
-    for c in 0..cols {
+    for c in from.min(cols)..to.min(cols) {
         let cell = &row[Column(c)];
         if cell
             .flags
@@ -724,6 +812,7 @@ fn screen_info<T>(term: &Term<T>) -> Screen {
         cursor_row: grid.cursor.point.line.0.max(0) as usize,
         cursor_col: grid.cursor.point.column.0,
         alt_screen: term.mode().contains(TermMode::ALT_SCREEN),
+        shell_integration: false,
     }
 }
 
@@ -905,6 +994,113 @@ fn read_since<T>(term: &Term<T>, since: Option<&Cursor>, max_chars: usize) -> Re
 }
 
 // ---------------------------------------------------------------------------
+// Shell integration (OSC 133)
+// ---------------------------------------------------------------------------
+
+/// Where a pane's shell put its OSC 133 marks, recorded as the bytes are parsed.
+#[derive(Default)]
+pub struct Marks {
+    last: Option<Mark>,
+    /// The shell has marked a command's output start at least once. Integrations without `C`
+    /// can't report where output ends, so `run` keeps using its marker for them.
+    seen_output_start: bool,
+    /// The current prompt followed a `D`. A shell that inherited a marked `PS1` (`sh` from an
+    /// integrated bash, `sudo -E`) prints `A`/`B` but never `C`/`D`; its prompt follows a `C`.
+    prompt_after_end: bool,
+    /// Commands finished so far.
+    finished: u64,
+    exit: Option<i32>,
+    /// Cursor (and column) at the last `C` and `D`.
+    output_start: Option<(Cursor, usize)>,
+    output_end: Option<(Cursor, usize)>,
+}
+
+impl Marks {
+    fn record<T>(&mut self, term: &Term<T>, mark: Mark) {
+        let at = (Cursor::at_cursor(term), term.grid().cursor.point.column.0);
+        match mark {
+            Mark::OutputStart => {
+                self.seen_output_start = true;
+                self.output_start = Some(at);
+                self.output_end = None;
+            }
+            Mark::CommandEnd(code) => {
+                self.finished += 1;
+                self.exit = Some(code);
+                self.output_end = Some(at);
+            }
+            Mark::PromptStart => {
+                self.prompt_after_end =
+                    matches!(self.last, Some(Mark::CommandEnd(_) | Mark::IdleEnd));
+            }
+            Mark::CommandStart | Mark::IdleEnd => {}
+        }
+        self.last = Some(mark);
+    }
+
+    /// At an integrated shell's prompt. After a `C` with no `D` a command is still running, and
+    /// it may be another shell without integration (ssh, sudo -i): then `run` uses its marker.
+    pub fn ready(&self) -> bool {
+        self.seen_output_start
+            && self.prompt_after_end
+            && matches!(self.last, Some(Mark::PromptStart | Mark::CommandStart))
+    }
+
+    /// The last command's output, between its `C` and `D` marks, if both can still be found.
+    fn output_text<T>(&self, term: &Term<T>) -> Option<String> {
+        let ((start, start_col), (end, end_col)) =
+            (self.output_start.as_ref()?, self.output_end.as_ref()?);
+        let (from, to) = (start.locate(term)?, end.locate(term)?);
+        if to < from {
+            return None;
+        }
+        let mut text = String::new();
+        let mut continued = false;
+        for r in from..=to.min(total_rows(term).saturating_sub(1)) {
+            if r > from && !continued {
+                text.push('\n');
+            }
+            let first = if r == from { *start_col } else { 0 };
+            let last = if r == to { *end_col } else { usize::MAX };
+            let (row, wrapped) = row_text_cols(term, r, first, last);
+            text.push_str(&row);
+            continued = wrapped && r != to;
+        }
+        Some(text.trim_end_matches(['\n', ' ']).to_string())
+    }
+}
+
+/// Parse PTY output into the grid, noting the cursor at each OSC 133 mark. Returns the exit codes
+/// of commands that finished, oldest first (as [`Scanner::scan`] does).
+pub fn feed<T: EventListener>(
+    parser: &mut Processor<StdSyncHandler>,
+    term: &Mutex<Term<T>>,
+    osc: &mut Scanner,
+    marks: &Mutex<Marks>,
+    bytes: &[u8],
+) -> Vec<i32> {
+    let found = osc.scan_marks(bytes);
+    let mut t = term.lock().unwrap();
+    if found.is_empty() {
+        parser.advance(&mut *t, bytes);
+        return Vec::new();
+    }
+    let mut m = marks.lock().unwrap();
+    let mut codes = Vec::new();
+    let mut prev = 0;
+    for (end, mark) in found {
+        parser.advance(&mut *t, &bytes[prev..end]);
+        m.record(&t, mark);
+        if let Mark::CommandEnd(code) = mark {
+            codes.push(code);
+        }
+        prev = end;
+    }
+    parser.advance(&mut *t, &bytes[prev..]);
+    codes
+}
+
+// ---------------------------------------------------------------------------
 // Run: commands with an end marker
 // ---------------------------------------------------------------------------
 
@@ -937,15 +1133,8 @@ impl Shell {
 /// contains that string (the pieces are split by quotes or carets), so the shell's echo of the
 /// line can't be mistaken for the marker.
 pub fn marked_command(command: &str, shell: Shell, nonce: &str) -> Result<String, String> {
+    check_command(command)?;
     let command = command.trim();
-    if command.is_empty() {
-        return Err("command is empty".into());
-    }
-    if command.contains(['\n', '\r']) {
-        return Err(
-            "pass a single command line; chain commands with ';' or '&&', or use pane_send for multi-line input".into(),
-        );
-    }
     // A trailing `&` already separates commands; `& ;` would be a syntax error.
     let sep = if command.ends_with('&') && !command.ends_with("&&") {
         " "
@@ -963,14 +1152,28 @@ pub fn marked_command(command: &str, shell: Shell, nonce: &str) -> Result<String
     })
 }
 
-/// Turn a run's raw `wait` result into the command's output and exit status.
-fn finish_run(resp: &mut Response, marker: &regex::Regex, max_chars: usize) {
+/// A run takes one non-empty command line.
+fn check_command(command: &str) -> Result<(), String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("command is empty".into());
+    }
+    if command.contains(['\n', '\r']) {
+        return Err(
+            "pass a single command line; chain commands with ';' or '&&', or use pane_send for multi-line input".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Turn a run's raw `wait` result into the command's output and, with a marker, exit status.
+fn finish_run(resp: &mut Response, marker: Option<&regex::Regex>, max_chars: usize) {
     if !resp.ok {
         return;
     }
     // The first line is the prompt with the typed command.
     let body = resp.text.split_once('\n').map_or("", |(_, rest)| rest);
-    let (output, code) = match marker.captures(body) {
+    let (output, code) = match marker.and_then(|m| m.captures(body)) {
         Some(c) => (&body[..c.get(0).unwrap().start()], c[1].parse().ok()),
         None => (body, None),
     };
@@ -1223,6 +1426,39 @@ mod tests {
     }
 
     #[test]
+    fn marks_bound_a_commands_output() {
+        let t = Mutex::new(term(20, 6, 100));
+        let marks = Mutex::new(Marks::default());
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        let mut osc = Scanner::default();
+        let mut go = |s: &str| super::feed(&mut parser, &t, &mut osc, &marks, s.as_bytes());
+        go("\x1b]133;A\x07$ \x1b]133;B\x07");
+        // A prompt without any `C` seen yet: not trusted for runs.
+        assert!(!marks.lock().unwrap().ready());
+        go("ls\r\n\x1b]133;C\x07a long line that wraps around\r\nb");
+        assert!(!marks.lock().unwrap().ready(), "still running");
+        let codes = go("\x1b]133;D;3\x07\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(codes, [3]);
+        {
+            let m = marks.lock().unwrap();
+            assert!(m.ready());
+            assert_eq!(m.exit, Some(3));
+        }
+        // A subshell that inherited the marked prompt but sends no `C`/`D`.
+        go("sh\r\n\x1b]133;C\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(!marks.lock().unwrap().ready());
+        // An empty line at an integrated prompt: `D` without a command keeps trust.
+        go("\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(marks.lock().unwrap().ready());
+        go("\x1b]133;C\x07a long line that wraps around\r\nb\x1b]133;D;3\x07\x1b]133;A\x07");
+        let m = marks.lock().unwrap();
+        assert_eq!(
+            m.output_text(&t.lock().unwrap()).unwrap(),
+            "a long line that wraps around\nb"
+        );
+    }
+
+    #[test]
     fn run_extracts_output_and_status() {
         let marker = regex::Regex::new(&format!("{MARKER}abc_(-?\\d+)__")).unwrap();
         let mut resp = Response {
@@ -1231,7 +1467,7 @@ mod tests {
             reason: Some("pattern".into()),
             ..Response::default()
         };
-        finish_run(&mut resp, &marker, 1000);
+        finish_run(&mut resp, Some(&marker), 1000);
         assert_eq!(resp.text, "building\nok");
         assert_eq!(resp.exit_code, Some(2));
         assert_eq!(resp.reason.as_deref(), Some("done"));
@@ -1255,7 +1491,9 @@ mod tests {
     fn modes_are_enforced_and_unshare_is_immediate() {
         let registry = Registry::new("1-2");
         let t = Arc::new(Mutex::new(term(20, 5, 100)));
-        let id = registry.share(7, Mode::ReadOnly, t.clone()).unwrap();
+        let id = registry
+            .share(7, Mode::ReadOnly, t.clone(), Default::default())
+            .unwrap();
         let sent = Mutex::new(Vec::new());
         let on_event = |e: Event| sent.lock().unwrap().push(e);
         let send = Request {
@@ -1276,7 +1514,12 @@ mod tests {
             bytes: b"ls\r".to_vec()
         }));
         // Re-sharing keeps the ID; a wrong secret is refused.
-        assert_eq!(registry.share(7, Mode::CanType, t).unwrap(), id);
+        assert_eq!(
+            registry
+                .share(7, Mode::CanType, t, Default::default())
+                .unwrap(),
+            id
+        );
         let forged = Request {
             v: PROTOCOL,
             id: format!("psh-1-2-{}", "0".repeat(32)),
@@ -1291,7 +1534,9 @@ mod tests {
     fn wait_returns_on_pattern_quiet_and_end() {
         let registry = Arc::new(Registry::new("1-2"));
         let t = Arc::new(Mutex::new(term(40, 5, 100)));
-        let id = registry.share(1, Mode::CanType, t.clone()).unwrap();
+        let id = registry
+            .share(1, Mode::CanType, t.clone(), Default::default())
+            .unwrap();
         let mark = Cursor::at_cursor(&t.lock().unwrap()).encode();
         let writer = {
             let t = t.clone();
