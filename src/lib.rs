@@ -10,5 +10,6 @@ pub mod osc133;
 pub mod proto;
 pub mod remote;
 pub mod settings;
+pub mod share;
 pub mod snapshot;
 pub mod term_env;

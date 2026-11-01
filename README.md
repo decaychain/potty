@@ -79,6 +79,11 @@ Or [build from source](#build--run).
   waiting on you, gathered out-of-band over a socket rather than scraped from the screen, so a
   session in a **background pane** still surfaces. Click an entry to jump to its pane. See
   [Attention feed](#attention-feed) and [the design doc](docs/attention-feed.md).
+- **Pane sharing** *(experimental)* — lend a live pane (say, an SSH session behind jump hosts
+  and a second factor) to an agent in another pane: right-click → *Share with agent*, paste the
+  copied ID into Claude Code or Codex. The agent reads, types, and waits for output through an
+  MCP server (`potty-notify --install-share claude|codex`); the pane's badge shows the mode and
+  ends the share. See [the design doc](docs/pane-sharing.md).
 
 Remote profile environment variables live in `potty.toml` on the matching connection profile:
 

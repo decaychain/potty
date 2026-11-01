@@ -27,6 +27,9 @@ wgpu = "29"
 winit = "0.30"
 russh = "0.61.2"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+interprocess = "2"
+regex = "1"
+getrandom = "0.3"
 
 # Clipboard is platform-specific: smithay-clipboard for native Wayland, arboard for X11,
 # Windows, and macOS. See src/clip.rs.

@@ -61,6 +61,7 @@ use workspace::{GAP, PaneId, Split, Workspace};
 use potty::notify as feed;
 use potty::proto::{self, Control, Frame};
 use potty::remote;
+use potty::share;
 
 const FONT_PX: f32 = 15.0;
 const LINE_PX: f32 = 18.0;
@@ -159,6 +160,8 @@ enum UserEvent {
     },
     /// A remote connection's auth ladder needs the user (host-key approval, …).
     Auth(AuthPrompt),
+    /// A share request from an agent (docs/pane-sharing.md).
+    Share(share::Event),
 }
 
 /// Terminal event listener for one pane: forwards the events we care about to the main loop,
@@ -539,6 +542,31 @@ enum Action {
     /// Detach the focused pane's remote session: drop its local tabs/panes and disconnect, but
     /// leave the daemon's shells running so it can be reattached later.
     DetachSession,
+    /// Lend a pane to an agent (or change an existing share's mode). Copies the share ID.
+    SharePane(PaneId, share::Mode),
+    /// End a pane's share; its ID stops working at once.
+    UnsharePane(PaneId),
+    CopyShareId(PaneId),
+}
+
+/// How long a badge shows agent activity or "copied".
+const SHARE_FLASH: Duration = Duration::from_millis(1500);
+
+/// One shared pane, as the chrome draws it.
+struct ShareBadge {
+    mode: share::Mode,
+    /// What the agent just did, or that the ID was just copied: shown briefly in the badge.
+    activity: Option<&'static str>,
+}
+
+/// Pane-sharing view model handed to `build_ui`, plus what it reports back.
+#[derive(Default)]
+struct ShareUi {
+    badges: HashMap<PaneId, ShareBadge>,
+    /// Repaint after this long to clear a transient badge message.
+    repaint_in: Option<Duration>,
+    /// The pointer is over a badge (keeps clicks from reaching the terminal underneath).
+    pointer_over: bool,
 }
 
 /// Display data for the active auth prompt, handed to the chrome (the reply channel stays in
@@ -660,7 +688,10 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::Connect(..)
         | Action::UseProfile(_)
         | Action::DismissError
-        | Action::DetachSession => {}
+        | Action::DetachSession
+        | Action::SharePane(..)
+        | Action::UnsharePane(_)
+        | Action::CopyShareId(_) => {}
     }
 }
 
@@ -1554,6 +1585,7 @@ fn full_menu(
     for_pane: Option<PaneId>,
     can_detach: bool,
     overview_enabled: bool,
+    share_target: (PaneId, Option<share::Mode>),
 ) {
     ui.set_min_width(228.0);
     ui.style_mut().interaction.selectable_labels = false;
@@ -1604,6 +1636,27 @@ fn full_menu(
         ui.close_menu();
     }
     ui.separator();
+    section_label(ui, "Agent");
+    let (share_pane, shared) = share_target;
+    if shared.is_some() {
+        if menu_item(ui, "id", "Copy share ID", None).clicked() {
+            actions.push(Action::CopyShareId(share_pane));
+            ui.close_menu();
+        }
+        if menu_item(ui, "x", "Stop sharing", None).clicked() {
+            actions.push(Action::UnsharePane(share_pane));
+            ui.close_menu();
+        }
+    } else {
+        if menu_item(ui, "ai", "Share with agent", None)
+            .on_hover_text("Let an agent read and type in this pane. Copies a share ID to paste into the agent; the pane's badge can make it read-only.")
+            .clicked()
+        {
+            actions.push(Action::SharePane(share_pane, share::Mode::CanType));
+            ui.close_menu();
+        }
+    }
+    ui.separator();
     section_label(ui, "View");
     if overview_enabled && menu_item(ui, "[]", "Sessions", None).clicked() {
         actions.push(Action::ToggleOverview);
@@ -1614,6 +1667,74 @@ fn full_menu(
         actions.push(Action::ShowSettings);
         ui.close_menu();
     }
+}
+
+/// The badge on a shared pane's top-right corner: who has it and in which mode, compact until
+/// hovered, then with mode toggle, copy, and stop. Returns whether the pointer is over it.
+fn share_badge(
+    ctx: &egui::Context,
+    pane: PaneId,
+    rect: egui::Rect,
+    badge: &ShareBadge,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let id = egui::Id::new(("share-badge", pane));
+    let expanded = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let r = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .fixed_pos(rect.right_top() + egui::vec2(-8.0, 6.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .fill(chrome_surface())
+                .stroke(egui::Stroke::new(1.0, chrome_warn()))
+                .corner_radius(egui::CornerRadius::same(10))
+                .show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.horizontal(|ui| {
+                        let status = match badge.activity {
+                            Some(a) => format!("● {a}"),
+                            None => format!("● Agent · {}", badge.mode.label()),
+                        };
+                        ui.label(egui::RichText::new(status).color(chrome_warn()).strong());
+                        if !expanded {
+                            return;
+                        }
+                        let (other, label) = match badge.mode {
+                            share::Mode::CanType => (share::Mode::ReadOnly, "Make read-only"),
+                            share::Mode::ReadOnly => (share::Mode::CanType, "Allow typing"),
+                        };
+                        if ui.small_button(label).clicked() {
+                            actions.push(Action::SharePane(pane, other));
+                        }
+                        if ui
+                            .small_button("Copy ID")
+                            .on_hover_text("Paste this ID into the agent's prompt")
+                            .clicked()
+                        {
+                            actions.push(Action::CopyShareId(pane));
+                        }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Stop sharing: the ID stops working at once")
+                            .clicked()
+                        {
+                            actions.push(Action::UnsharePane(pane));
+                        }
+                    });
+                });
+        });
+    let over = r.response.contains_pointer()
+        || ctx
+            .pointer_hover_pos()
+            .is_some_and(|p| r.response.rect.expand(4.0).contains(p));
+    if over != expanded {
+        ctx.data_mut(|d| d.insert_temp(id, over));
+        ctx.request_repaint();
+    }
+    over
 }
 
 fn pane_context_menu(
@@ -1887,7 +2008,11 @@ fn build_ui(
     error: Option<&str>,
     detachable_panes: &std::collections::HashSet<PaneId>,
     context_menu_pane: Option<PaneId>,
+    share_ui: &mut ShareUi,
 ) {
+    if let Some(after) = share_ui.repaint_in {
+        ctx.request_repaint_after(after);
+    }
     // The tab bar earns its space with more than one tab, current overview sessions, an open
     // overview, or a latched attention feed. Otherwise the menu lives on the pane's right-click
     // (shift-right-click when an app has grabbed the mouse).
@@ -1911,6 +2036,7 @@ fn build_ui(
                             let focus_detachable =
                                 detachable_panes.contains(&ws.active_tab().focus);
                             ui.menu_button("☰", |ui| {
+                                let focus = ws.active_tab().focus;
                                 full_menu(
                                     ui,
                                     actions,
@@ -1918,6 +2044,7 @@ fn build_ui(
                                     None,
                                     focus_detachable,
                                     overview.enabled,
+                                    (focus, share_ui.badges.get(&focus).map(|b| b.mode)),
                                 )
                             });
                             if show_overview_button && overview_button(ui, overview.open).clicked()
@@ -2020,13 +2147,25 @@ fn build_ui(
                             Some(id),
                             detachable_panes.contains(&id),
                             overview.enabled,
+                            (id, share_ui.badges.get(&id).map(|b| b.mode)),
                         )
                     });
+                    if let Some(badge) = share_ui.badges.get(&id) {
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::CornerRadius::same(4),
+                            egui::Stroke::new(2.0, chrome_warn()),
+                            egui::StrokeKind::Inside,
+                        );
+                        share_ui.pointer_over |= share_badge(ctx, id, rect, badge, actions);
+                    }
                     if single {
                         leaves.push((id, rect));
                         continue;
                     }
-                    let stroke = if id == focus {
+                    let stroke = if share_ui.badges.contains_key(&id) {
+                        egui::Stroke::NONE
+                    } else if id == focus {
                         egui::Stroke::new(1.5, border_color)
                     } else {
                         egui::Stroke::new(1.0, egui::Color32::from_gray(60))
@@ -2892,6 +3031,10 @@ struct App {
     connect_use_session: bool,
     /// A connection error to show in a dialog (instead of stderr).
     error_msg: Option<String>,
+    /// Panes lent to agents. Server threads answer agent requests from it.
+    shares: Arc<share::Registry<EventProxy>>,
+    /// Latest agent activity per shared pane (when, what), for the badge.
+    share_activity: HashMap<PaneId, (Instant, &'static str)>,
     /// Whether the feed overlay is currently shown. Auto-opens on a fresh wave of notes, toggled
     /// by the tab-bar bell, hidden by the overlay's close button.
     feed_open: bool,
@@ -2974,6 +3117,16 @@ impl App {
         notify_sock: PathBuf,
         notify_paths: Vec<PathBuf>,
     ) -> Self {
+        let shares = Arc::new(share::Registry::new(&instance_id));
+        let share_proxy = proxy.clone();
+        if let Err(e) = share::serve(
+            shares.clone(),
+            Arc::new(move |e| {
+                let _ = share_proxy.send_event(UserEvent::Share(e));
+            }),
+        ) {
+            eprintln!("potty: pane sharing disabled ({e})");
+        }
         Self {
             proxy,
             instance_id,
@@ -3045,6 +3198,8 @@ impl App {
             connect_name: String::new(),
             connect_use_session: false,
             error_msg: None,
+            shares,
+            share_activity: HashMap::new(),
         }
     }
 
@@ -4977,6 +5132,50 @@ impl App {
         self.apply_config(c);
     }
 
+    /// Lend `pane` to an agent, or change the mode of its share. A new share copies its ID.
+    fn share_pane(&mut self, pane: PaneId, mode: share::Mode) {
+        let Some(term) = self.arc(pane) else { return };
+        let fresh = !self.shares.list().contains_key(&pane);
+        match self.shares.share(pane, mode, term) {
+            Ok(_) if fresh => self.copy_share_id(pane),
+            Ok(_) => {}
+            Err(e) => self.error_msg = Some(format!("Could not share the pane: {e}")),
+        }
+        self.request_redraw();
+    }
+
+    fn copy_share_id(&mut self, pane: PaneId) {
+        if let Some((id, _)) = self.shares.list().remove(&pane)
+            && let Some(cb) = &self.clipboard
+        {
+            cb.store(id);
+            self.share_activity
+                .insert(pane, (Instant::now(), "Share ID copied"));
+            self.request_redraw();
+        }
+    }
+
+    /// Badges for this frame. Also drops shares of closed panes and keeps titles current.
+    fn share_ui(&mut self) -> ShareUi {
+        self.shares.retain(|p| self.terms.contains_key(&p));
+        let list = self.shares.list();
+        self.share_activity
+            .retain(|p, (at, _)| list.contains_key(p) && at.elapsed() < SHARE_FLASH);
+        let mut ui = ShareUi::default();
+        for (pane, (_, mode)) in list {
+            if let Some(t) = self.terms.get(&pane) {
+                self.shares.set_title(pane, &t.title);
+            }
+            let activity = self.share_activity.get(&pane).map(|(at, what)| {
+                let left = SHARE_FLASH.saturating_sub(at.elapsed());
+                ui.repaint_in = Some(ui.repaint_in.map_or(left, |d| d.min(left)));
+                *what
+            });
+            ui.badges.insert(pane, ShareBadge { mode, activity });
+        }
+        ui
+    }
+
     /// Write raw bytes to a pane: its local PTY, or the remote session as an input `Data` frame.
     fn write_pty(&mut self, id: PaneId, bytes: &[u8]) {
         if let Some(t) = self.terms.get_mut(&id) {
@@ -5620,6 +5819,7 @@ impl App {
             .filter(|c| !c.ephemeral)
             .flat_map(|c| c.routes.values().copied())
             .collect();
+        let mut share_ui = self.share_ui();
         let auth_inputs = &mut self.auth_inputs;
         self.overview_remote
             .retain(|key, _| self.overview.store.records.contains_key(key));
@@ -5720,6 +5920,7 @@ impl App {
                     error.as_deref(),
                     &detachable_panes,
                     context_menu_pane,
+                    &mut share_ui,
                 )
             })
         };
@@ -5738,6 +5939,7 @@ impl App {
             || feed_active
             || connect_progress_active
             || self.overview.pointer_over
+            || share_ui.pointer_over
             || auth_view.is_some()
             || self.show_settings
             || self.show_connect
@@ -5788,6 +5990,13 @@ impl App {
                     self.request_redraw();
                 }
                 Action::DetachSession => self.detach_focused_session(),
+                Action::SharePane(pane, mode) => self.share_pane(pane, mode),
+                Action::UnsharePane(pane) => {
+                    self.shares.unshare(pane);
+                    self.share_activity.remove(&pane);
+                    self.request_redraw();
+                }
+                Action::CopyShareId(pane) => self.copy_share_id(pane),
                 // Remote-aware: a split/new-tab from a remote pane stays on its connection; the
                 // tab bar's "+" always opens a local shell.
                 Action::Split(s) => self.split_pane(s),
@@ -6315,6 +6524,31 @@ impl ApplicationHandler<UserEvent> for App {
                     self.reset_blink();
                 }
                 self.touch(id);
+            }
+            UserEvent::Share(share::Event::Input { pane, bytes }) => {
+                // The mode may have changed since the server checked it.
+                let allowed = self
+                    .shares
+                    .list()
+                    .get(&pane)
+                    .is_some_and(|(_, mode)| *mode == share::Mode::CanType);
+                if allowed {
+                    self.scroll(pane, Scroll::Bottom);
+                    self.write_pty(pane, &bytes);
+                    self.share_activity
+                        .insert(pane, (Instant::now(), "Agent typing"));
+                    self.request_redraw();
+                }
+            }
+            UserEvent::Share(share::Event::Read { pane }) => {
+                let typing = self.share_activity.get(&pane).is_some_and(|(at, what)| {
+                    *what == "Agent typing" && at.elapsed() < SHARE_FLASH
+                });
+                if !typing {
+                    self.share_activity
+                        .insert(pane, (Instant::now(), "Agent reading"));
+                }
+                self.request_redraw();
             }
             UserEvent::Bell(id) => {
                 if let Some(state) = self.state.as_mut() {
@@ -6877,6 +7111,7 @@ mod tests {
                         None,
                         &HashSet::new(),
                         None,
+                        &mut super::ShareUi::default(),
                     );
                 },
             )

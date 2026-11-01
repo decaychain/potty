@@ -19,6 +19,8 @@ use std::path::PathBuf;
 
 #[path = "potty-notify/overview.rs"]
 mod overview;
+#[path = "potty-notify/share_mcp.rs"]
+mod share_mcp;
 
 use lexopt::prelude::{Long, Short, Value};
 use potty::notify::{
@@ -27,6 +29,9 @@ use potty::notify::{
 };
 
 fn main() {
+    if share_mcp::run() {
+        return;
+    }
     if overview::run() {
         return;
     }
@@ -295,6 +300,8 @@ USAGE:
   potty-notify --tool <claude|codex> --briefing --session <id>
                                                Publish a briefing JSON object from stdin.
                       [--briefing-file <path>] Queue a Codex briefing at the path supplied by its hook.
+  potty-notify --install-share <claude|codex>    Register the pane-sharing MCP server.
+  potty-notify --mcp                             Run the pane-sharing MCP server (stdio).
   potty-notify --print-ssh-config [host]         Print an ~/.ssh/config block to forward over SSH
                                                   (simple; one session per host at a time).
   potty-notify --print-ssh-wrapper               Print a shell `ssh` wrapper with per-pane sockets
@@ -308,7 +315,8 @@ ENV (potty sets these per pane; you don't):
   POTTY_NOTIFY   socket to send notes to
   POTTY_PANE     pane id, for click-to-jump correlation
 
-See docs/attention-feed.md for the SSH/Zellij setup and docs/session-overview.md for briefings.
+See docs/attention-feed.md for the SSH/Zellij setup and docs/session-overview.md for briefings,
+docs/pane-sharing.md for sharing panes with agents.
 "
     );
 }
