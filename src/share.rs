@@ -197,6 +197,17 @@ pub enum Op {
         #[serde(default)]
         max_chars: Option<usize>,
     },
+    /// Type one command line with an end marker appended, and wait for the marker.
+    Run {
+        command: String,
+        /// `posix` (sh, bash, zsh, …; the default), `fish`, `powershell`, or `cmd`.
+        #[serde(default)]
+        shell: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        max_chars: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,9 +241,13 @@ pub struct Response {
     /// Older text was cut to respect `max_chars`.
     #[serde(default)]
     pub truncated: bool,
-    /// Why a `wait` returned: `pattern`, `quiet`, `timeout`, or `ended`.
+    /// Why a `wait` returned: `pattern`, `quiet`, `timeout`, or `ended`. A `run` returns `done`,
+    /// `timeout`, or `ended`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Exit status of a finished `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<Screen>,
 }
@@ -529,6 +544,53 @@ pub fn handle<T: EventListener>(
                 limit(*max_chars),
             )
         }
+        Op::Run {
+            command,
+            shell,
+            timeout_ms,
+            max_chars,
+        } => {
+            if mode != Mode::CanType {
+                return Response::err(
+                    "this share is read-only; ask the user to switch the share badge on the pane to 'can type'",
+                );
+            }
+            let shell = match Shell::parse(shell.as_deref()) {
+                Ok(s) => s,
+                Err(e) => return Response::err(e),
+            };
+            let nonce = match ShareId::new("0") {
+                Ok(id) => id.secret[..12].to_string(),
+                Err(e) => return Response::err(e.to_string()),
+            };
+            let line = match marked_command(command, shell, &nonce) {
+                Ok(l) => l,
+                Err(e) => return Response::err(e),
+            };
+            let start = {
+                let t = term.lock().unwrap();
+                Cursor::at_cursor(&t)
+            };
+            on_event(Event::Input {
+                pane,
+                bytes: format!("{line}\r").into_bytes(),
+            });
+            let marker = regex::Regex::new(&format!("{MARKER}{nonce}_(-?\\d+)__")).unwrap();
+            let timeout =
+                Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS));
+            let mut resp = wait(
+                registry,
+                &id.secret,
+                &term,
+                Some(&start.encode()),
+                Some(&Matcher::Regex(marker.clone())),
+                None,
+                timeout,
+                usize::MAX,
+            );
+            finish_run(&mut resp, &marker, limit(*max_chars));
+            resp
+        }
     };
     resp.mode = Some(mode);
     if !title.is_empty() {
@@ -772,24 +834,25 @@ struct ReadOut {
     truncated: bool,
 }
 
+/// Cut `text` from the front to at most `max_chars`, starting on a line boundary when possible.
+/// Returns whether anything was cut.
+fn truncate_head(text: &mut String, max_chars: usize) -> bool {
+    let chars = text.chars().count();
+    if chars <= max_chars {
+        return false;
+    }
+    let skip = chars - max_chars;
+    let mut cut = text.char_indices().nth(skip).map_or(text.len(), |(i, _)| i);
+    if let Some(nl) = text[cut..].find('\n') {
+        cut += nl + 1;
+    }
+    text.drain(..cut);
+    true
+}
+
 impl ReadOut {
     fn truncate_to(&mut self, max_chars: usize) {
-        let chars = self.text.chars().count();
-        if chars <= max_chars {
-            return;
-        }
-        let skip = chars - max_chars;
-        let mut cut = self
-            .text
-            .char_indices()
-            .nth(skip)
-            .map_or(self.text.len(), |(i, _)| i);
-        // Prefer starting on a line boundary.
-        if let Some(nl) = self.text[cut..].find('\n') {
-            cut += nl + 1;
-        }
-        self.text.drain(..cut);
-        self.truncated = true;
+        self.truncated |= truncate_head(&mut self.text, max_chars);
     }
 
     fn into_response(self, screen: Screen) -> Response {
@@ -839,6 +902,85 @@ fn read_since<T>(term: &Term<T>, since: Option<&Cursor>, max_chars: usize) -> Re
     };
     out.truncate_to(max_chars);
     out
+}
+
+// ---------------------------------------------------------------------------
+// Run: commands with an end marker
+// ---------------------------------------------------------------------------
+
+/// Start of a run's end marker; the full marker is `__PTY_<nonce>_<status>__`.
+const MARKER: &str = "__PTY_";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shell {
+    Posix,
+    Fish,
+    PowerShell,
+    Cmd,
+}
+
+impl Shell {
+    fn parse(s: Option<&str>) -> Result<Self, String> {
+        match s.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("" | "posix" | "sh" | "bash" | "zsh" | "dash" | "ksh") => Ok(Shell::Posix),
+            Some("fish") => Ok(Shell::Fish),
+            Some("powershell" | "pwsh") => Ok(Shell::PowerShell),
+            Some("cmd" | "cmd.exe") => Ok(Shell::Cmd),
+            Some(other) => Err(format!(
+                "unknown shell '{other}' (use posix, fish, powershell, or cmd)"
+            )),
+        }
+    }
+}
+
+/// `command` followed by a marker that prints `__PTY_<nonce>_<status>__`. The typed form never
+/// contains that string (the pieces are split by quotes or carets), so the shell's echo of the
+/// line can't be mistaken for the marker.
+pub fn marked_command(command: &str, shell: Shell, nonce: &str) -> Result<String, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("command is empty".into());
+    }
+    if command.contains(['\n', '\r']) {
+        return Err(
+            "pass a single command line; chain commands with ';' or '&&', or use pane_send for multi-line input".into(),
+        );
+    }
+    // A trailing `&` already separates commands; `& ;` would be a syntax error.
+    let sep = if command.ends_with('&') && !command.ends_with("&&") {
+        " "
+    } else {
+        "; "
+    };
+    Ok(match shell {
+        Shell::Posix => format!("{command}{sep}printf '\\n{MARKER}%s_%s__\\n' '{nonce}' \"$?\""),
+        Shell::Fish => format!("{command}{sep}printf '\\n{MARKER}%s_%s__\\n' '{nonce}' $status"),
+        Shell::PowerShell => format!(
+            "{command}; $__pty_ok = $?; $__pty_code = $LASTEXITCODE; Write-Output ('' + [char]10 + '{MARKER}' + '{nonce}_' + $(if ($__pty_ok) {{ 0 }} elseif ($__pty_code) {{ $__pty_code }} else {{ 1 }}) + '__')"
+        ),
+        // `call` re-parses the line so %ERRORLEVEL% is read after the command ran, not before.
+        Shell::Cmd => format!("{command} & call echo {MARKER}^{nonce}_%^ERRORLEVEL%__"),
+    })
+}
+
+/// Turn a run's raw `wait` result into the command's output and exit status.
+fn finish_run(resp: &mut Response, marker: &regex::Regex, max_chars: usize) {
+    if !resp.ok {
+        return;
+    }
+    // The first line is the prompt with the typed command.
+    let body = resp.text.split_once('\n').map_or("", |(_, rest)| rest);
+    let (output, code) = match marker.captures(body) {
+        Some(c) => (&body[..c.get(0).unwrap().start()], c[1].parse().ok()),
+        None => (body, None),
+    };
+    let mut output = output.trim_end_matches(['\n', ' ']).to_string();
+    resp.truncated |= truncate_head(&mut output, max_chars);
+    resp.text = output;
+    resp.exit_code = code;
+    if resp.reason.as_deref() == Some("pattern") {
+        resp.reason = Some("done".into());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1177,64 @@ mod tests {
         assert!(out.truncated);
         assert!(out.text.ends_with("line 49\n"));
         assert!(out.text.chars().count() <= 30);
+    }
+
+    /// Run marked commands through real shells: the marker must print with the right status,
+    /// and the typed line itself must not match.
+    #[test]
+    fn markers_work_in_real_shells() {
+        let nonce = "0123456789ab";
+        let marker = regex::Regex::new(&format!("{MARKER}{nonce}_(-?\\d+)__")).unwrap();
+        for sh in ["sh", "bash", "zsh", "dash"] {
+            if std::process::Command::new(sh)
+                .arg("-c")
+                .arg("true")
+                .status()
+                .is_err()
+            {
+                continue;
+            }
+            for (cmd, code) in [
+                ("echo hi", 0),
+                ("false", 1),
+                ("exit_3() { return 3; }; exit_3", 3),
+                ("sleep 0 &", 0),
+            ] {
+                let line = marked_command(cmd, Shell::Posix, nonce).unwrap();
+                assert!(!marker.is_match(&line), "{sh}: echo matches: {line}");
+                let out = std::process::Command::new(sh)
+                    .arg("-c")
+                    .arg(&line)
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let c = marker
+                    .captures(&stdout)
+                    .unwrap_or_else(|| panic!("{sh}: no marker in {stdout:?}"));
+                assert_eq!(c[1].parse::<i32>().unwrap(), code, "{sh}: {cmd}");
+            }
+        }
+        for shell in [Shell::Fish, Shell::PowerShell, Shell::Cmd] {
+            let line = marked_command("dir", shell, nonce).unwrap();
+            assert!(!marker.is_match(&line), "{shell:?}: echo matches: {line}");
+        }
+        assert!(marked_command("a\nb", Shell::Posix, nonce).is_err());
+        assert!(marked_command("  ", Shell::Posix, nonce).is_err());
+    }
+
+    #[test]
+    fn run_extracts_output_and_status() {
+        let marker = regex::Regex::new(&format!("{MARKER}abc_(-?\\d+)__")).unwrap();
+        let mut resp = Response {
+            ok: true,
+            text: "$ make; printf …\nbuilding\nok\n\n__PTY_abc_2__\n$".into(),
+            reason: Some("pattern".into()),
+            ..Response::default()
+        };
+        finish_run(&mut resp, &marker, 1000);
+        assert_eq!(resp.text, "building\nok");
+        assert_eq!(resp.exit_code, Some(2));
+        assert_eq!(resp.reason.as_deref(), Some("done"));
     }
 
     #[test]

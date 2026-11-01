@@ -102,7 +102,13 @@ fn agent_reads_types_and_waits_through_the_mcp_server() {
         Arc::new(move |e| {
             if let Event::Input { pane: 3, bytes } = e {
                 feed(&pane_term, &bytes);
-                if bytes.ends_with(b"\r") {
+                let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                if line.contains("__PTY_") {
+                    // A pane_run line: execute it in a real shell, as the remote would.
+                    let out = Command::new("sh").arg("-c").arg(&line).output().unwrap();
+                    let out = String::from_utf8_lossy(&out.stdout).replace('\n', "\r\n");
+                    feed(&pane_term, format!("\r\n{out}user@prod:~$ ").as_bytes());
+                } else if bytes.ends_with(b"\r") {
                     feed(
                         &pane_term,
                         b"\n 10:00 up 3 days\r\n__POTTY_DONE_0__\r\nuser@prod:~$ ",
@@ -132,7 +138,13 @@ fn agent_reads_types_and_waits_through_the_mcp_server() {
         .collect();
     assert_eq!(
         names,
-        ["pane_snapshot", "pane_read", "pane_send", "pane_wait"]
+        [
+            "pane_snapshot",
+            "pane_read",
+            "pane_send",
+            "pane_run",
+            "pane_wait"
+        ]
     );
 
     let (snap, err) = mcp.tool("pane_snapshot", json!({"share_id": id}));
@@ -169,7 +181,117 @@ fn agent_reads_types_and_waits_through_the_mcp_server() {
         "{more}"
     );
 
+    let (run, err) = mcp.tool(
+        "pane_run",
+        json!({"share_id": id, "command": "printf 'a\\nb\\n'; (exit 4)", "timeout_ms": 5000}),
+    );
+    assert!(!err, "{run}");
+    assert!(run.contains("exit status: 4"), "{run}");
+    assert!(run.ends_with("--- output ---\na\nb"), "{run}");
+
     registry.unshare(3);
     let (msg, err) = mcp.tool("pane_snapshot", json!({"share_id": id}));
     assert!(err && msg.contains("ended"), "{msg}");
+}
+
+/// pane_run against interactive shells in a real PTY: real echo, prompt, and line editing, in a
+/// narrow pane so the marked line wraps.
+#[cfg(unix)]
+#[test]
+fn pane_run_works_in_interactive_shells() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use potty::share::{Op, PROTOCOL, Request, handle};
+    use std::io::Read;
+
+    for (shell, args) in [
+        ("bash", &["--norc", "--noprofile", "-i"][..]),
+        ("zsh", &["-f", "-i"][..]),
+    ] {
+        if Command::new(shell).arg("-c").arg("true").status().is_err() {
+            continue;
+        }
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 12,
+                cols: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.args(args);
+        cmd.env("PS1", "test$ ");
+        cmd.env("PROMPT", "test$ ");
+        cmd.env("TERM", "xterm-256color");
+        let mut child = pty.slave.spawn_command(cmd).unwrap();
+        drop(pty.slave);
+        let term: SharedTerm = Arc::new(Mutex::new(Term::new(
+            Config::default(),
+            &TermSize::new(40, 12),
+            VoidListener,
+        )));
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let reader_term = term.clone();
+        std::thread::spawn(move || {
+            let mut p: Processor<StdSyncHandler> = Processor::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                p.advance(&mut *reader_term.lock().unwrap(), &buf[..n]);
+            }
+        });
+        let writer = Mutex::new(pty.master.take_writer().unwrap());
+        let registry = Registry::new("9-9");
+        let id = registry.share(1, Mode::CanType, term.clone()).unwrap();
+        let on_event = |e: Event| {
+            if let Event::Input { bytes, .. } = e {
+                let mut w = writer.lock().unwrap();
+                w.write_all(&bytes).unwrap();
+                w.flush().unwrap();
+            }
+        };
+        let ask = |op: Op| {
+            handle(
+                &Request {
+                    v: PROTOCOL,
+                    id: id.clone(),
+                    op,
+                },
+                &registry,
+                &on_event,
+            )
+        };
+        // Let the shell print its first prompt.
+        let ready = ask(Op::Wait {
+            since: None,
+            pattern: Some("test$".into()),
+            regex: false,
+            quiet_ms: None,
+            timeout_ms: Some(10_000),
+            max_chars: None,
+        });
+        assert_eq!(
+            ready.reason.as_deref(),
+            Some("pattern"),
+            "{shell}: no prompt"
+        );
+        let run = |command: &str| {
+            ask(Op::Run {
+                command: command.into(),
+                shell: None,
+                timeout_ms: Some(10_000),
+                max_chars: None,
+            })
+        };
+        let r = run("echo one; echo two");
+        assert_eq!(r.reason.as_deref(), Some("done"), "{shell}: {r:?}");
+        assert_eq!(r.exit_code, Some(0));
+        assert_eq!(r.text, "one\ntwo", "{shell}");
+        let r = run("ls /definitely/not/here 2>/dev/null");
+        assert_eq!(r.exit_code, Some(2), "{shell}: {r:?}");
+        assert_eq!(r.text, "", "{shell}");
+        let _ = child.kill();
+    }
 }

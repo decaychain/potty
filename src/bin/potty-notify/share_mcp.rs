@@ -17,15 +17,17 @@ Potty pane sharing. The user can lend you a live terminal pane in Potty (often a
 that is hard to reproduce: jump hosts, second factors, sudo). They give you a share ID that \
 starts with `psh-`. Use only IDs the user gave you.
 
-Workflow: pane_snapshot to see where the pane is; pane_send to type; pane_wait with the cursor \
-that pane_send returned to collect the output; pane_read to fetch output since a cursor.
+Workflow: pane_snapshot first to see where the pane is (which host, which shell, whether a \
+program is running). At a shell prompt, use pane_run: it types one command line, waits for it to \
+finish, and returns its output and exit status. Pass shell='fish', 'powershell' or 'cmd' when \
+the prompt is one of those. For anything interactive (a REPL, a password prompt, a TUI), use \
+pane_send to type and pane_wait with the cursor pane_send returned to collect the output; \
+pane_read fetches output since a cursor.
 
-A terminal has no end-of-output signal. To know when a command finished, append a marker whose \
-typed form differs from its output, e.g. `cmd; printf '__PO''TTY_DONE_%s__\\n' \"$?\"`, then \
-pane_wait for the regex `__POTTY_DONE_\\d+__` (it also gives you the exit status). Otherwise wait \
-for the shell prompt, or use quiet_ms. Avoid pagers and interactive programs: use `| cat`, \
-`--no-pager`, `SYSTEMD_PAGER=cat`. If a program waits for input, pane_snapshot and answer it, \
-or send C-c.
+Avoid pagers and programs that wait for input: use `| cat`, `--no-pager`, `SYSTEMD_PAGER=cat`. \
+If pane_run times out, the command may be waiting for input: pane_snapshot and answer it, or \
+send C-c. pane_run appends a short end marker to the command line, which shows up in the pane \
+and in shell history.
 
 The pane belongs to the user and may be a production system: run only what the task needs, \
 prefer read-only commands, and ask before anything destructive. Never type passwords or second \
@@ -62,6 +64,19 @@ fn tools() -> Value {
                 "enter": {"type": "boolean", "description": "Press Enter after the text."},
                 "keys": {"type": "array", "items": {"type": "string"}, "description": "Named keys after the text: Enter, Tab, Escape, Backspace, Up, Down, Left, Right, Home, End, PageUp, PageDown, Delete, F1-F12, C-c (Ctrl), M-b (Alt)."}
             }, "required": ["share_id"]},
+            "annotations": {"destructiveHint": true, "openWorldHint": true}
+        },
+        {
+            "name": "pane_run",
+            "title": "Run a command in a shared Potty pane",
+            "description": "Type one shell command line into a shared Potty pane that is at a shell prompt, wait for it to finish, and return its output and exit status. Requires 'can type' mode. Use pane_send for interactive programs.",
+            "inputSchema": {"type": "object", "properties": {
+                "share_id": id,
+                "command": {"type": "string", "description": "One command line (chain with ; or &&). No trailing comment."},
+                "shell": {"type": "string", "enum": ["posix", "fish", "powershell", "cmd"], "description": "The pane's shell (default posix: sh, bash, zsh)."},
+                "timeout_ms": {"type": "integer", "description": "Give up after this long (default 30000, max 600000). The command keeps running."},
+                "max_chars": max_chars
+            }, "required": ["share_id", "command"]},
             "annotations": {"destructiveHint": true, "openWorldHint": true}
         },
         {
@@ -204,6 +219,12 @@ fn call(name: &str, args: &Value) -> Result<String, String> {
             timeout_ms: u64_arg("timeout_ms"),
             max_chars: u64_arg("max_chars").map(|n| n as usize),
         },
+        "pane_run" => Op::Run {
+            command: str_arg("command").ok_or("command is required")?,
+            shell: str_arg("shell"),
+            timeout_ms: u64_arg("timeout_ms"),
+            max_chars: u64_arg("max_chars").map(|n| n as usize),
+        },
         other => return Err(format!("unknown tool: {other}")),
     };
     let resp = share::request(&Request {
@@ -226,7 +247,19 @@ fn format_response(tool: &str, r: &Response) -> String {
     if let Some(mode) = r.mode {
         head.push(format!("mode: {}", mode.label()));
     }
-    if let Some(reason) = &r.reason {
+    if tool == "pane_run" {
+        match r.reason.as_deref() {
+            Some("done") => head.push(match r.exit_code {
+                Some(code) => format!("exit status: {code}"),
+                None => "finished (exit status unknown)".into(),
+            }),
+            Some("timeout") => head.push(
+                "not finished before the timeout; it may be waiting for input (pane_snapshot), or pane_wait with the cursor below".into(),
+            ),
+            Some("ended") => head.push("the share ended while waiting".into()),
+            _ => {}
+        }
+    } else if let Some(reason) = &r.reason {
         head.push(format!("returned because: {reason}"));
     }
     if let Some(s) = &r.screen {
@@ -256,7 +289,12 @@ fn format_response(tool: &str, r: &Response) -> String {
         head.push("typed; pass this cursor as `since` to pane_wait".into());
         return head.join("\n");
     }
-    format!("{}\n--- pane text ---\n{}", head.join("\n"), r.text)
+    let label = if tool == "pane_run" {
+        "output"
+    } else {
+        "pane text"
+    };
+    format!("{}\n--- {label} ---\n{}", head.join("\n"), r.text)
 }
 
 // --------------------------------------------------------------------------------------------

@@ -89,6 +89,7 @@ pane (local PTY, ConPTY, or potty-session remote pane)
 | `pane_snapshot` | any | Visible screen as text, cursor position, alternate-screen flag, size. |
 | `pane_read` | any | Output since a cursor (logical lines, wrapped rows joined). |
 | `pane_send` | can type | Literal text plus named keys (`Enter`, `C-c`, `Up`, `F5`, …). |
+| `pane_run` | can type | Run one command line at a shell prompt; returns its output and exit status. |
 | `pane_wait` | any | Block until a pattern appears, output goes quiet, or a timeout. |
 
 ### Read cursors
@@ -102,15 +103,29 @@ prompt) can repeat on the next read because it may still be changing.
 
 ### Detecting the end of a command
 
-There is no end-of-stream marker on a terminal. In order of reliability:
+There is no end-of-stream marker on a terminal. `pane_run` solves it for shell prompts: it types
+the command with an end marker appended and waits for the marker's output,
+`__PTY_<nonce>_<status>__`. The nonce is random per run, and the typed form never contains the
+marker string (quotes or carets split it), so the shell's echo of the line can't match. The
+output is the text between the echoed line and the marker.
 
-1. **A marker**: append something like `; printf '__PO''TTY_DONE_%s__\n' "$?"` and wait for the
-   pattern `__POTTY_DONE_`. The split quotes keep the typed command's echo from matching.
-2. **The prompt**: wait for a known prompt pattern.
-3. **Quiet**: wait until nothing changes for `quiet_ms`.
+| `shell` | Appended to the command |
+|---|---|
+| `posix` (default; sh, bash, zsh, dash, ksh) | `; printf '\n__PTY_%s_%s__\n' '<nonce>' "$?"` |
+| `fish` | the same with `$status` |
+| `powershell` | saves `$?` / `$LASTEXITCODE`, then `Write-Output` of the marker |
+| `cmd` | `& call echo __PTY_^<nonce>_%^ERRORLEVEL%__` (`call` reads ERRORLEVEL after the command) |
 
-*(later)* `pane_run` wraps option 1 with `posix` / `powershell` / `cmd` flavors, and OSC 133
-command-end marks are used when the shell emits them.
+Limits: one command line (no newlines, no trailing comment, which would swallow the marker). The
+marker is visible in the pane and in shell history. A command that waits for input times out;
+`pane_run` then says so, and the agent continues with `pane_snapshot`, `pane_send`, `pane_wait`.
+POSIX markers are tested against real interactive bash and zsh in a PTY; fish, PowerShell and
+cmd are not yet tested on those shells.
+
+For anything else (REPLs, prompts, TUIs) the agent uses `pane_send` plus `pane_wait` on a pattern
+(such as the prompt) or on `quiet_ms`.
+
+*(later)* OSC 133 command-end marks, used when the shell emits them.
 
 ## Setup
 
@@ -128,7 +143,7 @@ tool timeout long enough for `pane_wait`; Codex's own approval policy is left un
 
 1. **Foundation** *(implemented)*: cross-platform endpoint, ID, badge with mode / copy / stop,
    MCP server with snapshot / read / send / wait, installer.
-2. **Comfort** *(later)*: `pane_run` with markers, OSC 133, "Share with → [agent session]" from
+2. **Comfort**: `pane_run` with markers *(implemented)*; *(later)* OSC 133, "Share with → [agent session]" from
    the overview (types the ID into that agent's prompt), input log in the badge, confirm mode.
 3. **Unification** *(later)*: move the notify listener onto the same cross-platform transport, so
    the session overview also works on Windows.
