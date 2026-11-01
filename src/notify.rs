@@ -3,8 +3,8 @@
 //! the `potty-notify` helper (the sender) must agree on: the JSON `Note`, the socket they speak
 //! over, and the env vars potty injects into its child shells.
 //!
-//! Design: `docs/attention-feed.md`. The transport is out-of-band (a Unix-domain socket), so a
-//! note never rides the terminal byte stream — that's what lets a background pane, or (Phase 2)
+//! Design: `docs/attention-feed.md`. The transport is out-of-band (a Unix-domain socket, or a
+//! named pipe on Windows), so a note never rides the terminal byte stream — that's what lets a background pane, or (Phase 2)
 //! a session over SSH, still reach the UI.
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,7 @@ pub struct Note {
 /// The default listener socket: `$XDG_RUNTIME_DIR/potty/notify.sock`, falling back to the temp
 /// dir. potty binds it and injects its path as `$POTTY_NOTIFY`; the helper honours that env var
 /// (so SSH remote-forwarding to a different path keeps working) and only falls back to this.
+#[cfg(unix)]
 pub fn default_socket_path() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
@@ -115,7 +116,63 @@ pub enum InstanceMessage {
     },
 }
 
+/// On Windows the endpoints are named pipes, addressed by `\\.\pipe\…` paths.
+#[cfg(windows)]
+pub fn default_socket_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{PIPE_DIR}potty-notify"))
+}
+
+#[cfg(windows)]
+const PIPE_DIR: &str = r"\\.\pipe\";
+#[cfg(windows)]
+const INSTANCE_PIPE: &str = "potty-notify-";
+
+#[cfg(windows)]
+pub fn instance_socket_path(instance: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{PIPE_DIR}{INSTANCE_PIPE}{instance}"))
+}
+
+/// Live instances' pipes. The pipe namespace lists like a directory.
+#[cfg(windows)]
+pub fn instance_socket_paths() -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(PIPE_DIR) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(INSTANCE_PIPE))
+        .map(|e| std::path::PathBuf::from(format!("{PIPE_DIR}{}", e.file_name().to_string_lossy())))
+        .collect()
+}
+
+/// Connect to a notify endpoint (a Unix socket path, or a `\\.\pipe\…` path on Windows).
+pub fn connect(path: &std::path::Path) -> std::io::Result<interprocess::local_socket::Stream> {
+    use interprocess::local_socket::{GenericFilePath, Stream, prelude::*};
+    Stream::connect(path.to_fs_name::<GenericFilePath>()?)
+}
+
+/// Bind a notify endpoint. On Unix the caller prepares the directory and clears stale sockets.
+pub fn listen(path: &std::path::Path) -> std::io::Result<interprocess::local_socket::Listener> {
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
+    ListenerOptions::new()
+        .name(path.to_fs_name::<GenericFilePath>()?)
+        // Removing the socket is the owner's job (on exit, or when it finds it stale).
+        .reclaim_name(false)
+        .create_sync()
+}
+
+/// Send one JSON line to a notify endpoint.
+pub fn send_line(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    use interprocess::local_socket::traits::Stream as _;
+    use std::io::Write;
+    let mut stream = connect(path)?;
+    let _ = stream.set_send_timeout(Some(std::time::Duration::from_millis(250)));
+    stream.write_all(format!("{json}\n").as_bytes())?;
+    stream.flush()
+}
+
 /// Per-instance sockets live under the same private runtime directory as the compatibility socket.
+#[cfg(unix)]
 pub fn instance_socket_dir() -> std::path::PathBuf {
     default_socket_path()
         .parent()
@@ -124,10 +181,12 @@ pub fn instance_socket_dir() -> std::path::PathBuf {
         .join("instances")
 }
 
+#[cfg(unix)]
 pub fn instance_socket_path(instance: &str) -> std::path::PathBuf {
     instance_socket_dir().join(format!("{instance}.sock"))
 }
 
+#[cfg(unix)]
 pub fn instance_socket_paths() -> Vec<std::path::PathBuf> {
     let Ok(entries) = std::fs::read_dir(instance_socket_dir()) else {
         return Vec::new();
@@ -142,6 +201,38 @@ pub fn instance_socket_paths() -> Vec<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoints_carry_one_line_and_instances_are_found() {
+        use interprocess::local_socket::prelude::*;
+        use std::io::{BufRead, BufReader};
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A real instance endpoint on Windows (to check discovery); a private temp socket on
+        // Unix, where discovery is a plain directory listing.
+        #[cfg(windows)]
+        let path = instance_socket_path(&format!("test-{nanos}"));
+        #[cfg(unix)]
+        let path = std::env::temp_dir().join(format!("potty-notify-test-{nanos}.sock"));
+        let listener = listen(&path).unwrap();
+        #[cfg(windows)]
+        assert!(
+            instance_socket_paths().contains(&path),
+            "{path:?} not listed"
+        );
+        let reader = std::thread::spawn(move || {
+            let conn = listener.incoming().next().unwrap().unwrap();
+            let mut line = String::new();
+            BufReader::new(conn).read_line(&mut line).unwrap();
+            line
+        });
+        send_line(&path, r#"{"v":1}"#).unwrap();
+        assert_eq!(reader.join().unwrap(), "{\"v\":1}\n");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn legacy_notes_without_instance_still_deserialize() {

@@ -83,9 +83,9 @@ pane (local PTY, ConPTY, or potty-session remote pane)
 - **Why MCP**: an agent's shell sandbox blocks Unix sockets (the reason the overview briefings
   need a file relay). An MCP stdio server is started by the agent itself, outside that sandbox,
   and its calls are typed, synchronous tools, which fits "send, then wait for output".
-- **Why a separate endpoint**: the notify socket is fire-and-forget and Unix-only. Sharing needs
-  request/response on Linux, macOS and Windows. The endpoint uses the `interprocess` crate: Unix
-  sockets and Windows named pipes behind one API.
+- **Why a separate endpoint**: the notify socket is fire-and-forget. Sharing needs
+  request/response. Both use the `interprocess` crate: Unix sockets and Windows named pipes
+  behind one API.
 - **Routing**: the ID embeds the owning instance, so the MCP server connects to exactly one
   endpoint without enumerating instances (named pipes can't be listed like a directory).
 - **One code path for every pane kind**: the GUI keeps a grid for local and remote panes alike,
@@ -173,5 +173,6 @@ upgrading); Codex's own approval policy is left unchanged.
    mode in the badge. Dropped: an input log in the badge (see *User flow*), and "Share with →
    [agent session]" from the overview (the request has to be typed into the agent anyway, and
    switching panes costs nothing).
-3. **Unification** *(later)*: move the notify listener onto the same cross-platform transport, so
-   the session overview also works on Windows.
+3. **Unification** *(implemented, untested on Windows)*: the notify listener and its senders use
+   the same cross-platform transport, so the attention feed and session overview can work on
+   Windows too. The Codex briefing file relay and SSH socket forwarding stay Unix-only.

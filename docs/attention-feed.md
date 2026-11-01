@@ -81,7 +81,11 @@ hosts with one toolchain). Its job:
 
 ### 3. The transport — a Unix-domain socket potty listens on
 
-potty owns a listener socket. The helper connects, writes one line of JSON, disconnects. On the
+potty owns a listener socket. On Windows it is a named pipe (`\\.\pipe\potty-notify-<instance>`,
+plus `\\.\pipe\potty-notify` for compatibility); `$POTTY_NOTIFY` then holds the pipe path. Both
+are reached through the same code (`potty::notify::{listen, connect, send_line}`, built on the
+`interprocess` crate). The SSH forwarding below is Unix-only. The helper connects, writes one line
+of JSON, disconnects. On the
 potty side a background thread accepts connections and forwards each event into the winit loop as
 a new `UserEvent` — exactly how the PTY reader and child-exit threads already feed the loop
 (`src/main.rs`: `proxy.send_event(UserEvent::Wake(id))`). The UI never does blocking I/O.

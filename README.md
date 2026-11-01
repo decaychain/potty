@@ -75,7 +75,7 @@ Or [build from source](#build--run).
 - **Keyboard** — layout-resolved text (German/US, no IME needed) with an IME-commit safety net,
   DECCKM-aware cursor / navigation / function keys (so `mc` and ncurses apps work), and AltGr
   handling on Windows.
-- **Attention feed** *(Linux)* — a floating list of agentic-CLI sessions (Claude Code, Codex)
+- **Attention feed** *(Linux, macOS; Windows new and untested)* — a floating list of agentic-CLI sessions (Claude Code, Codex)
   waiting on you, gathered out-of-band over a socket rather than scraped from the screen, so a
   session in a **background pane** still surfaces. Click an entry to jump to its pane. See
   [Attention feed](#attention-feed) and [the design doc](docs/attention-feed.md).

@@ -158,19 +158,15 @@ fn main() {
     let _ = send(&note);
 }
 
-#[cfg(unix)]
 fn send(note: &Note) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::net::UnixStream;
-
     fn write_json(
         path: impl AsRef<std::path::Path>,
         value: &impl serde::Serialize,
     ) -> std::io::Result<()> {
-        let mut stream = UnixStream::connect(path)?;
-        let mut line = serde_json::to_string(value).unwrap_or_default();
-        line.push('\n');
-        stream.write_all(line.as_bytes())
+        potty::notify::send_line(
+            path.as_ref(),
+            &serde_json::to_string(value).unwrap_or_default(),
+        )
     }
 
     if let Some(path) = std::env::var_os(ENV_SOCK).map(std::path::PathBuf::from) {
@@ -183,6 +179,8 @@ fn send(note: &Note) -> std::io::Result<()> {
         if write_json(&path, &msg).is_ok() {
             sent = true;
         } else {
+            // A crashed instance's socket; named pipes vanish by themselves.
+            #[cfg(unix)]
             let _ = std::fs::remove_file(path);
         }
     }
@@ -191,12 +189,6 @@ fn send(note: &Note) -> std::io::Result<()> {
     } else {
         write_json(default_socket_path(), note)
     }
-}
-
-#[cfg(not(unix))]
-fn send(_note: &Note) -> std::io::Result<()> {
-    // Phase 1 transport is a Unix-domain socket; no-op elsewhere.
-    Ok(())
 }
 
 /// Best-effort hostname. `$HOSTNAME` isn't always exported, so fall back to `/etc/hostname`.

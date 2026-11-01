@@ -3683,36 +3683,27 @@ impl App {
     }
 
     fn broadcast_instance_message(&self, msg: &feed::InstanceMessage) {
-        #[cfg(unix)]
-        {
-            for path in feed::instance_socket_paths() {
-                if self.notify_paths.iter().any(|owned| owned == &path) {
-                    continue;
-                }
-                if send_instance_message(&path, msg).is_err() {
-                    let _ = std::fs::remove_file(path);
-                }
+        for path in feed::instance_socket_paths() {
+            if self.notify_paths.iter().any(|owned| owned == &path) {
+                continue;
+            }
+            // A socket nobody answers on is a crashed instance's leftover (pipes vanish by
+            // themselves).
+            if send_instance_message(&path, msg).is_err() {
+                #[cfg(unix)]
+                let _ = std::fs::remove_file(path);
             }
         }
-        #[cfg(not(unix))]
-        let _ = msg;
     }
 
     fn send_instance_message_to(&self, instance: &str, msg: &feed::InstanceMessage) -> bool {
+        let path = feed::instance_socket_path(instance);
+        let sent = send_instance_message(&path, msg).is_ok();
         #[cfg(unix)]
-        {
-            let path = feed::instance_socket_path(instance);
-            let sent = send_instance_message(&path, msg).is_ok();
-            if !sent {
-                let _ = std::fs::remove_file(path);
-            }
-            sent
+        if !sent {
+            let _ = std::fs::remove_file(path);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (instance, msg);
-            false
-        }
+        sent
     }
 
     /// Flag a pane's render as stale, and ask for a redraw if that pane is on screen.
@@ -3797,13 +3788,10 @@ impl App {
             potty::term_env::COLORTERM_VALUE,
         );
         // Attention feed: tell child tools where to send notes (`potty-notify` connects here) and
-        // which pane they live in (for exact jump-to-focus). Unix-only — the listener is a UDS.
-        #[cfg(unix)]
-        {
-            cmd.env(feed::ENV_SOCK, &self.notify_sock);
-            cmd.env(feed::ENV_PANE, id.to_string());
-            cmd.env(feed::ENV_INSTANCE, &self.instance_id);
-        }
+        // which pane they live in (for exact jump-to-focus).
+        cmd.env(feed::ENV_SOCK, &self.notify_sock);
+        cmd.env(feed::ENV_PANE, id.to_string());
+        cmd.env(feed::ENV_INSTANCE, &self.instance_id);
         if let Some(cwd) = &cwd {
             cmd.cwd(cwd.as_os_str());
             cmd.env("PWD", cwd.as_os_str());
@@ -7021,12 +7009,12 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// Listen on this instance's attention-feed sockets and forward each message into the event loop.
 /// Raw `Note` JSON is the public helper contract; wrapped `InstanceMessage` JSON is the private
-/// fan-out/focus protocol between live GUI instances. Unix-only — the transport is a UDS.
-#[cfg(unix)]
+/// fan-out/focus protocol between live GUI instances. Unix sockets, or named pipes on Windows.
 fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>, instance_path: &Path) -> Vec<PathBuf> {
+    use interprocess::local_socket::Listener;
     use std::io::{BufRead, BufReader, Read};
-    use std::os::unix::net::{UnixListener, UnixStream};
 
+    #[cfg(unix)]
     fn prepare_socket_dir(path: &Path) {
         let Some(dir) = path.parent() else {
             return;
@@ -7035,11 +7023,15 @@ fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>, instance_path: &Path)
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
+    // Named pipes need no directory and leave nothing stale behind.
+    #[cfg(not(unix))]
+    fn prepare_socket_dir(_path: &Path) {}
 
-    fn bind_unique(path: &Path) -> Option<UnixListener> {
+    fn bind_unique(path: &Path) -> Option<Listener> {
         prepare_socket_dir(path);
+        #[cfg(unix)]
         let _ = std::fs::remove_file(path);
-        match UnixListener::bind(path) {
+        match feed::listen(path) {
             Ok(listener) => Some(listener),
             Err(err) => {
                 eprintln!(
@@ -7051,22 +7043,26 @@ fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>, instance_path: &Path)
         }
     }
 
-    fn bind_compat(path: &Path) -> Option<UnixListener> {
+    fn bind_compat(path: &Path) -> Option<Listener> {
         prepare_socket_dir(path);
-        match UnixListener::bind(path) {
+        match feed::listen(path) {
             Ok(listener) => Some(listener),
-            Err(_) if UnixStream::connect(path).is_ok() => None,
+            Err(_) if feed::connect(path).is_ok() => None,
+            #[cfg(unix)]
             Err(_) => {
                 let _ = std::fs::remove_file(path);
-                UnixListener::bind(path).ok()
+                feed::listen(path).ok()
             }
+            #[cfg(not(unix))]
+            Err(_) => None,
         }
     }
 
-    fn spawn_acceptor(proxy: EventLoopProxy<UserEvent>, listener: UnixListener) {
+    fn spawn_acceptor(proxy: EventLoopProxy<UserEvent>, listener: Listener) {
+        use interprocess::local_socket::prelude::*;
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.set_recv_timeout(Some(Duration::from_secs(1)));
                 // Cap the read so a rogue client can't make us allocate unbounded.
                 let mut line = String::new();
                 if BufReader::new(stream.take(64 * 1024))
@@ -7096,12 +7092,6 @@ fn spawn_notify_listener(proxy: EventLoopProxy<UserEvent>, instance_path: &Path)
     owned
 }
 
-#[cfg(not(unix))]
-fn spawn_notify_listener(_proxy: EventLoopProxy<UserEvent>, _instance_path: &Path) -> Vec<PathBuf> {
-    Vec::new()
-}
-
-#[cfg(unix)]
 fn handle_notify_line(proxy: &EventLoopProxy<UserEvent>, line: &str) {
     if let Some(record) = potty::agent::Message::parse(line) {
         let _ = proxy.send_event(UserEvent::OverviewRecord(record));
@@ -7142,14 +7132,11 @@ fn handle_notify_line(proxy: &EventLoopProxy<UserEvent>, line: &str) {
     }
 }
 
-#[cfg(unix)]
 fn send_instance_message(path: &Path, msg: &feed::InstanceMessage) -> std::io::Result<()> {
-    use std::os::unix::net::UnixStream;
-
-    let mut stream = UnixStream::connect(path)?;
-    let mut line = serde_json::to_string(msg).map_err(std::io::Error::other)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes())
+    feed::send_line(
+        path,
+        &serde_json::to_string(msg).map_err(std::io::Error::other)?,
+    )
 }
 
 fn new_instance_id() -> String {

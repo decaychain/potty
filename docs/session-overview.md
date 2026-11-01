@@ -153,7 +153,7 @@ Wire limits are UTF-8 bytes: title 120, summary 1200, next 600, and five milesto
 These compatibility ceilings are not writing targets; the skill requests the shorter form above.
 Reports replace the previous briefing, including milestones. Invalid reports return a nonzero
 exit status; automatic hooks remain silent and successful on transport or payload failures.
-This first publisher uses Unix sockets, matching the existing notification integration.
+The publisher uses the notification transport: Unix sockets, or named pipes on Windows.
 For Codex's relay, use the complete command supplied by the hook, including its `--briefing-file`
 argument; do not guess an outbox path or session ID.
 

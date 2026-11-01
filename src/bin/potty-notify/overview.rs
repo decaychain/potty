@@ -3,7 +3,7 @@ use potty::{
     notify::{self, Tool},
 };
 use std::{
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -243,15 +243,8 @@ fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-#[cfg(unix)]
 fn send(path: &Path, json: &str) -> std::io::Result<()> {
-    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
-    stream.set_write_timeout(Some(std::time::Duration::from_millis(250)))?;
-    stream.write_all(format!("{json}\n").as_bytes())
-}
-#[cfg(not(unix))]
-fn send(_path: &Path, _json: &str) -> std::io::Result<()> {
-    Err(std::io::Error::other("Unix sockets required"))
+    notify::send_line(path, json)
 }
 
 fn install(tool: &str, dir: &Path, exe: &str, relay: bool) -> std::io::Result<()> {
