@@ -22,7 +22,8 @@ the output back, while the user watches and can take the pane back at any moment
    away. A new share can type; one menu item covers the usual case, and the badge switches it to
    read-only when wanted.
 2. A badge appears at the pane's top-right corner and the pane border turns amber. Hovering the
-   badge reveals **Allow typing** / **Make read-only**, **Copy ID**, and **×** to stop sharing.
+   badge reveals the mode (**read-only** / **confirm** / **can type**), **Copy ID**, and **×** to
+   stop sharing.
    The same actions are in the pane's right-click menu.
 3. In the agent's pane: "help me with X in Potty pane `psh-…`" (paste the ID).
 4. The agent uses the Potty MCP tools with that ID. The badge shows "Agent reading" or
@@ -40,10 +41,15 @@ Approval is **per share, enforced by Potty**, not per keystroke by the agent too
 - Agent tools can't vary their permission prompts per Potty share, and confirming every send makes
   the feature too tedious to use. The installer therefore allows the Potty MCP tools in Claude
   Code (see *Setup*), and Potty decides what each request may do.
-- Each share has a mode: **read-only** (snapshot, read, wait) or **can type** (also send). The
-  mode can be changed at any time from the badge.
-- *(later)* A **confirm** mode: Potty shows the pending input in the badge with
-  *Allow / Always for this share / Deny*.
+- Each share has a mode, chosen in the hovered badge at any time:
+  - **read-only**: snapshot, read, wait. Typing is refused, and the badge says so.
+  - **confirm**: each `pane_send` / `pane_run` waits until the user answers in the badge, which
+    then shows the input (`$ command`, or keystrokes like `y<Enter>`) without hovering, with
+    *Allow*, *Deny*, and *Always allow* (switches the share to *can type*). If the pane is on
+    another tab, a notice at the top of the window says which, with a *Show* button. The window
+    requests attention when it isn't focused. The agent waits up to 2 minutes; switching to
+    *read-only* refuses waiting inputs.
+  - **can type**: the default for a new share.
 
 Pane content is shared as-is, secrets on screen included, and the agent can read the pane's
 existing scrollback, not only output produced after sharing.
@@ -156,14 +162,16 @@ potty-notify --install-share codex    # adds [mcp_servers.potty] to config.toml
 Claude: the installer runs `claude mcp add --scope user potty -- <helper> --mcp` and adds
 `mcp__potty` to `permissions.allow` in `settings.json`. Without the `claude` command on `PATH`
 it prints the command to run instead. Codex: the installer adds `[mcp_servers.potty]` with a
-tool timeout long enough for `pane_wait`; Codex's own approval policy is left unchanged.
+tool timeout long enough for `pane_wait` plus a confirmation (re-run the installer after
+upgrading); Codex's own approval policy is left unchanged.
 
 ## Phases
 
 1. **Foundation** *(implemented)*: cross-platform endpoint, ID, badge with mode / copy / stop,
    MCP server with snapshot / read / send / wait, installer.
-2. **Comfort**: `pane_run` with markers and OSC 133, refusal notice in the badge *(implemented)*;
-   *(later)* confirm mode. Dropped: an input log in the badge (see *User flow*). Dropped: "Share with → [agent session]" from the overview. The request
-   has to be typed into the agent anyway, and switching panes costs nothing.
+2. **Comfort** *(implemented)*: `pane_run` with markers and OSC 133, refusal notice and confirm
+   mode in the badge. Dropped: an input log in the badge (see *User flow*), and "Share with →
+   [agent session]" from the overview (the request has to be typed into the agent anyway, and
+   switching panes costs nothing).
 3. **Unification** *(later)*: move the notify listener onto the same cross-platform transport, so
    the session overview also works on Windows.

@@ -549,6 +549,8 @@ enum Action {
     /// End a pane's share; its ID stops working at once.
     UnsharePane(PaneId),
     CopyShareId(PaneId),
+    /// Answer an input waiting in confirm mode: allow or deny.
+    ShareDecide(PaneId, u64, bool),
 }
 
 /// How long a badge shows agent activity or "copied".
@@ -569,6 +571,8 @@ struct ShareBadge {
     mode: share::Mode,
     /// What the agent just did, or that the ID was just copied: shown briefly in the badge.
     activity: Option<&'static str>,
+    /// Inputs waiting for the user (confirm mode), oldest first.
+    pending: Vec<share::Pending>,
 }
 
 /// Pane-sharing view model handed to `build_ui`, plus what it reports back.
@@ -703,7 +707,8 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::DetachSession
         | Action::SharePane(..)
         | Action::UnsharePane(_)
-        | Action::CopyShareId(_) => {}
+        | Action::CopyShareId(_)
+        | Action::ShareDecide(..) => {}
     }
 }
 
@@ -1719,12 +1724,22 @@ fn share_badge(
                         if !expanded {
                             return;
                         }
-                        let (other, label) = match badge.mode {
-                            share::Mode::CanType => (share::Mode::ReadOnly, "Make read-only"),
-                            share::Mode::ReadOnly => (share::Mode::CanType, "Allow typing"),
-                        };
-                        if ui.small_button(label).clicked() {
-                            actions.push(Action::SharePane(pane, other));
+                        for (mode, hint) in [
+                            (share::Mode::ReadOnly, "The agent can look, not type"),
+                            (share::Mode::Confirm, "Allow each input here first"),
+                            (share::Mode::CanType, "The agent types freely"),
+                        ] {
+                            if ui
+                                .selectable_label(
+                                    badge.mode == mode,
+                                    egui::RichText::new(mode.label()).small(),
+                                )
+                                .on_hover_text(hint)
+                                .clicked()
+                                && badge.mode != mode
+                            {
+                                actions.push(Action::SharePane(pane, mode));
+                            }
                         }
                         if ui
                             .small_button("Copy ID")
@@ -1741,6 +1756,38 @@ fn share_badge(
                             actions.push(Action::UnsharePane(pane));
                         }
                     });
+                    // A waiting input shows whether or not the badge is hovered.
+                    if let Some(p) = badge.pending.first() {
+                        ui.separator();
+                        let more = match badge.pending.len() {
+                            1 => String::new(),
+                            n => format!(" (+{} more)", n - 1),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("Agent wants to type{more}:"))
+                                .color(chrome_warn()),
+                        );
+                        ui.set_max_width(440.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&p.text).monospace().strong())
+                                .wrap(),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("Allow").clicked() {
+                                actions.push(Action::ShareDecide(pane, p.id, true));
+                            }
+                            if ui.button("Deny").clicked() {
+                                actions.push(Action::ShareDecide(pane, p.id, false));
+                            }
+                            if ui
+                                .button("Always allow")
+                                .on_hover_text("Switch this share to 'can type'")
+                                .clicked()
+                            {
+                                actions.push(Action::SharePane(pane, share::Mode::CanType));
+                            }
+                        });
+                    }
                 });
         });
     let over = r.response.contains_pointer()
@@ -2230,6 +2277,40 @@ fn build_ui(
                     }
                 }
             });
+    }
+
+    // An input waiting for confirmation in a pane on another tab: its badge isn't drawn, so say
+    // where it is.
+    for (pane, badge) in &share_ui.badges {
+        let Some(tab) = ws.tab_of(*pane).filter(|t| *t != ws.active) else {
+            continue;
+        };
+        if badge.pending.is_empty() {
+            continue;
+        }
+        let r = egui::Area::new(egui::Id::new(("share-pending", *pane)))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+            .show(ctx, |ui| {
+                popup_frame().show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "● Agent wants to type in tab {}",
+                                tab + 1
+                            ))
+                            .color(chrome_warn())
+                            .strong(),
+                        );
+                        if ui.button("Show").clicked() {
+                            actions.push(Action::SelectTab(tab));
+                            actions.push(Action::Focus(*pane));
+                        }
+                    });
+                });
+            });
+        share_ui.pointer_over |= r.response.contains_pointer();
     }
 
     // Attention feed — a floating list of sessions waiting for you, drawn as an Area so it
@@ -5195,7 +5276,15 @@ impl App {
                 ui.repaint_in = Some(ui.repaint_in.map_or(left, |d| d.min(left)));
                 *what
             });
-            ui.badges.insert(pane, ShareBadge { mode, activity });
+            let pending = self.shares.pending(pane);
+            ui.badges.insert(
+                pane,
+                ShareBadge {
+                    mode,
+                    activity,
+                    pending,
+                },
+            );
         }
         ui
     }
@@ -6021,6 +6110,10 @@ impl App {
                     self.request_redraw();
                 }
                 Action::CopyShareId(pane) => self.copy_share_id(pane),
+                Action::ShareDecide(pane, id, allow) => {
+                    self.shares.decide(pane, id, allow);
+                    self.request_redraw();
+                }
                 // Remote-aware: a split/new-tab from a remote pane stays on its connection; the
                 // tab bar's "+" always opens a local shell.
                 Action::Split(s) => self.split_pane(s),
@@ -6555,7 +6648,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .shares
                     .list()
                     .get(&pane)
-                    .is_some_and(|(_, mode)| *mode == share::Mode::CanType);
+                    .is_some_and(|(_, mode)| *mode != share::Mode::ReadOnly);
                 if allowed {
                     self.scroll(pane, Scroll::Bottom);
                     self.write_pty(pane, &bytes);
@@ -6563,6 +6656,17 @@ impl ApplicationHandler<UserEvent> for App {
                         .insert(pane, (Instant::now(), "Agent typing"));
                     self.request_redraw();
                 }
+            }
+            UserEvent::Share(share::Event::Pending { .. }) => {
+                // Bring the question to the user's attention, like a waiting agent session.
+                if let Some(state) = &self.state
+                    && !state.window.has_focus()
+                {
+                    state
+                        .window
+                        .request_user_attention(Some(UserAttentionType::Informational));
+                }
+                self.request_redraw();
             }
             UserEvent::Share(share::Event::Refused { pane }) => {
                 self.share_activity
@@ -7081,6 +7185,135 @@ mod tests {
     use crate::config::Config;
     use std::collections::HashSet;
     use winit::event::MouseButton;
+
+    /// A waiting input shows on its badge even when not hovered, and as a notice when its pane
+    /// is on another tab; the buttons answer it.
+    #[test]
+    #[allow(deprecated)]
+    fn confirm_prompt_shows_without_hover_and_from_other_tabs() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config as TermConfig, Term, test::TermSize};
+        use potty::share::{Mode, Registry};
+        use std::sync::{Arc, Mutex};
+
+        let registry = Arc::new(Registry::new("1-1"));
+        let term = Arc::new(Mutex::new(Term::new(
+            TermConfig::default(),
+            &TermSize::new(40, 5),
+            VoidListener,
+        )));
+        let mut ws = crate::workspace::Workspace::new();
+        let pane = ws.active_tab().focus;
+        registry
+            .share(pane, Mode::Confirm, term, Default::default())
+            .unwrap();
+        let asker = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.confirm(
+                    pane,
+                    "$ systemctl restart nginx".into(),
+                    std::time::Duration::from_secs(5),
+                    &|_| {},
+                )
+            })
+        };
+        while registry.pending(pane).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let ctx = egui::Context::default();
+        super::apply_chrome_style(&ctx, 13.0);
+        let frame = |ws: &crate::workspace::Workspace| {
+            let mut share_ui = super::ShareUi::default();
+            share_ui.badges.insert(
+                pane,
+                super::ShareBadge {
+                    mode: Mode::Confirm,
+                    activity: None,
+                    pending: registry.pending(pane),
+                },
+            );
+            let mut overview = crate::overview::Overview::live();
+            let titles = vec!["shell".to_owned(); ws.tabs.len()];
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    super::build_ui(
+                        ctx,
+                        &mut overview,
+                        &Config::default(),
+                        ws,
+                        &[],
+                        None,
+                        13.0,
+                        &titles,
+                        super::chrome_accent(),
+                        0.0,
+                        &mut false,
+                        &mut super::SettingsPage::Font,
+                        None,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &[],
+                        &mut false,
+                        false,
+                        false,
+                        None,
+                        &mut Vec::new(),
+                        false,
+                        &mut String::new(),
+                        &mut String::new(),
+                        &mut true,
+                        &[],
+                        &[],
+                        &mut false,
+                        None,
+                        &HashSet::new(),
+                        None,
+                        &mut share_ui,
+                    );
+                },
+            );
+            fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for s in &output.shapes {
+                collect(&s.shape, &mut out);
+            }
+            out
+        };
+        frame(&ws);
+        let shown = frame(&ws);
+        assert!(
+            shown.iter().any(|t| t == "$ systemctl restart nginx"),
+            "{shown:?}"
+        );
+        assert!(shown.iter().any(|t| t == "Allow") && shown.iter().any(|t| t == "Deny"));
+        ws.new_tab();
+        frame(&ws);
+        let elsewhere = frame(&ws);
+        assert!(
+            elsewhere
+                .iter()
+                .any(|t| t == "● Agent wants to type in tab 1"),
+            "{elsewhere:?}"
+        );
+        let id = registry.pending(pane)[0].id;
+        registry.decide(pane, id, true);
+        assert_eq!(asker.join().unwrap(), Ok(()));
+    }
 
     #[test]
     #[allow(deprecated)]

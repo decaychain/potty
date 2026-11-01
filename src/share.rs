@@ -46,6 +46,8 @@ const POLL: Duration = Duration::from_millis(40);
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
     ReadOnly,
+    /// Every input waits until the user allows it in Potty.
+    Confirm,
     CanType,
 }
 
@@ -53,10 +55,14 @@ impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Mode::ReadOnly => "read-only",
+            Mode::Confirm => "confirm",
             Mode::CanType => "can type",
         }
     }
 }
+
+/// How long an input in confirm mode waits for the user.
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A parsed share ID: `psh-<instance>-<secret>`. The instance names the endpoint to connect to;
 /// the secret (128 random bits, hex) is the capability.
@@ -307,6 +313,17 @@ pub enum Event {
     Read { pane: u64 },
     /// The agent tried to type, but the share is read-only. The terminal doesn't show this.
     Refused { pane: u64 },
+    /// An input waits for the user's decision (confirm mode).
+    Pending { pane: u64 },
+}
+
+/// An input waiting for the user in confirm mode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    pub id: u64,
+    /// What the agent wants to type: `$ command` for a run, the keystrokes for a send.
+    pub text: String,
+    decision: Option<bool>,
 }
 
 struct Entry<T> {
@@ -315,6 +332,7 @@ struct Entry<T> {
     term: Arc<Mutex<Term<T>>>,
     marks: Arc<Mutex<Marks>>,
     title: String,
+    pending: std::collections::VecDeque<Pending>,
 }
 
 /// Live shares by pane. The GUI mutates it; server threads read it on every request, so ending a
@@ -322,6 +340,8 @@ struct Entry<T> {
 pub struct Registry<T> {
     instance: String,
     shares: Mutex<HashMap<u64, Entry<T>>>,
+    /// Signals a decision on a pending input, a mode change, or an ended share.
+    decided: std::sync::Condvar,
 }
 
 impl<T> Registry<T> {
@@ -329,6 +349,7 @@ impl<T> Registry<T> {
         Self {
             instance: instance.to_string(),
             shares: Mutex::new(HashMap::new()),
+            decided: std::sync::Condvar::new(),
         }
     }
 
@@ -341,9 +362,14 @@ impl<T> Registry<T> {
         marks: Arc<Mutex<Marks>>,
     ) -> io::Result<String> {
         let mut shares = self.shares.lock().unwrap();
-        if let Some(e) = shares.get_mut(&pane) {
-            e.mode = mode;
-            return Ok(self.id_of(&e.secret));
+        if shares.contains_key(&pane) {
+            drop(shares);
+            self.set_mode(pane, mode);
+            return Ok(self
+                .list()
+                .remove(&pane)
+                .map(|(id, _)| id)
+                .unwrap_or_default());
         }
         let id = ShareId::new(&self.instance)?;
         shares.insert(
@@ -354,6 +380,7 @@ impl<T> Registry<T> {
                 term,
                 marks,
                 title: String::new(),
+                pending: Default::default(),
             },
         );
         Ok(id.to_string())
@@ -361,11 +388,95 @@ impl<T> Registry<T> {
 
     pub fn unshare(&self, pane: u64) {
         self.shares.lock().unwrap().remove(&pane);
+        self.decided.notify_all();
     }
 
+    /// Change a share's mode. Waiting inputs follow it: allowed by `CanType`, refused by
+    /// `ReadOnly`.
     pub fn set_mode(&self, pane: u64, mode: Mode) {
         if let Some(e) = self.shares.lock().unwrap().get_mut(&pane) {
             e.mode = mode;
+            let verdict = match mode {
+                Mode::CanType => Some(true),
+                Mode::ReadOnly => Some(false),
+                Mode::Confirm => None,
+            };
+            for p in e.pending.iter_mut().filter(|p| p.decision.is_none()) {
+                p.decision = verdict;
+            }
+        }
+        self.decided.notify_all();
+    }
+
+    /// Inputs waiting for the user, oldest first.
+    pub fn pending(&self, pane: u64) -> Vec<Pending> {
+        self.shares
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .map(|e| {
+                e.pending
+                    .iter()
+                    .filter(|p| p.decision.is_none())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The user's answer to one waiting input.
+    pub fn decide(&self, pane: u64, id: u64, allow: bool) {
+        if let Some(p) = self
+            .shares
+            .lock()
+            .unwrap()
+            .get_mut(&pane)
+            .and_then(|e| e.pending.iter_mut().find(|p| p.id == id))
+        {
+            p.decision.get_or_insert(allow);
+        }
+        self.decided.notify_all();
+    }
+
+    /// Block until the user allows (`Ok`) or declines this input, the share ends, or `timeout`
+    /// passes.
+    pub fn confirm(
+        &self,
+        pane: u64,
+        text: String,
+        timeout: Duration,
+        on_event: &dyn Fn(Event),
+    ) -> Result<(), &'static str> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.shares.lock().unwrap().get_mut(&pane) {
+            Some(e) => e.pending.push_back(Pending {
+                id,
+                text,
+                decision: None,
+            }),
+            None => return Err(ENDED),
+        }
+        on_event(Event::Pending { pane });
+        let deadline = Instant::now() + timeout;
+        let mut shares = self.shares.lock().unwrap();
+        loop {
+            let Some(e) = shares.get_mut(&pane) else {
+                return Err(ENDED);
+            };
+            let Some(i) = e.pending.iter().position(|p| p.id == id) else {
+                return Err(ENDED);
+            };
+            if let Some(allow) = e.pending[i].decision {
+                e.pending.remove(i);
+                return if allow { Ok(()) } else { Err(DECLINED) };
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                e.pending.remove(i);
+                return Err(NO_ANSWER);
+            }
+            shares = self.decided.wait_timeout(shares, left).unwrap().0;
         }
     }
 
@@ -477,6 +588,10 @@ fn serve_one<T: EventListener>(conn: Stream, registry: &Registry<T>, on_event: &
 const READ_ONLY: &str =
     "this share is read-only; ask the user to switch the share badge on the pane to 'can type'";
 
+const DECLINED: &str =
+    "the user declined this input; don't repeat it unchanged, ask the user what to do instead";
+const NO_ANSWER: &str = "the user did not confirm this input in time (the share is in confirm mode); ask the user to look at the pane's share badge";
+
 const ENDED: &str = "this share has ended (the user stopped sharing or closed the pane); ask the user to share the pane again";
 
 /// Answer one request. Public so tests can drive it without a socket.
@@ -520,9 +635,14 @@ pub fn handle<T: EventListener>(
             out.into_response(screen_info(&t))
         }
         Op::Send { text, keys, enter } => {
-            if mode != Mode::CanType {
-                on_event(Event::Refused { pane });
-                return Response::err(READ_ONLY);
+            if let Err(e) = gate(
+                registry,
+                pane,
+                mode,
+                describe_input(text.as_deref(), keys, *enter),
+                on_event,
+            ) {
+                return Response::err(e);
             }
             let (bytes, cursor) = {
                 let t = term.lock().unwrap();
@@ -578,11 +698,16 @@ pub fn handle<T: EventListener>(
             timeout_ms,
             max_chars,
         } => {
-            if mode != Mode::CanType {
-                on_event(Event::Refused { pane });
-                return Response::err(READ_ONLY);
-            }
             if let Err(e) = check_command(command) {
+                return Response::err(e);
+            }
+            if let Err(e) = gate(
+                registry,
+                pane,
+                mode,
+                format!("$ {}", command.trim()),
+                on_event,
+            ) {
                 return Response::err(e);
             }
             let timeout =
@@ -680,6 +805,44 @@ fn finish(mut resp: Response, mode: Mode, title: String, marks: &Mutex<Marks>) -
         screen.shell_integration = marks.lock().unwrap().ready();
     }
     resp
+}
+
+/// May this input be typed? Read-only refuses; confirm asks the user and waits.
+fn gate<T>(
+    registry: &Registry<T>,
+    pane: u64,
+    mode: Mode,
+    what: String,
+    on_event: &dyn Fn(Event),
+) -> Result<(), &'static str> {
+    match mode {
+        Mode::CanType => Ok(()),
+        Mode::ReadOnly => {
+            on_event(Event::Refused { pane });
+            Err(READ_ONLY)
+        }
+        Mode::Confirm => registry.confirm(pane, what, CONFIRM_TIMEOUT, on_event),
+    }
+}
+
+/// A send's input as one readable line: text, with Enter, Tab and named keys as `<Key>`.
+pub fn describe_input(text: Option<&str>, keys: &[String], enter: bool) -> String {
+    let mut out = String::new();
+    for c in text.unwrap_or("").chars() {
+        match c {
+            '\n' | '\r' => out.push_str("<Enter>"),
+            '\t' => out.push_str("<Tab>"),
+            c if c.is_control() => out.push_str(&format!("<0x{:02x}>", c as u32)),
+            c => out.push(c),
+        }
+    }
+    if enter {
+        out.push_str("<Enter>");
+    }
+    for key in keys {
+        out.push_str(&format!("<{key}>"));
+    }
+    out
 }
 
 fn limit(max: Option<usize>) -> usize {
@@ -1535,6 +1698,79 @@ mod tests {
         assert!(!handle(&forged, &registry, &on_event).ok);
         registry.unshare(7);
         assert!(!handle(&send, &registry, &on_event).ok);
+    }
+
+    #[test]
+    fn confirm_mode_waits_for_the_user() {
+        let registry = Arc::new(Registry::new("1-2"));
+        let t = Arc::new(Mutex::new(term(20, 5, 100)));
+        let id = registry
+            .share(5, Mode::Confirm, t, Default::default())
+            .unwrap();
+        // The user answers from another thread (the GUI), once the input shows up.
+        let answer = |allow: Option<bool>, mode: Option<Mode>| {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                while registry.pending(5).is_empty() {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let p = registry.pending(5).remove(0);
+                assert_eq!(p.text, "ls<Enter>");
+                match (allow, mode) {
+                    (Some(allow), _) => registry.decide(5, p.id, allow),
+                    (None, Some(mode)) => registry.set_mode(5, mode),
+                    (None, None) => registry.unshare(5),
+                }
+            })
+        };
+        let sent = Mutex::new(Vec::new());
+        let on_event = |e: Event| sent.lock().unwrap().push(e);
+        let send = Request {
+            v: PROTOCOL,
+            id: id.clone(),
+            op: Op::Send {
+                text: Some("ls".into()),
+                keys: vec![],
+                enter: true,
+            },
+        };
+        let typed = |sent: &Mutex<Vec<Event>>| {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, Event::Input { .. }))
+                .count()
+        };
+        let user = answer(Some(true), None);
+        assert!(handle(&send, &registry, &on_event).ok);
+        user.join().unwrap();
+        assert!(sent.lock().unwrap().contains(&Event::Pending { pane: 5 }));
+        assert_eq!(typed(&sent), 1);
+
+        let user = answer(Some(false), None);
+        let r = handle(&send, &registry, &on_event);
+        user.join().unwrap();
+        assert!(r.error.unwrap().contains("declined"));
+        assert_eq!(typed(&sent), 1);
+
+        // "Always allow" switches the share to can type, which lets the waiting input through.
+        let user = answer(None, Some(Mode::CanType));
+        assert!(handle(&send, &registry, &on_event).ok);
+        user.join().unwrap();
+        assert_eq!(typed(&sent), 2);
+        assert!(handle(&send, &registry, &on_event).ok, "no question asked");
+
+        registry.set_mode(5, Mode::Confirm);
+        let r = registry.confirm(5, "x".into(), Duration::from_millis(30), &|_| {});
+        assert_eq!(r, Err(NO_ANSWER));
+        assert!(registry.pending(5).is_empty());
+
+        let user = answer(None, None);
+        let r = handle(&send, &registry, &on_event);
+        user.join().unwrap();
+        assert!(r.error.unwrap().contains("ended"));
     }
 
     #[test]
