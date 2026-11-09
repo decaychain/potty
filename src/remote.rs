@@ -108,6 +108,7 @@ pub struct SshConfig {
 /// writer signals channel EOF (so the remote relay exits and the daemon detaches) — that's how the
 /// client closes a connection after its last pane goes away.
 pub struct RemoteSession {
+    _process: Option<ProcessSession>,
     /// The SSH handle for the `potty-session` path (one channel). `None` for the raw-shell path,
     /// where the handle lives in the coordinator task that owns the per-pane channels.
     _session: Option<Handle<ClientHandler>>,
@@ -127,6 +128,145 @@ impl RemoteSession {
 
 fn io_err(e: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(e.to_string())
+}
+
+/// A deliberately small, shell-free parser for the experimental Teleport transport.
+/// Keep the original string as the saved target, including proxy/cluster identity.
+pub fn tsh_arguments(input: &str) -> std::io::Result<Vec<String>> {
+    let mut words = input.split_whitespace();
+    if words.next() != Some("tsh") || words.next() != Some("ssh") {
+        return Err(io_err(
+            "expected tsh ssh [--proxy=...] [--auth=...] [--cluster=...] user@host",
+        ));
+    }
+    let args: Vec<String> = words.map(str::to_owned).collect();
+    let Some(target) = args.last() else {
+        return Err(io_err("Teleport target is missing"));
+    };
+    if target.starts_with('-')
+        || !target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@._-".contains(c))
+    {
+        return Err(io_err(
+            "Teleport target must be a single hostname or user@hostname",
+        ));
+    }
+    for arg in &args[..args.len() - 1] {
+        if !["--proxy=", "--auth=", "--cluster=", "--user="]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix) && arg.len() > prefix.len())
+        {
+            return Err(io_err(
+                "supported Teleport options: --proxy=, --auth=, --cluster=, --user= (no shell quoting)",
+            ));
+        }
+    }
+    Ok(args)
+}
+
+struct ProcessSession(std::process::Child);
+
+impl Drop for ProcessSession {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Login is separate so browser-login text can never enter the binary protocol stream.
+/// Runs on the dedicated connection thread; browser MFA must not inherit the SSH timeout.
+pub fn connect_tsh(
+    cfg: &SshConfig,
+    command: &str,
+) -> std::io::Result<(RemoteSession, mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
+    connect_tsh_program(cfg, command, std::ffi::OsStr::new("tsh"))
+}
+
+fn connect_tsh_program(
+    cfg: &SshConfig,
+    command: &str,
+    program: &std::ffi::OsStr,
+) -> std::io::Result<(RemoteSession, mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let args = tsh_arguments(&cfg.host)?;
+    let options = &args[..args.len() - 1];
+    let mut login = Command::new(program);
+    login.arg("login");
+    for option in options {
+        if let Some(cluster) = option.strip_prefix("--cluster=") {
+            login.arg(cluster);
+        } else {
+            login.arg(option);
+        }
+    }
+    let output = login
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| io_err(format!("could not run tsh login: {e}")))?;
+    if !output.status.success() {
+        return Err(io_err(format!(
+            "tsh login failed ({}): {} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        )));
+    }
+    let mut child = Command::new(program)
+        .arg("ssh")
+        .args(options)
+        .args(["--no-tty", "--no-relogin"])
+        .arg(args.last().unwrap())
+        .arg(command_with_env(command, &cfg.env))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| io_err(format!("could not run tsh ssh: {e}")))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let captured = stderr.clone();
+    let errors = std::thread::spawn(move || {
+        let mut bytes = [0; 1024];
+        while let Ok(n) = err.read(&mut bytes) {
+            if n == 0 {
+                break;
+            }
+            let mut out = captured.lock().unwrap();
+            let remaining = 4096usize.saturating_sub(out.len());
+            out.extend_from_slice(&bytes[..n.min(remaining)]);
+        }
+    });
+    let (in_tx, in_rx) = mpsc::channel(256);
+    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
+    std::thread::spawn(move || {
+        while let Ok(Some(frame)) = Frame::read(&mut stdout) {
+            if in_tx.blocking_send(frame).is_err() {
+                return;
+            }
+        }
+        let _ = errors.join();
+    });
+    std::thread::spawn(move || {
+        while let Some(frame) = out_rx.blocking_recv() {
+            if frame.write(&mut stdin).is_err() {
+                break;
+            }
+        }
+        // Closing stdin signals detach, allowing the remote daemon's PTYs to survive.
+    });
+    Ok((
+        RemoteSession {
+            _session: None,
+            _process: Some(ProcessSession(child)),
+            stderr,
+        },
+        out_tx,
+        in_rx,
+    ))
 }
 
 /// TEMPORARY DIAGNOSTICS for the silent-connect bug: `POTTY_SSH_DEBUG=1 potty` prints
@@ -269,6 +409,7 @@ pub async fn connect_and_exec(
 
     Ok((
         RemoteSession {
+            _process: None,
             _session: Some(session),
             stderr,
         },
@@ -379,6 +520,7 @@ pub async fn shell_session(
     Ok((
         RemoteSession {
             _session: None,
+            _process: None,
             stderr,
         },
         out_tx,
@@ -744,6 +886,63 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::command_with_env;
+
+    #[test]
+    fn teleport_command_accepts_browser_auth_but_rejects_stream_changing_options() {
+        assert!(
+            super::tsh_arguments("tsh ssh --proxy=example.teleport.sh --auth=entra alice@node")
+                .is_ok()
+        );
+        for command in [
+            "tsh ssh",
+            "tsh ssh --tty alice@node",
+            "tsh ssh --local alice@node",
+            "tsh ssh alice@node extra",
+            "tsh ssh alice@node;id",
+        ] {
+            assert!(super::tsh_arguments(command).is_err(), "{command}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn teleport_login_output_is_separate_from_frame_stream() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "potty-tsh-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let program = dir.join("tsh");
+        std::fs::write(&program, "#!/bin/sh\ncase \"$1\" in\nlogin) echo 'Browser MFA completed'; exit 0;;\nssh) shift; [ \"$1\" = '--proxy=example.teleport.sh' ] || exit 2; shift; [ \"$1\" = '--auth=entra' ] || exit 3; shift; [ \"$1\" = '--no-tty' ] || exit 4; shift; [ \"$1\" = '--no-relogin' ] || exit 5; cat;;\nesac\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = super::SshConfig {
+            host: "tsh ssh --proxy=example.teleport.sh --auth=entra alice@node".into(),
+            port: 22,
+            user: String::new(),
+            env: BTreeMap::new(),
+            keys: vec![],
+            known_hosts: None,
+            use_agent: false,
+            agent_sock: None,
+            connect_timeout: super::DEFAULT_CONNECT_TIMEOUT,
+        };
+        let (session, tx, mut rx) =
+            super::connect_tsh_program(&cfg, "potty-session", program.as_os_str()).unwrap();
+        let frame = crate::proto::Frame::Control(crate::proto::Control::Hello {
+            version: crate::proto::PROTOCOL_VERSION,
+        });
+        tx.blocking_send(frame.clone()).unwrap();
+        assert_eq!(rx.blocking_recv(), Some(frame));
+        drop(tx);
+        assert_eq!(rx.blocking_recv(), None);
+        drop(session);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn command_with_env_shell_quotes_values() {

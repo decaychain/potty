@@ -4,6 +4,28 @@
 > [attention-feed.md](attention-feed.md) for the *remote* case: once potty owns the remote session,
 > the attention feed is just "a potty pane wants attention" — no forwarded sockets, no ssh wrappers.
 
+## Experimental Teleport connection
+
+In **Connect to host**, paste a complete command into **Host**, for example:
+
+```text
+tsh ssh --proxy=nv-prd-it.teleport.sh --auth=entra nshadrin@omni-lfe-chhrk
+```
+
+Potty runs `tsh login` first, allowing `tsh` to open the browser for SSO/MFA
+(valid credentials can be reused). It then runs a non-PTY `tsh ssh` command
+to execute the configured `remote_command` (default `potty-session`). The
+remote helper must already be installed. Login output is separate from the
+binary session protocol. Complete authentication in the browser while Potty
+shows connection progress; the normal short SSH timeout does not apply.
+
+This initial integration always uses persistent sessions. Recent connections
+save the full command, including proxy and cluster. Supported options are
+`--proxy=`, `--auth=`, `--cluster=`, and `--user=` before the final `user@host`;
+use the equals syntax and unquoted values. Commands are passed as arguments,
+not evaluated by a local shell. `tsh` must be available on Potty's PATH.
+Terminal password/OTP prompts are not supported by this browser-login path.
+
 ## Goal
 
 Make potty multiplex remote sessions itself, replacing Zellij-over-SSH. A remote host appears as

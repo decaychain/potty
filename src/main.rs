@@ -987,6 +987,9 @@ fn feed_label(host: &str, cwd: &str, zellij: Option<&feed::ZellijLoc>) -> String
 /// defaults to `$USER`; missing port to 22.
 fn parse_host(input: &str) -> (String, String, u16) {
     let input = input.trim();
+    if input.starts_with("tsh ") {
+        return (String::new(), input.to_string(), 22);
+    }
     let (user, rest) = match input.split_once('@') {
         Some((u, r)) => (u.to_string(), r),
         None => (default_user(), input),
@@ -2458,6 +2461,11 @@ fn build_ui(
                     resp.request_focus();
                 }
                 ui.add_space(4.0);
+                ui.label("Teleport: paste tsh ssh --proxy=… --auth=… user@host");
+                if connect_host.trim().starts_with("tsh ") {
+                    *connect_use_session = true;
+                    ui.label("Teleport uses potty-session. Complete MFA in your browser.");
+                }
                 section_label(ui, "Name");
                 ui.add(chrome_text_edit(connect_name, "optional"));
                 ui.add_space(4.0);
@@ -4042,7 +4050,11 @@ impl App {
             ConnectProgress {
                 target: target.clone(),
                 label: display_name.clone().unwrap_or_else(|| target_label.clone()),
-                detail: format!("Connecting to {target_label} over SSH"),
+                detail: if cfg.host.starts_with("tsh ") {
+                    "Teleport: logging in / connecting — complete MFA in your browser".into()
+                } else {
+                    format!("Connecting to {target_label} over SSH")
+                },
                 started: Instant::now(),
             },
         );
@@ -4067,7 +4079,9 @@ impl App {
                     "gui: connecting to {}:{} (potty-session: {use_session})",
                     cfg.host, cfg.port
                 ));
-                let result = if use_session {
+                let result = if cfg.host.starts_with("tsh ") {
+                    remote::connect_tsh(&cfg, &command)
+                } else if use_session {
                     remote::connect_and_exec(&cfg, auth, &command).await
                 } else {
                     remote::shell_session(&cfg, auth).await
@@ -4843,6 +4857,10 @@ impl App {
 
     /// Start a connection from the "Connect to host…" dialog input (`[user@]host[:port]`).
     fn start_connect(&mut self, input: &str, name: &str) {
+        if input.trim().starts_with("tsh ") {
+            // Teleport's first transport supports persistent multiplexing only.
+            self.connect_use_session = true;
+        }
         let (user, host, port) = parse_host(input);
         if host.is_empty() {
             return;
