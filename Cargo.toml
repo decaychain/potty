@@ -12,7 +12,11 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 cosmic-text = "0.18"
 egui = "0.34.3"
 egui-wgpu = "0.34.3"
-egui-winit = "0.34.3"
+# Without the `clipboard` feature: egui's own smithay-clipboard would be a second Wayland data
+# device in this process, and GNOME's mutter keeps only the newest one per client, so Potty's own
+# clipboard never saw a selection (paste did nothing on Ubuntu). Dialog fields use Potty's
+# clipboard instead (see `src/clip.rs` and the bridge in `main.rs`).
+egui-winit = { version = "0.34.3", default-features = false, features = ["links", "wayland", "x11"] }
 notify = "8.2.0"
 pollster = "0.4.0"
 portable-pty = "0.9.0"

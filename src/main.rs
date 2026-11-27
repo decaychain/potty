@@ -6361,6 +6361,14 @@ impl App {
             pixels_per_point,
             ..
         } = full;
+        // Copy/cut in a dialog field goes to Potty's clipboard (egui has none of its own).
+        if let Some(cb) = &self.clipboard {
+            for command in &platform_output.commands {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    cb.store(text.clone());
+                }
+            }
+        }
         self.egui_state
             .as_mut()
             .unwrap()
@@ -6605,6 +6613,12 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Platform clipboard (Wayland seat on Linux, Win32 on Windows). See `clip`.
         self.clipboard = clip::Clipboard::new(&window);
+        match &self.clipboard {
+            Some(cb) => eprintln!("potty: clipboard backend: {}", cb.backend()),
+            None => {
+                eprintln!("potty: no clipboard available for this display; copy and paste are off")
+            }
+        }
         let egui_renderer = egui_wgpu::Renderer::new(
             &state.device,
             state.surface_config.format,
@@ -6930,6 +6944,15 @@ impl ApplicationHandler<UserEvent> for App {
                 egui_consumed = true;
                 window.request_redraw();
             } else if !withhold_from_egui {
+                // egui has no clipboard of its own (see Cargo.toml): hand it ours just before a
+                // paste shortcut, which it then reads back as its clipboard text.
+                if let WindowEvent::KeyboardInput { event: key, .. } = &event
+                    && key.state == ElementState::Pressed
+                    && is_paste_shortcut(&key.logical_key, &key.physical_key, self.mods.state())
+                    && let Some(text) = self.clipboard.as_ref().and_then(|c| c.load())
+                {
+                    es.set_clipboard_text(text);
+                }
                 let resp = es.on_window_event(&window, &event);
                 egui_consumed = resp.consumed;
                 // This event is already being painted below. Scheduling it again creates an
@@ -7231,6 +7254,24 @@ fn send_instance_message(path: &Path, msg: &feed::InstanceMessage) -> std::io::R
     )
 }
 
+/// The shortcuts egui treats as paste: Ctrl/Cmd+V (with or without Shift; the physical V key for
+/// layouts without Latin letters) and Shift+Insert.
+fn is_paste_shortcut(
+    logical: &Key,
+    physical: &winit::keyboard::PhysicalKey,
+    mods: winit::keyboard::ModifiersState,
+) -> bool {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    let command = if cfg!(target_os = "macos") {
+        mods.super_key()
+    } else {
+        mods.control_key()
+    };
+    let v = matches!(logical, Key::Character(c) if c.eq_ignore_ascii_case("v"))
+        || *physical == PhysicalKey::Code(KeyCode::KeyV);
+    (command && v) || (mods.shift_key() && matches!(logical, Key::Named(NamedKey::Insert)))
+}
+
 fn new_instance_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7264,6 +7305,42 @@ mod tests {
     use crate::config::Config;
     use std::collections::HashSet;
     use winit::event::MouseButton;
+
+    #[test]
+    fn paste_shortcuts_for_dialog_fields() {
+        use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+        let v = PhysicalKey::Code(KeyCode::KeyV);
+        let ins = PhysicalKey::Code(KeyCode::Insert);
+        let cmd = if cfg!(target_os = "macos") {
+            ModifiersState::SUPER
+        } else {
+            ModifiersState::CONTROL
+        };
+        let paste = |k: Key, p, m| super::is_paste_shortcut(&k, &p, m);
+        assert!(paste(Key::Character("v".into()), v, cmd));
+        assert!(paste(
+            Key::Character("V".into()),
+            v,
+            cmd | ModifiersState::SHIFT
+        ));
+        // A layout without Latin letters still pastes with the physical V key.
+        assert!(paste(Key::Character("м".into()), v, cmd));
+        assert!(paste(
+            Key::Named(NamedKey::Insert),
+            ins,
+            ModifiersState::SHIFT
+        ));
+        assert!(!paste(
+            Key::Character("v".into()),
+            v,
+            ModifiersState::empty()
+        ));
+        assert!(!paste(
+            Key::Character("c".into()),
+            PhysicalKey::Code(KeyCode::KeyC),
+            cmd
+        ));
+    }
 
     /// A waiting input shows on its badge even when not hovered, and as a notice when its pane
     /// is on another tab; the buttons answer it.

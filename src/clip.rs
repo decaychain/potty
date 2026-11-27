@@ -69,16 +69,31 @@ impl Clipboard {
         }
     }
 
-    /// Read the system clipboard.
-    pub fn load(&self) -> Option<String> {
+    /// Which backend is in use, for diagnostics.
+    pub fn backend(&self) -> &'static str {
         match &self.0 {
             #[cfg(target_os = "linux")]
-            Backend::Wayland(c) => c.load().ok(),
+            Backend::Wayland(_) => "wayland (smithay-clipboard)",
             #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
-            Backend::Arboard(c) => c.borrow_mut().get_text().ok(),
+            Backend::Arboard(_) => "arboard",
             #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-            Backend::Disabled => None,
+            Backend::Disabled => "none",
         }
+    }
+
+    /// Read the system clipboard. A failure is logged: otherwise a paste just does nothing.
+    pub fn load(&self) -> Option<String> {
+        let result: Result<String, String> = match &self.0 {
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(c) => c.load().map_err(|e| e.to_string()),
+            #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+            Backend::Arboard(c) => c.borrow_mut().get_text().map_err(|e| e.to_string()),
+            #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+            Backend::Disabled => Err("no clipboard backend".into()),
+        };
+        result
+            .map_err(|e| eprintln!("potty: clipboard read failed ({}): {e}", self.backend()))
+            .ok()
     }
 
     /// Set the primary selection (Linux middle-click source). No-op where unsupported.
