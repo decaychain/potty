@@ -544,6 +544,8 @@ enum Action {
     /// Detach the focused pane's remote session: drop its local tabs/panes and disconnect, but
     /// leave the daemon's shells running so it can be reattached later.
     DetachSession,
+    /// Stop a connection attempt still in progress (login, handshake, or session restore).
+    CancelConnect(ConnId),
     /// Lend a pane to an agent (or change an existing share's mode). Copies the share ID.
     SharePane(PaneId, share::Mode),
     /// End a pane's share; its ID stops working at once.
@@ -667,9 +669,12 @@ struct ConnectProgress {
     label: String,
     detail: String,
     started: Instant,
+    /// Set by the Cancel button; the connection thread stops at its next step.
+    cancel: Arc<AtomicBool>,
 }
 
 struct ConnectProgressView {
+    conn: ConnId,
     label: String,
     detail: String,
     elapsed: Duration,
@@ -705,6 +710,7 @@ fn apply(ws: &mut Workspace, action: Action) {
         | Action::UseProfile(_)
         | Action::DismissError
         | Action::DetachSession
+        | Action::CancelConnect(_)
         | Action::SharePane(..)
         | Action::UnsharePane(_)
         | Action::CopyShareId(_)
@@ -2524,7 +2530,21 @@ fn build_ui(
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.vertical(|ui| {
-                                    ui.label(elide(&item.label, 36));
+                                    ui.horizontal(|ui| {
+                                        ui.label(elide(&item.label, 30));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .small_button("Cancel")
+                                                    .on_hover_text("Stop this connection attempt")
+                                                    .clicked()
+                                                {
+                                                    actions.push(Action::CancelConnect(item.conn));
+                                                }
+                                            },
+                                        );
+                                    });
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "{} - {}s",
@@ -3118,6 +3138,8 @@ struct App {
     connections: HashMap<ConnId, Connection>,
     /// SSH attempts that have been started but have not reached the remote protocol's `Ready`.
     connect_progress: HashMap<ConnId, ConnectProgress>,
+    /// Connections the user cancelled; late events from their threads are ignored.
+    cancelled_conns: std::collections::HashSet<ConnId>,
     /// Allocates `ConnId`s.
     next_conn_id: ConnId,
     /// Pending auth prompts from remote connections, awaiting the user (host-key approval, …).
@@ -3295,6 +3317,7 @@ impl App {
             pending_cwds: HashMap::new(),
             connections: HashMap::new(),
             connect_progress: HashMap::new(),
+            cancelled_conns: std::collections::HashSet::new(),
             next_conn_id: 0,
             auth_prompts: Vec::new(),
             auth_inputs: Vec::new(),
@@ -3522,10 +3545,11 @@ impl App {
     }
 
     fn connect_progress_views(&self) -> Vec<ConnectProgressView> {
-        let mut rows: Vec<&ConnectProgress> = self.connect_progress.values().collect();
-        rows.sort_by_key(|p| p.started);
+        let mut rows: Vec<(&ConnId, &ConnectProgress)> = self.connect_progress.iter().collect();
+        rows.sort_by_key(|(_, p)| p.started);
         rows.into_iter()
-            .map(|p| ConnectProgressView {
+            .map(|(conn, p)| ConnectProgressView {
+                conn: *conn,
                 label: p.label.clone(),
                 detail: p.detail.clone(),
                 elapsed: p.started.elapsed(),
@@ -3956,6 +3980,25 @@ impl App {
     /// drop the `Connection`. With every outbound `Sender` gone, the writer signals channel EOF and
     /// the daemon detaches with its panes intact — ready to reattach. Keeps potty alive with a
     /// fresh local tab if this emptied the workspace.
+    /// The Cancel button on a connection in progress: stop its thread, drop anything it already
+    /// set up, and ignore whatever it still sends.
+    fn cancel_connect(&mut self, conn: ConnId) {
+        if let Some(progress) = self.connect_progress.remove(&conn) {
+            progress.cancel.store(true, Ordering::Release);
+        }
+        self.cancelled_conns.insert(conn);
+        if self.connections.contains_key(&conn) {
+            self.detach_connection(conn);
+        }
+        // Auth dialogs belong to connections in progress. With none left, close them: dropping
+        // their reply channels answers "cancelled" to the waiting thread.
+        if self.connect_progress.is_empty() {
+            self.auth_prompts.clear();
+            self.auth_inputs.clear();
+        }
+        self.request_redraw();
+    }
+
     fn detach_connection(&mut self, conn: ConnId) {
         let locals: Vec<PaneId> = self
             .connections
@@ -4045,6 +4088,7 @@ impl App {
             command: command.clone(),
         };
         let target_label = target.label();
+        let cancel = Arc::new(AtomicBool::new(false));
         self.connect_progress.insert(
             conn,
             ConnectProgress {
@@ -4056,6 +4100,7 @@ impl App {
                     format!("Connecting to {target_label} over SSH")
                 },
                 started: Instant::now(),
+                cancel: cancel.clone(),
             },
         );
         self.request_redraw();
@@ -4080,12 +4125,25 @@ impl App {
                     cfg.host, cfg.port
                 ));
                 let result = if cfg.host.starts_with("tsh ") {
-                    remote::connect_tsh(&cfg, &command)
-                } else if use_session {
-                    remote::connect_and_exec(&cfg, auth, &command).await
+                    remote::connect_tsh(&cfg, &command, &cancel)
                 } else {
-                    remote::shell_session(&cfg, auth).await
+                    let connect = async {
+                        if use_session {
+                            remote::connect_and_exec(&cfg, auth, &command).await
+                        } else {
+                            remote::shell_session(&cfg, auth).await
+                        }
+                    };
+                    tokio::select! {
+                        r = connect => r,
+                        _ = remote::until_cancelled(&cancel) => Err(remote::cancelled()),
+                    }
                 };
+                // Cancelled: say nothing more; dropping the result closes any session.
+                if cancel.load(Ordering::Acquire) {
+                    remote::sshdbg("gui: connect cancelled");
+                    return;
+                }
                 match result {
                     Ok((session, outbound, mut rx)) => {
                         remote::sshdbg("gui: transport ready — handing to UI thread");
@@ -4107,7 +4165,12 @@ impl App {
                         // `potty-session` missing on the host — so surface that instead of silently
                         // leaving a dead, paneless connection.
                         let mut greeted = false;
-                        while let Some(frame) = rx.recv().await {
+                        // Cancelling during the handshake or restore stops waiting for frames;
+                        // dropping the session then ends the transport (and a `tsh` process).
+                        while let Some(frame) = tokio::select! {
+                            f = rx.recv() => f,
+                            _ = remote::until_cancelled(&cancel) => None,
+                        } {
                             greeted |= matches!(frame, Frame::Control(Control::Welcome { .. }));
                             if matches!(frame, Frame::Control(_)) {
                                 remote::sshdbg(format!("gui: recv {frame:?}"));
@@ -4119,6 +4182,9 @@ impl App {
                         remote::sshdbg(format!(
                             "gui: frame stream ended (greeted: {greeted})"
                         ));
+                        if cancel.load(Ordering::Acquire) {
+                            return;
+                        }
                         if !greeted {
                             let detail = session.stderr();
                             let msg = if detail.is_empty() {
@@ -6109,6 +6175,7 @@ impl App {
                     self.request_redraw();
                 }
                 Action::DetachSession => self.detach_focused_session(),
+                Action::CancelConnect(conn) => self.cancel_connect(conn),
                 Action::SharePane(pane, mode) => self.share_pane(pane, mode),
                 Action::UnsharePane(pane) => {
                     self.shares.unshare(pane);
@@ -6761,6 +6828,13 @@ impl ApplicationHandler<UserEvent> for App {
                 session,
             } => self.on_peer_dismiss(instance, host, session),
             // A remote session connected — give it a tab with one shell pane.
+            // A cancelled connection's late events: dropping `outbound` closes the transport.
+            UserEvent::RemoteConnected { conn, .. }
+            | UserEvent::RemoteFrame(conn, _)
+            | UserEvent::RemoteDisconnected { conn, .. }
+            | UserEvent::RemoteError {
+                conn: Some(conn), ..
+            } if self.cancelled_conns.contains(&conn) => {}
             UserEvent::RemoteConnected {
                 conn,
                 target,

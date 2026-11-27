@@ -17,7 +17,10 @@ Potty runs `tsh login` first, allowing `tsh` to open the browser for SSO/MFA
 to execute the configured `remote_command` (default `potty-session`). The
 remote helper must already be installed. Login output is separate from the
 binary session protocol. Complete authentication in the browser while Potty
-shows connection progress; the normal short SSH timeout does not apply.
+shows connection progress; the normal short SSH timeout does not apply. If the
+browser is closed or the login stalls, **Cancel** in the progress overlay kills the
+waiting `tsh login` (or `tsh ssh`). The same button stops an SSH connection during
+connect, authentication, or session restore; a cancelled attempt shows no error.
 
 This initial integration always uses persistent sessions. Recent connections
 save the full command, including proxy and cluster. Supported options are

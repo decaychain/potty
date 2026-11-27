@@ -176,17 +176,32 @@ impl Drop for ProcessSession {
 
 /// Login is separate so browser-login text can never enter the binary protocol stream.
 /// Runs on the dedicated connection thread; browser MFA must not inherit the SSH timeout.
+/// `cancel` stops a login still waiting on the browser.
 pub fn connect_tsh(
     cfg: &SshConfig,
     command: &str,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<(RemoteSession, mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
-    connect_tsh_program(cfg, command, std::ffi::OsStr::new("tsh"))
+    connect_tsh_program(cfg, command, std::ffi::OsStr::new("tsh"), cancel)
+}
+
+/// The error a cancelled connection attempt ends with. The UI shows nothing for it.
+pub fn cancelled() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "connection cancelled")
+}
+
+/// Resolves once `flag` is set: race it against a connection step to make the step cancellable.
+pub async fn until_cancelled(flag: &std::sync::atomic::AtomicBool) {
+    while !flag.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn connect_tsh_program(
     cfg: &SshConfig,
     command: &str,
     program: &std::ffi::OsStr,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<(RemoteSession, mpsc::Sender<Frame>, mpsc::Receiver<Frame>)> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -201,16 +216,55 @@ fn connect_tsh_program(
             login.arg(option);
         }
     }
-    let output = login
+    let mut login = login
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| io_err(format!("could not run tsh login: {e}")))?;
-    if !output.status.success() {
+    // Drain both pipes on their own threads, so the login can't stall on a full pipe while we
+    // poll for it to finish or to be cancelled.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let login_out = drain(
+        login
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let login_err = drain(
+        login
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let status = loop {
+        if let Some(status) = login.try_wait()? {
+            break status;
+        }
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = login.kill();
+            let _ = login.wait();
+            return Err(cancelled());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let (stdout, stderr) = (
+        login_out.join().unwrap_or_default(),
+        login_err.join().unwrap_or_default(),
+    );
+    if !status.success() {
         return Err(io_err(format!(
-            "tsh login failed ({}): {} {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
+            "tsh login failed ({status}): {} {}",
+            String::from_utf8_lossy(&stderr),
+            String::from_utf8_lossy(&stdout)
         )));
     }
     let mut child = Command::new(program)
@@ -905,8 +959,80 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// The fake-`tsh` tests write a script and then run it. Run in parallel, one test's fork can
+    /// still hold the other's script open for writing, and its exec fails with "Text file busy".
+    static FAKE_TSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Closing the browser leaves `tsh login` waiting forever: cancelling must kill it promptly.
+    #[test]
+    fn cancelling_stops_a_teleport_login_waiting_on_the_browser() {
+        let _serial = FAKE_TSH.lock().unwrap_or_else(|e| e.into_inner());
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!(
+            "potty-tsh-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let program = dir.join("tsh");
+        let pidfile = dir.join("login.pid");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\nlogin) echo $$ > '{}'; exec sleep 60;;\nesac\nexit 9\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = super::SshConfig {
+            host: "tsh ssh --proxy=example.teleport.sh alice@node".into(),
+            port: 22,
+            user: String::new(),
+            env: BTreeMap::new(),
+            keys: vec![],
+            known_hosts: None,
+            use_agent: false,
+            agent_sock: None,
+            connect_timeout: super::DEFAULT_CONNECT_TIMEOUT,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Release);
+            })
+        };
+        let started = std::time::Instant::now();
+        let result =
+            super::connect_tsh_program(&cfg, "potty-session", program.as_os_str(), &cancel);
+        canceller.join().unwrap();
+        let err = result.err().expect("a cancelled login must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "tsh login still running");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn teleport_login_output_is_separate_from_frame_stream() {
+        let _serial = FAKE_TSH.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
             "potty-tsh-test-{}-{}",
@@ -931,8 +1057,10 @@ mod tests {
             agent_sock: None,
             connect_timeout: super::DEFAULT_CONNECT_TIMEOUT,
         };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
         let (session, tx, mut rx) =
-            super::connect_tsh_program(&cfg, "potty-session", program.as_os_str()).unwrap();
+            super::connect_tsh_program(&cfg, "potty-session", program.as_os_str(), &cancel)
+                .unwrap();
         let frame = crate::proto::Frame::Control(crate::proto::Control::Hello {
             version: crate::proto::PROTOCOL_VERSION,
         });
