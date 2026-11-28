@@ -3068,6 +3068,8 @@ struct App {
     /// Active-tab pane rects in physical px: (id, origin x, origin y, width, height).
     pane_px: Vec<(PaneId, f32, f32, f32, f32)>,
     mouse_px: (f64, f64),
+    /// Scroll not yet worth a whole line (see `wheel_lines`).
+    wheel_rest: f64,
     /// The pane the in-progress press/drag (selection or mouse-report) belongs to.
     mouse_pane: Option<PaneId>,
     selecting: bool,
@@ -3284,6 +3286,7 @@ impl App {
             _watcher: None,
             pane_px: Vec::new(),
             mouse_px: (0.0, 0.0),
+            wheel_rest: 0.0,
             mouse_pane: None,
             selecting: false,
             last_click: None,
@@ -7082,8 +7085,12 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } if !self.menu_open && !self.show_settings => {
                 // Positive = up / into history. 3 lines per wheel notch; touchpad by pixels.
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h.max(1.0) as f64) as i32,
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        wheel_lines(&mut self.wheel_rest, y as f64 * 3.0)
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        wheel_lines(&mut self.wheel_rest, p.y / self.cell_h.max(1.0) as f64)
+                    }
                 };
                 if lines != 0 {
                     let Some(id) = self.pane_at(self.mouse_px.0, self.mouse_px.1) else {
@@ -7254,6 +7261,20 @@ fn send_instance_message(path: &Path, msg: &feed::InstanceMessage) -> std::io::R
     )
 }
 
+/// Whole lines to scroll for a wheel event of `delta` lines, carrying the fraction in `rest`.
+/// Touchpads (and high-resolution wheels) send many events worth a fraction of a line each; on
+/// Wayland a touchpad event is a few pixels. Truncating each one on its own dropped nearly all of
+/// them. A change of direction discards the leftover so the reversal responds at once.
+fn wheel_lines(rest: &mut f64, delta: f64) -> i32 {
+    if *rest * delta < 0.0 {
+        *rest = 0.0;
+    }
+    *rest += delta;
+    let lines = rest.trunc();
+    *rest -= lines;
+    lines as i32
+}
+
 /// The shortcuts egui treats as paste: Ctrl/Cmd+V (with or without Shift; the physical V key for
 /// layouts without Latin letters) and Shift+Insert.
 fn is_paste_shortcut(
@@ -7305,6 +7326,24 @@ mod tests {
     use crate::config::Config;
     use std::collections::HashSet;
     use winit::event::MouseButton;
+
+    #[test]
+    fn touchpad_pixels_add_up_to_lines() {
+        use super::wheel_lines;
+        // 24 px cells, a GNOME touchpad swipe in 6 px steps: each step alone is a quarter line.
+        let mut rest = 0.0;
+        let lines: i32 = (0..8).map(|_| wheel_lines(&mut rest, 6.0 / 24.0)).sum();
+        assert_eq!(lines, 2);
+        // Reversing drops the leftover instead of spending it against the new direction.
+        let mut rest = 0.0;
+        assert_eq!(wheel_lines(&mut rest, 0.9), 0);
+        assert_eq!(wheel_lines(&mut rest, -0.5), 0);
+        assert_eq!(wheel_lines(&mut rest, -0.5), -1);
+        // A wheel notch stays three lines.
+        let mut rest = 0.0;
+        assert_eq!(wheel_lines(&mut rest, 3.0), 3);
+        assert_eq!(wheel_lines(&mut rest, -3.0), -3);
+    }
 
     #[test]
     fn paste_shortcuts_for_dialog_fields() {
